@@ -1,0 +1,30 @@
+# Editor and OS files
+.DS_Store
+Thumbs.db
+Desktop.ini
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+*.tmp
+*.bak
+*.log
+
+# Credentials and local cluster configuration
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+kubeconfig
+kubeconfig.*
+*.kubeconfig
+secrets/
+
+# Generated caches
+__pycache__/
+*.py[cod]
+.pytest_cache/
