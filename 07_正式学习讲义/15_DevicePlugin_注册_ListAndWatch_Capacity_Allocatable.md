@@ -1,2229 +1,1716 @@
-# 第 15 课：Device Plugin——注册、ListAndWatch 与 Node Capacity/Allocatable
+# 第 15 课：Device Plugin 已经注册，为什么 Java 推理 Pod 仍然 FailedScheduling——从 ListAndWatch 读懂 Capacity 与 Allocatable
 
-> 主案例：GPU Node 的 Driver、Toolkit、containerd/CDI都正常，NVIDIA Device Plugin Pod也是 Running，但 Node 没有 `nvidia.com/gpu`  
-> 主线源码：`pkg/kubelet/cm/devicemanager/plugin/v1beta1/*`、`pkg/kubelet/pluginmanager/*`、`pkg/kubelet/cm/devicemanager/manager.go`、`pkg/kubelet/nodestatus/setters.go`  
-> 源码基线：`301946d15e67a4a2e8a5fb8292eb836acd366d78`（`v1.37.0-alpha.0-280-g301946d15e6`）  
-> 本课深度：S3，读穿注册成功、第一份设备清单、健康账本、Node status异步传播和断连收敛  
-> 前置断点：第 14 课已经证明宿主机GPU底座与容器runtime责任边界，本课从“设备插件进程怎样把GPU变成Kubernetes资源”继续
+> 本课源码基线：Kubernetes commit `301946d15e67a4a2e8a5fb8292eb836acd366d78`（本地 `git describe` 为 `v1.37.0-alpha.0-280-g301946d15e6`）。
+>
+> 本课面向已经做过多年 Kubernetes 平台运维、但 Go 语法还不熟的学习者。重点不是背 Device Plugin 部署命令，而是弄明白：**一块宿主机看得见的 GPU，经过哪些状态账本，才会变成 scheduler 可以使用的 `nvidia.com/gpu`。**
 
 ---
 
-## 0. 这一课不再把“Device Plugin Pod Running”当作结论
+## 0. 先把这一课的生产问题钉死
 
-生产现场：
+### 0.1 固定案例：只讨论这一条主线
 
-```text
-gpu-node-07:
-  Node Ready=True
-  host nvidia-smi -L成功
-  nvidia-ctk cdi list有设备
-  nvidia-device-plugin Pod Running/Ready
-
-但：
-  Node.status.capacity["nvidia.com/gpu"] 不存在或为0
-  Node.status.allocatable["nvidia.com/gpu"] 不存在或为0
-  GPU业务Pod FailedScheduling: Insufficient nvidia.com/gpu
-```
-
-很多排障到这里会说：
-
-> 插件Pod明明是Running，应该是scheduler缓存有问题。
-
-这仍然跳得太快。一个 Device Plugin Pod至少要经过：
+游戏平台有一个 Java 推理服务：
 
 ```text
-进程启动
-  -> 发现宿主机设备
-  -> 监听自己的Unix socket
-  -> 向kubelet注册
-  -> kubelet反向连接插件
-  -> GetDevicePluginOptions成功
-  -> ListAndWatch建流成功
-  -> 第一份完整设备清单到达
-  -> DeviceManager重建healthy/unhealthy账本
-  -> kubelet下一轮生成Node Status
-  -> Patch到apiserver
-  -> scheduler informer看到新Node对象
+namespace: prod
+Deployment: game-infer
+container: infer-server
+用途: Java 服务通过 JNI 调用 CUDA 推理
+GPU request/limit: nvidia.com/gpu=1
 ```
 
-Pod `phase=Running` 最多证明容器进程仍在。它不证明后面十步都成功。
+新扩容了一台 GPU Node：
 
-生产取证按同一个Node、同一个时间窗过六道闸门：
+```text
+Node: gpu-node-07
+物理 GPU: 8 张
+MIG: 关闭
+time-slicing: 关闭
+MPS: 关闭
+DRA Extended Resource 映射: 未配置
+历史 kubelet_internal_checkpoint: 不存在
+```
 
-| 闸门 | 最小证据 | 还不能证明 |
-|---|---|---|
-| Plugin Pod身份 | namespace/name/UID/image/containerID/`spec.nodeName` | socket已监听 |
-| 入口判定 | direct `Register`日志，或generic watcher/GetInfo日志与socket路径 | 两套入口都必须串行经过 |
-| socket/listener | 目标Node实际socket、owner/mode、监听进程 | kubelet已连接 |
-| registration/connect | 字段校验、dial、GetOptions成功日志 | first list已处理 |
-| first ListAndWatch | 同resource的首份完整清单、total/healthy与stream错误 | Node API已patch |
-| Node/scheduler | Capacity/Allocatable、resourceVersion、FailedScheduling时间 | 具体device ID已Allocate给container |
+为了让“8 张物理卡”和“8 个 Kubernetes 资源单位”在本课里一一对应，我们特意关闭 MIG 和共享策略。生产环境若开启 MIG 或 time-slicing，`nvidia.com/gpu` 的数量可能不再等于物理卡数，不能照抄这个等式。
 
-任何一步使用了另一个Node的Pod或日志，整条因果链都无效。
+目标节点上的 NVIDIA Device Plugin 固定为：
 
-本课还要先过一条版本闸门：它讲的是**传统 Device Plugin扩展资源账本**。当前commit的`DRAExtendedResource`可以让`DeviceClass.spec.extendedResourceName`接管同名extended resource；此时相同的`limits: nvidia.com/gpu: 1`可能转成DRA claim。进入本课主链前先确认没有匹配的DeviceClass，并检查Pod `status.extendedResourceClaimStatus`；若由DRA接管，应改查DeviceClass/ResourceSlice/ResourceClaim，而不是要求DeviceManager一定生成同名Node Capacity。
+```text
+namespace: gpu-operator
+Pod: nvidia-device-plugin-daemonset-k7m2p
+UID: 1d19c8c0-1111-2222-3333-777777777777
+container: nvidia-device-plugin-ctr
+image: nvcr.io/nvidia/k8s-device-plugin@sha256:TEACHING_DIGEST
+containerID: containerd://9e8f7a6b5c4d
+registration path: direct Registration.Register
+kubelet socket: /var/lib/kubelet/device-plugins/kubelet.sock
+plugin endpoint: nvidia-gpu.sock
+resourceName: nvidia.com/gpu
+```
+
+`TEACHING_DIGEST`只是讲义里的脱敏占位值，不代表真实镜像；现场必须记录完整镜像 digest。
+
+### 0.2 故障时已经确认的事实
+
+```text
+1. host 上 nvidia-smi -L 能看到 8 张 GPU。
+2. Device Plugin Pod 是 Running，restartCount=0。
+3. nvidia-gpu.sock 已存在，进程正在监听。
+4. 插件日志显示已向 kubelet 发起 Register。
+5. kubelet 日志出现：
+   Got registration request...
+   Connected to new client...
+   Device plugin connected...
+6. 已确认同一 boot ID、同一注册时间窗的 kubelet V(2) 日志采集完整，但没有出现：
+   State pushed for device plugin...
+   Processed device updates for resource...
+7. Node status 中 nvidia.com/gpu 字段完全 absent，不是显式 0。
+8. prod/game-infer 新 Pod 持续 FailedScheduling：
+   Insufficient nvidia.com/gpu
+```
+
+因为这是新节点且没有历史 checkpoint，所以“字段 absent”与本案一致：kubelet 还没有形成第一份可发布的设备清单。
+
+### 0.3 本课要验证的假设
+
+```text
+注册入口已经通过
+  -> kubelet 已经反向连接插件
+  -> GetDevicePluginOptions 已经成功
+  -> 但 ListAndWatch 的第一份完整清单尚未被 kubelet 收到
+  -> DeviceManager 里的 healthyDevices/unhealthyDevices 仍没有 nvidia.com/gpu
+  -> GetCapacity 无法产出该资源
+  -> Node Status 没有该字段
+  -> scheduler 只能判定 Insufficient nvidia.com/gpu
+```
+
+什么证据可以推翻这个假设？
+
+```text
+若 kubelet 已经记录：
+  State pushed ... resourceCapacity=8
+  Processed device updates ... totalCount=8 healthyCount=8
+
+但 Node status 仍长期 absent，
+那么断点已经从 ListAndWatch 前移到了：
+  GetCapacity -> Node status setter -> API Server patch
+```
+
+这就是源码排障的基本纪律：**先提出可证伪的链路假设，再找能把断点向前或向后移动的证据。**
 
 ---
 
-## 1. 本课先钉死六个结论
+## 1. 为什么 Kubernetes 要设计这么多层，而不是让插件直接改 Node
 
-1. **当前源码同时存在两套 Device Plugin注册入口**，不能把其中一套说成所有插件唯一真相。
-2. **注册成功不等于资源已经出现**；至少还要等第一份 `ListAndWatchResponse`。
-3. `ListAndWatch` 是 gRPC server-stream，不是 Kubernetes Watch，也不是固定周期心跳。
-4. 每份 response是该resource的**完整设备清单**，DeviceManager据此重建三张表。
-5. `Capacity=healthy+unhealthy`，`Allocatable=healthy`；计数单位是插件逻辑device entry，且Allocatable不是“当前剩余未分配GPU”。
-6. Device Plugin容量变化走 Node Status，不走 Node Lease，也不是直接同步通知scheduler。
-
-把这六句掌握后，你才能解释：
+如果只看表面，这套链路很绕：
 
 ```text
-为什么在“无MIG/无sharing、一entry一整卡”的例子里，物理8卡、Node Allocatable仍是8，但只剩2个资源单位可继续调度；
-为什么一个entry变Unhealthy时Capacity可能仍是8、Allocatable变7；
-为什么插件刚断连时Allocatable先归0，Capacity过一段时间才归0；
-为什么kubectl Events里没有“Device Plugin注册失败”也不能证明注册正常。
-```
-
----
-
-## 2. 先分清四个角色和两组 gRPC API
-
-| 角色 | 运行位置 | 主要职责 |
-|---|---|---|
-| NVIDIA Device Plugin | 每个GPU Node上的DaemonSet Pod/进程 | 发现GPU、报告device ID/health、响应Allocate等RPC |
-| kubelet plugin manager | kubelet进程 | 通用发现registration socket并按plugin type分发 |
-| kubelet DeviceManager | kubelet进程 | 保存设备账、形成capacity/allocatable、后续分配具体device |
-| Node status/scheduler | apiserver对象与scheduler缓存 | 暴露数量并按requests做调度 |
-
-两组API：
-
-### 2.1 Device Plugin专用 API
-
-```text
-staging/src/k8s.io/kubelet/pkg/apis/deviceplugin/v1beta1/api.proto
-```
-
-方向：
-
-```text
-插件 -> kubelet Registration.Register
-kubelet -> 插件 GetDevicePluginOptions
-kubelet -> 插件 ListAndWatch
-kubelet -> 插件 Allocate / PreStartContainer / GetPreferredAllocation
-```
-
-本课读前两段和 `ListAndWatch`；Allocate留到第 16 课。
-
-### 2.2 通用 plugin registration API
-
-```text
-staging/src/k8s.io/kubelet/pkg/apis/pluginregistration/v1/api.proto
-```
-
-方向：
-
-```text
-kubelet -> registration socket GetInfo
-kubelet -> registration socket NotifyRegistrationStatus
-```
-
-它还服务CSI、DRA等插件。看到 `plugins_registry` socket时，不能只凭路径就认定是GPU Device Plugin。
-
----
-
-## 3. 当前 kubelet为什么会同时有两套入口
-
-### 3.1 通用 plugin manager在构造时就建立
-
-```text
-pkg/kubelet/kubelet.go:1038-1042
-```
-
-```go
-klet.pluginManager = pluginmanager.NewPluginManager(
-    klet.getPluginsRegistrationDir(),
-    kubeDeps.Recorder,
-)
-```
-
-registration目录：
-
-```text
-pkg/kubelet/kubelet_getters.go:76-84
-
-<kubelet root>/plugins_registry
-```
-
-默认root通常是 `/var/lib/kubelet`，但发行版或托管平台可能改 `--root-dir`；不能永远硬编码。
-
-### 3.2 DeviceManager自己仍启动专用registration server
-
-kubelet启动container manager：
-
-```text
-pkg/kubelet/kubelet.go:1817-1825
-```
-
-DeviceManager：
-
-```text
-pkg/kubelet/cm/devicemanager/manager.go:340-355
-```
-
-```go
-func (m *ManagerImpl) Start(...) error {
-    logger.V(2).Info("Starting Device Plugin manager")
-
-    err := m.readCheckpoint(logger)
-    if err != nil {
-        logger.Error(
-            err,
-            "Continue after failing to read checkpoint file...",
-        )
-    }
-
-    return m.server.Start(logger)
-}
-```
-
-`m.server.Start`监听传统socket：
-
-```text
-/var/lib/kubelet/device-plugins/kubelet.sock
-```
-
-### 3.3 同时又把DeviceManager挂到通用plugin manager
-
-```text
-pkg/kubelet/cm/container_manager_linux.go:736-744
-```
-
-```go
-func (cm *containerManagerImpl) GetPluginRegistrationHandlers() map[string]cache.PluginHandler {
-
-    res := map[string]cache.PluginHandler{
-        pluginwatcherapi.DevicePlugin:
-            cm.deviceManager.GetWatcherHandler(),
-    }
-    // DRA feature gate开启时还会加入DRAPlugin
-    return res
-}
-```
-
-kubelet随后：
-
-```text
-pkg/kubelet/kubelet.go:1830-1840
-```
-
-```go
-for name, handler :=
-    range kl.containerManager.
-        GetPluginRegistrationHandlers() {
-    kl.pluginManager.AddHandler(name, handler)
-}
-
-go kl.pluginManager.Run(
-    ctx,
-    kl.sourcesReady,
-    wait.NeverStop,
-)
-```
-
-所以当前commit的真实图是：
-
-```text
-入口A：device-plugins/kubelet.sock
-  -> Device Plugin专用Registration.Register
-
-入口B：plugins_registry/<plugin>.sock
-  -> 通用GetInfo/NotifyRegistrationStatus
-
-两条入口
-  -> 最终都交给DeviceManager server/connectClient
-```
-
-不能写：
-
-```text
-“支持plugin watcher后，direct Register已经完全删除”
-```
-
-也不能反过来写：
-
-```text
-“Device Plugin永远只会调用kubelet.sock”
-```
-
-实际 NVIDIA Device Plugin、Operator打包版本或其他厂商插件走哪条，要看它的实现、挂载、socket和日志。NVIDIA官方插件的常见部署仍会挂载 `/var/lib/kubelet/device-plugins`并向专用socket注册，但本课不把这个实现习惯升级成Kubernetes协议唯一入口。
-
----
-
-## 4. 入口 A：传统 direct `Registration.Register`
-
-### 4.1 kubelet先监听 `kubelet.sock`
-
-```text
-pkg/kubelet/cm/devicemanager/plugin/v1beta1/server.go:86-133
-```
-
-核心动作：
-
-```go
-os.MkdirAll(s.socketDir, 0750)
-s.rhandler.CleanupPluginDirectory(
-    logger,
-    s.socketDir,
-)
-
-ln, err := net.Listen(
-    "unix",
-    s.SocketPath(),
-)
-
-s.grpc = grpc.NewServer()
-api.RegisterRegistrationServer(
-    s.grpc,
-    s,
-)
-go s.grpc.Serve(ln)
-```
-
-路径常量：
-
-```text
-staging/src/k8s.io/kubelet/pkg/apis/deviceplugin/v1beta1/constants.go
-
-DevicePluginPath = /var/lib/kubelet/device-plugins/
-KubeletSocket    = /var/lib/kubelet/device-plugins/kubelet.sock
-```
-
-这里要和通用目录严格分开：当前 upstream Linux 把 direct Device Plugin目录和`kubelet.sock`写成上述绝对常量，普通`--root-dir`**不会**把它们移动到新root。发行版源码补丁或容器化kubelet的mount namespace可能让“宿主机看到的路径”不同，但那不是`--root-dir`本身的效果；要用源码版本、进程mount和DaemonSet hostPath交叉确认。
-
-### 4.2 插件调用Register
-
-```text
-pkg/kubelet/cm/devicemanager/plugin/v1beta1/server.go:159-185
-```
-
-```go
-func (s *server) Register(
-    ctx context.Context,
-    r *api.RegisterRequest,
-) (*api.Empty, error) {
-    logger := klog.FromContext(ctx)
-    logger.Info(
-        "Got registration request from device plugin with resource",
-        "resourceName",
-        r.ResourceName,
-    )
-
-    metrics.DevicePluginRegistrationCount.
-        WithLabelValues(r.ResourceName).Inc()
-
-    if !s.isVersionCompatibleWithPlugin(r.Version) {
-        err := fmt.Errorf(
-            errUnsupportedVersion,
-            r.Version,
-            api.SupportedVersions,
-        )
-        return &api.Empty{}, err
-    }
-
-    if !v1helper.IsExtendedResourceName(
-        core.ResourceName(r.ResourceName),
-    ) {
-        err := fmt.Errorf(
-            errInvalidResourceName,
-            r.ResourceName,
-        )
-        return &api.Empty{}, err
-    }
-
-    if err := s.connectClient(
-        ctx,
-        r.ResourceName,
-        filepath.Join(s.socketDir, r.Endpoint),
-    ); err != nil {
-        return &api.Empty{}, err
-    }
-    return &api.Empty{}, nil
-}
-```
-
-Go现场补——第一个方法签名现在就读懂：
-
-- `(s *server)`是receiver：这不是独立函数，而是`*server`对象的方法；`s`让方法访问socket目录、client表等状态；
-- `ctx context.Context`按值传递取消、超时和日志上下文；
-- `r *api.RegisterRequest`是请求指针，读取`Version/Endpoint/ResourceName`；
-- `(*api.Empty, error)`表示两个返回值：空响应指针和错误；gRPC调用成功是`&api.Empty{}, nil`，失败返回非`nil error`；
-- `if err := ...; err != nil`把`err`限制在这个`if`作用域，不能拿作用域外不存在的`err`凑一个删节摘录。
-
-这条入口的关键字段：
-
-| 字段 | 示例 | 作用 |
-|---|---|---|
-| `Version` | `v1beta1` | 必须与kubelet支持版本兼容 |
-| `Endpoint` | `nvidia-gpu.sock` | 插件自己的DevicePlugin socket文件名 |
-| `ResourceName` | `nvidia.com/gpu` | Node status里的extended resource name |
-| `Options` | DevicePluginOptions | 当前 `server.Register`没有直接消费 |
-
-容易误讲的点：
-
-> `RegisterRequest.Options` 并不是当前DeviceManager最终选项来源。
-
-`connectClient`成功后，kubelet还会主动调用插件的 `GetDevicePluginOptions`。本commit最终保存的是那个RPC返回值。
-
-### 4.3 direct路径会拼接socket目录
-
-```go
-filepath.Join(s.socketDir, r.Endpoint)
-```
-
-这意味着插件传的是endpoint名，由kubelet拼成专用目录下路径。
-
-若插件把绝对路径、跨目录路径或错误文件名当作普通endpoint，实际行为和安全边界必须按 `filepath.Join`及平台路径规则重新核对，不能只看Register请求打印值。
-
----
-
-## 5. 入口 B：通用 plugin watcher
-
-### 5.1 watcher看到Unix socket只先写desired state
-
-```text
-pkg/kubelet/pluginmanager/pluginwatcher/plugin_watcher.go:163-210
-```
-
-```go
-func (w *Watcher) handleCreateEvent(
-    ctx context.Context,
-    event fsnotify.Event,
-) error {
-    fi, err := getStat(event)
-    // ...
-    if !fi.IsDir() {
-        isSocket, err :=
-            util.IsUnixDomainSocket(
-                util.NormalizePath(event.Name),
-            )
-        if !isSocket {
-            return nil
-        }
-        return w.handlePluginRegistration(
-            ctx,
-            event.Name,
-        )
-    }
-    return w.traversePluginDir(
-        ctx,
-        event.Name,
-    )
-}
-
-func (w *Watcher) handlePluginRegistration(
-    ctx context.Context,
-    socketPath string,
-) error {
-    return w.desiredStateOfWorld.
-        AddOrUpdatePlugin(
-            ctx,
-            getSocketPath(socketPath),
-        )
-}
-```
-
-这还是：
-
-```text
-“期望存在这个plugin”
-```
-
-不是：
-
-```text
-“plugin已经注册成功”
-```
-
-后续由 reconciler把 desired state和actual state调到一致。
-
-### 5.2 operation executor反向问插件 `GetInfo`
-
-```text
-pkg/kubelet/pluginmanager/operationexecutor/operation_generator.go:78-156
-```
-
-主线：
-
-```go
-client, conn, err :=
-    dial(ctx, socketPath, dialTimeoutDuration)
-if err != nil {
-    return fmt.Errorf(
-        "RegisterPlugin error -- dial failed at " +
-            "socket %s, err: %v",
-        socketPath,
-        err,
-    )
-}
-defer conn.Close()
-
-ctxWithTimeout, cancel :=
-    context.WithTimeout(ctx, time.Second)
-defer cancel()
-
-infoResp, err :=
-    client.GetInfo(
-        ctxWithTimeout,
-        &registerapi.InfoRequest{},
-    )
-if err != nil {
-    return fmt.Errorf(
-        "RegisterPlugin error -- failed to get plugin " +
-            "info using RPC GetInfo at socket %s, err: %v",
-        socketPath,
-        err,
-    )
-}
-
-handler, ok :=
-    pluginHandlers[infoResp.Type]
-if !ok {
-    if err := og.notifyPlugin(ctx, client, false,
-        fmt.Sprintf(
-            "RegisterPlugin error -- no handler registered " +
-                "for plugin type: %s at socket %s",
-            infoResp.Type,
-            socketPath,
-        )); err != nil {
-        return fmt.Errorf(
-            "RegisterPlugin error -- failed to send error at " +
-                "socket %s, err: %v",
-            socketPath, err,
-        )
-    }
-    return fmt.Errorf(
-        "RegisterPlugin error -- no handler registered for " +
-            "plugin type: %s at socket %s",
-        infoResp.Type, socketPath,
-    )
-}
-
-if infoResp.Endpoint == "" {
-    infoResp.Endpoint = socketPath
-}
-
-err = handler.ValidatePlugin(
-    infoResp.Name,
-    infoResp.Endpoint,
-    infoResp.SupportedVersions,
-)
-```
-
-Go现场补——`context.WithTimeout`与 `defer cancel()`：
-
-- dial失败先early return；成功后`defer conn.Close()`保证这次generic registration操作结束时关闭临时GetInfo/Notify连接；
-- 派生一个最多活1秒的context；
-- `cancel`释放timer等资源；
-- `defer`保证当前函数返回时执行；
-- GetInfo卡死因此不会无限阻塞registration operation。
-
-Go现场补——`handler, ok := pluginHandlers[key]`：
-
-- Go map读取可以同时返回value和 `ok bool`；
-- `ok=false`表示key不存在；
-- 这里不是handler执行业务后报错，而是kubelet根本没为这个plugin type注册消费者；
-- map的value是interface，CSI、DevicePlugin、DRA都可用同一组 `Validate/Register/DeRegister`方法被通用manager调度。
-
-时间边界：
-
-```text
-dial registration socket：10秒
-GetInfo：1秒
-NotifyRegistrationStatus：5秒
-```
-
-这些是当前源码常量，不是所有历史版本固定值。
-
-### 5.3 `Type`决定由谁处理
-
-`GetInfoResponse`返回：
-
-```text
-Type
-Name
-Endpoint
-SupportedVersions
-```
-
-`Type=DevicePlugin`才会找到本章的DeviceManager handler。
-
-如果：
-
-- `Type`拼错；
-- kubelet没有该type handler；
-- resource name不合法；
-- API version不兼容；
-- endpoint连不上；
-
-registration会失败，并通过 `NotifyRegistrationStatus(false, error)`回告插件。
-
-### 5.4 endpoint为空与非空不是一回事
-
-```go
-if infoResp.Endpoint == "" {
-    infoResp.Endpoint = socketPath
-}
-```
-
-- 为空：registration socket本身也充当DevicePlugin业务socket；
-- 非空：按插件返回值传给handler。
-
-与direct路径不同，这里不会自动执行：
-
-```go
-filepath.Join(
-    /var/lib/kubelet/device-plugins,
-    endpoint,
-)
-```
-
-所以不要把两条入口的endpoint解析规则画成一模一样。
-
-### 5.5 validate、actual state、register、notify的顺序
-
-```text
-GetInfo
-  -> 找handler
-  -> ValidatePlugin
-  -> actualStateOfWorld.AddPlugin
-  -> handler.RegisterPlugin
-  -> NotifyRegistrationStatus(success)
-```
-
-若 `RegisterPlugin`失败，会从actual state移除。若成功后通知失败，也会移除并调用 `DeRegisterPlugin`。
-
-这里体现通用plugin manager的reconcile思想：
-
-```text
-socket存在
-  != actual state已经稳定
-```
-
----
-
-## 6. `DEPRECATION` 文件：按当前调用链讲，不按函数名猜
-
-> **二读内容**：这是训练“不能按函数名猜调用链”的好例子，但首遍生产排障先掌握两套入口、connect、first list与Node Status；不要求第一次就背这个兼容死角。
-
-源码里有：
-
-```text
-pkg/kubelet/cm/devicemanager/plugin/v1beta1/handler.go:32-44
-```
-
-```go
-func (s *server) GetPluginHandler() cache.PluginHandler {
-
-    os.Create(
-        s.socketDir + "DEPRECATION",
-    )
-    return s
-}
-```
-
-测试插件可能据此跳过direct Register。仅看函数名，很容易写出：
-
-> kubelet启用plugin watcher后一定创建DEPRECATION文件，传统入口自动关闭。
-
-但当前commit全仓调用链中：
-
-```text
-ManagerImpl.GetWatcherHandler()
-  -> 直接 return m.server
-```
-
-没有经过 `server.GetPluginHandler()`。
-
-因此本课只得出：
-
-```text
-源码保留这个能力和兼容信号
-但当前静态主链不能证明它会被必然调用
-```
-
-生产看到或没看到 `DEPRECATION`文件，都不能脱离版本、调用链和插件实现直接推断注册模式。
-
----
-
-## 7. 两条入口最终怎样汇合
-
-direct：
-
-```text
-Registration.Register
-  -> server.connectClient
-```
-
-generic：
-
-```text
-GetInfo/Validate
-  -> server.RegisterPlugin
-  -> server.connectClient
-```
-
-共同后半段：
-
-```text
-connectClient
-  -> NewPluginClient(resourceName, endpoint)
-  -> client.Connect
-  -> ManagerImpl.PluginConnected
-  -> GetDevicePluginOptions
-  -> endpoints[resourceName] = endpointInfo
-  -> go client.Run
+GPU
+  -> NVIDIA Device Plugin
+  -> gRPC registration
   -> ListAndWatch
+  -> kubelet DeviceManager 内存表
+  -> Node Status
+  -> API Server
+  -> scheduler cache
 ```
 
-对应：
+但它不是为了“把简单事情复杂化”，而是在解决五个真实矛盾。
+
+### 1.1 Kubernetes 核心不可能内置所有厂商驱动逻辑
+
+如果 kubelet 直接理解 NVIDIA、AMD、Intel、FPGA、RDMA 和各种专用加速卡：
 
 ```text
-pkg/kubelet/cm/devicemanager/plugin/v1beta1/handler.go:83-105
+每增加一种硬件
+  -> kubelet 都要加厂商代码
+  -> Kubernetes 发版节奏被厂商驱动节奏绑住
+  -> 核心组件权限和依赖不断膨胀
 ```
 
-```go
-func (s *server) connectClient(
-    ctx context.Context,
-    name string,
-    socketPath string,
-) error {
-    logger := klog.FromContext(ctx)
-    c := NewPluginClient(
-        name,
-        socketPath,
-        s.chandler,
-    )
-
-    s.registerClient(logger, name, c)
-    if err := c.Connect(ctx); err != nil {
-        s.deregisterClient(logger, name)
-        return err
-    }
-
-    go s.runClient(ctx, name, c)
-    return nil
-}
-```
-
-Go现场补——`go s.runClient(...)`：
-
-- `go`启动新goroutine；
-- `connectClient`不用等ListAndWatch结束才返回；
-- registration可以完成，而设备清单流在后台长期运行；
-- 所以“Register返回成功”和“第一份response已经处理”天然有时间差。
-
-注意顺序：
+Device Plugin 把边界切成：
 
 ```text
-client先放入server.clients
-  -> Connect失败再移除
-  -> Connect成功后另起goroutine跑ListAndWatch
+厂商插件负责：
+  我能发现哪些设备
+  每个设备 ID 是什么
+  当前健康状态是什么
+  分配时要注入什么
+
+kubelet 负责：
+  验证资源名与协议版本
+  保存节点本地设备账
+  保护分配过程
+  把数量写进 Node Status
 ```
 
-这也是为什么“有过registration请求”不能证明ListAndWatch仍活着。
+这叫**机制与厂商知识分离**。
+
+### 1.2 为什么不能让插件自己 patch Node Status
+
+假设每个厂商插件都能直接写 Node：
+
+```text
+插件 A 写 Capacity
+插件 B 写 Allocatable
+kubelet 同时更新 CPU/内存/临时盘
+多个写者并发覆盖同一个 status
+权限、重试、冲突和审计边界全部混在一起
+```
+
+现在的设计把 Node Status 的写权限收口给 kubelet：
+
+```text
+插件只报告设备事实
+kubelet统一组装节点事实
+API Server只看到一个节点代理的状态写入
+```
+
+代价是状态传播多了一跳，收益是**单写者、统一校验、统一重试和更清楚的责任边界**。
+
+### 1.3 为什么 ListAndWatch 发完整清单，而不是只发增量事件
+
+如果只发送：
+
+```text
+GPU-1 added
+GPU-3 unhealthy
+GPU-5 removed
+```
+
+一旦 kubelet 重连、插件重启或中间丢过事件，双方就可能永远对不上账。
+
+完整快照的思路是：
+
+```text
+每次 response 都表达“我现在认可的全部设备”
+旧快照整体被新快照替换
+重连后再发一份完整清单即可重新收敛
+```
+
+它牺牲了一点网络和重建 map 的成本，换来了**幂等和最终收敛**。对于每个节点几十到几百个设备 entry，这个取舍通常很划算。
+
+### 1.4 为什么 Capacity 包含 Unhealthy，而 Allocatable 只包含 Healthy
+
+Kubernetes 希望同时表达两个事实：
+
+```text
+Capacity:
+  这个插件当前登记过多少个设备单位
+
+Allocatable:
+  当前允许继续分配多少个健康设备单位
+```
+
+所以 8 个 entry 中 1 个 Unhealthy 时：
+
+```text
+Capacity = 8
+Allocatable = 7
+```
+
+如果把坏设备直接从 Capacity 抹掉，平台会失去“硬件仍存在但不可分配”的差异；如果 Allocatable 也保留 8，scheduler 又可能继续把新 Pod 放到坏设备上。
+
+### 1.5 为什么插件断开后不立刻把 Capacity 清零
+
+插件短暂重启、socket 切换或节点负载抖动，不代表 8 张 GPU 在同一瞬间物理消失。当前源码保留 5 分钟停止宽限期：
+
+```text
+刚断开：Capacity 保留，Allocatable 立即变 0
+宽限期后仍未恢复：Capacity 和 Allocatable 都变 0
+```
+
+这个设计的目标不是“保证业务不断”，而是避免一次瞬时插件抖动立刻把节点硬件身份从集群里抹掉，同时阻止新分配继续发生。
 
 ---
 
-## 8. `PluginConnected`主动读取真正的插件选项
+## 2. 先建立六本账，后面所有源码都往账上放
+
+| 账本 | 谁维护 | 记录什么 | 本案故障时的状态 |
+|---|---|---|---|
+| 宿主机硬件账 | Driver/NVML | host 能看到哪些 GPU | 8 张 |
+| 插件进程账 | kubelet/CRI | Plugin Pod、进程、socket 是否存在 | Running，socket 存在 |
+| 注册关系账 | Device Plugin server | resourceName 对应哪个 gRPC client | 已 connected |
+| 设备快照账 | DeviceManager | all/healthy/unhealthy device IDs | 尚未形成第一份快照 |
+| Node 广告账 | kubelet Node status | Capacity/Allocatable | 字段 absent |
+| 调度占用账 | scheduler | Node 广告量减去已绑定 Pod requests | 可用量 0 |
+
+本章最关键的认识是：
 
 ```text
-pkg/kubelet/cm/devicemanager/manager.go:228-245
+前一本账正确
+  != 后一本账已经正确
 ```
 
-```go
-func (m *ManagerImpl) PluginConnected(
-    ctx context.Context,
-    resourceName string,
-    p plugin.DevicePlugin,
-) error {
-    options, err :=
-        p.API().
-            GetDevicePluginOptions(
-                ctx,
-                &pluginapi.Empty{},
-            )
-    if err != nil {
-        return fmt.Errorf(
-            "failed to get device plugin options: %v",
-            err,
-        )
-    }
-
-    e := newEndpointImpl(p)
-
-    m.mutex.Lock()
-    defer m.mutex.Unlock()
-    m.endpoints[resourceName] =
-        endpointInfo{e, options}
-    return nil
-}
-```
-
-Go现场补——这里第一次真正加锁：
-
-- `m.mutex.Lock()`只是在**当前kubelet进程内**保护`endpoints`共享map，避免连接、断连、Node status读取等goroutine并发读写；
-- `defer m.mutex.Unlock()`保证函数返回前释放锁；
-- 它不等于分布式锁，也不会同步等待apiserver或scheduler完成更新；
-- 所以“锁内写入endpoint成功”和“Node API已出现Capacity”仍是两个完成点。
-
-`DevicePluginOptions`主要告诉kubelet：
-
-- 是否需要 `PreStartContainer`；
-- 是否支持 `GetPreferredAllocation`；
-- 当前API版本的其他能力。
-
-本课只记“何时读取和保存”。具体怎样影响第 16 课的分配链，后面再展开。
-
-注册到这里仍只说明：
+例如：
 
 ```text
-kubelet能连上插件
-并获取能力选项
+nvidia-smi 有 8 张卡
+  != 插件已注册
+
+插件已注册
+  != 第一份 ListAndWatch 已处理
+
+Node Allocatable=8
+  != 当前还剩 8 个可调度单位
 ```
 
-Node resource尚未必出现。
+### 2.1 五条必须保持的系统不变量
+
+1. 一个 resourceName 在 kubelet 内应对应一个当前有效 endpoint。
+2. `allDevices`、`healthyDevices`、`unhealthyDevices`应来自同一份快照。
+3. 同一个 device ID 在同一份插件清单中应唯一且健康状态一致。
+4. `Capacity = healthy set 数量 + unhealthy set 数量`。
+5. scheduler 的实时剩余量不写回 Node Allocatable，而由 scheduler 自己减去 Pod requests。
+
+如果现场违反这些不变量，就不能只靠“重启插件试试”掩盖问题，要继续追查版本、配置或插件实现。
 
 ---
 
-## 9. `ListAndWatch`：不是心跳，是完整设备清单流
+## 3. 本课怎么读：哪些读深，哪些只知道边界
+
+### 第一遍：必须读到 S3
 
 ```text
-pkg/kubelet/cm/devicemanager/plugin/v1beta1/client.go:81-107
+direct Register
+  -> connectClient
+  -> GetDevicePluginOptions
+  -> ListAndWatch first snapshot
+  -> 重建三张设备表
+  -> GetCapacity
+  -> Node Capacity/Allocatable
+  -> disconnect 两阶段收敛
 ```
 
+这是 NVIDIA Device Plugin “资源为什么没出现在 Node 上”的主排障链。
+
+### 第二遍：读到 S2 即可
+
+- 通用 plugin watcher 的 `GetInfo -> Validate -> Register -> Notify`；
+- checkpoint 的恢复与失败边界；
+- `ResourceHealthStatus`怎样把已分配设备健康写进 Pod status；
+- Device Plugin 注册指标与 generic plugin manager 指标。
+
+### 本课一笔带过
+
+- gRPC/HTTP2 底层帧；
+- NVIDIA 插件内部 NVML 枚举实现；
+- MIG Manager、time-slicing 和 MPS 的完整实现；
+- DRA driver 的 claim 分配链；
+- `Allocate`、Topology Manager 和 CDI 注入，留到第 16 课。
+
+### 源码阅读约定
+
+1. 源码路径都相对本地 `kubernetes/` 目录。
+2. 代码以固定 commit `301946d...` 为准，不用滚动的 GitHub `master`代替。
+3. 代码块中的中文 `//`是教学注释；删除这些中文注释后，业务语句与当前源码一致。
+4. 为了让你先看懂状态变化，少数长函数只摘连续的关键区间；不会用省略号伪造不存在的控制流。
+5. 每个源码块后都有“大白话总结”和“顺手学 Go”，不用先系统学完整本 Go 教材。
+
+---
+
+## 4. 入口之前：kubelet 先恢复旧账，再启动注册服务
+
+源码：`pkg/kubelet/cm/devicemanager/manager.go::Start`
+
 ```go
+// Start 接收 kubelet 已知的 Pod、容器和 source 就绪信息，然后启动 DeviceManager。
+func (m *ManagerImpl) Start(logger klog.Logger, activePods ActivePodsFunc, sourcesReady config.SourcesReady, initialContainers containermap.ContainerMap, initialContainerRunningSet sets.Set[string]) error {
+	// 记录 DeviceManager 开始启动；V(2) 表示需要相应日志级别才能看到。
+	logger.V(2).Info("Starting Device Plugin manager")
+
+	// 保存一个函数，后面需要时可读取当前活跃 Pod。
+	m.activePods = activePods
+	// 保存 kubelet 配置源是否已经就绪的判断器。
+	m.sourcesReady = sourcesReady
+	// 保存 kubelet 启动时已经知道的 container ID 映射。
+	m.containerMap = initialContainers
+	// 保存启动时仍在运行的 container ID 集合。
+	m.containerRunningSet = initialContainerRunningSet
+
+	// 先尝试从磁盘 checkpoint 恢复历史分配账。
+	err := m.readCheckpoint(logger)
+	// checkpoint 读取失败不会直接阻止 DeviceManager 启动。
+	if err != nil {
+		// kubelet 明确记录“分配信息可能不是最新”，然后继续启动。
+		logger.Error(err, "Continue after failing to read checkpoint file. Device allocation info may NOT be up-to-date")
+	}
+
+	// 最后启动 Device Plugin registration gRPC server。
+	return m.server.Start(logger)
+}
+```
+
+**大白话总结：** kubelet 重启后不是直接等插件重新报卡，而是先读旧的分配账，再监听插件注册。checkpoint 失败属于“带风险继续”，不是“自动回到完全正确的空状态”。本案明确是新节点且没有历史 checkpoint，所以第一份 Node GPU 数量只能等插件新快照形成。
+
+**顺手学 Go：**
+
+- `func (m *ManagerImpl) Start`：`m`叫接收者，表示这是 `ManagerImpl`对象的方法，类似 Java 的实例方法。
+- `err :=`：短变量声明，Go 根据右侧返回值推断 `err`类型。
+- `if err != nil`：Go 用 `nil`表示“没有对象/没有错误值”；错误不为 `nil`就进入分支。
+- `return m.server.Start(logger)`：直接把下层函数返回的 `error`原样返回。
+
+### 4.1 这里体现了什么设计思想
+
+checkpoint 是**恢复优化**，不是插件存活证明：
+
+```text
+checkpoint 告诉 kubelet：过去哪些设备分给过哪些容器
+ListAndWatch 告诉 kubelet：插件现在认可哪些设备以及当前健康状态
+```
+
+把两者混成一本账会产生危险结论：旧 checkpoint 里有 8 个 ID，不代表当前插件和硬件已经健康。
+
+---
+
+## 5. 主入口：NVIDIA 插件怎样通过 direct Register 报到
+
+本案走传统 direct registration：插件主动连接固定的 kubelet socket，然后发送 `RegisterRequest`。
+
+```text
+插件连接：/var/lib/kubelet/device-plugins/kubelet.sock
+请求里携带：Version、Endpoint、ResourceName、Options
+kubelet 回连：/var/lib/kubelet/device-plugins/nvidia-gpu.sock
+```
+
+当前 `server.Register`真正读取的是 `Version`、`Endpoint`和 `ResourceName`；它没有用 `RegisterRequest.Options`决定插件能力。能力协商发生在回连后的独立 `GetDevicePluginOptions` RPC，不能把这两份 Options 混成一步。
+
+源码：`pkg/kubelet/cm/devicemanager/plugin/v1beta1/server.go::Register`
+
+```go
+// Register 是插件调用的注册 RPC；ctx 带着这次请求的上下文，r 是请求对象。
+func (s *server) Register(ctx context.Context, r *api.RegisterRequest) (*api.Empty, error) {
+	// 从 RPC context 中取出结构化 logger。
+	logger := klog.FromContext(ctx)
+	// 只说明 kubelet 收到注册请求，还不说明设备清单已经到达。
+	logger.Info("Got registration request from device plugin with resource", "resourceName", r.ResourceName)
+	// direct 注册计数器在校验之前就加一，因此“计数增加”不等于注册成功。
+	metrics.DevicePluginRegistrationCount.WithLabelValues(r.ResourceName).Inc()
+
+	// 先检查插件声明的 API 版本是否与 kubelet 兼容。
+	if !s.isVersionCompatibleWithPlugin(r.Version) {
+		// 构造“不支持版本”的错误。
+		err := fmt.Errorf(errUnsupportedVersion, r.Version, api.SupportedVersions)
+		// 日志保留 resourceName，方便区分不同插件。
+		logger.Error(err, "Bad registration request from device plugin with resource", "resourceName", r.ResourceName)
+		// 返回空响应和错误，后续不会建立 client。
+		return &api.Empty{}, err
+	}
+
+	// 再检查 resourceName 是否符合扩展资源命名规则，例如 nvidia.com/gpu。
+	if !v1helper.IsExtendedResourceName(core.ResourceName(r.ResourceName)) {
+		// 构造非法资源名错误。
+		err := fmt.Errorf(errInvalidResourceName, r.ResourceName)
+		// 记录错误；此时依然没有连接插件 endpoint。
+		logger.Error(err, "Bad registration request from device plugin")
+		// 拒绝这次注册。
+		return &api.Empty{}, err
+	}
+
+	// Endpoint 是插件报来的文件名；kubelet把它拼到固定 socket 目录后再反向连接。
+	if err := s.connectClient(ctx, r.ResourceName, filepath.Join(s.socketDir, r.Endpoint)); err != nil {
+		// 反向连接、GetDevicePluginOptions 等任一步失败都会到这里。
+		logger.Error(err, "Error connecting to device plugin client")
+		// 注册 RPC 返回失败。
+		return &api.Empty{}, err
+	}
+
+	// 能走到这里，只能证明客户端连接阶段成功；第一份 ListAndWatch 仍可能没到。
+	return &api.Empty{}, nil
+}
+```
+
+**大白话总结：** `Register`不是“把 8 张 GPU 写进 Node”的 RPC。它只做报到、校验和建立回连。最容易误判的地方有两个：计数器在校验前就增加；`Register`返回成功时，后台 `ListAndWatch`才刚准备启动。
+
+**顺手学 Go：**
+
+- `r *api.RegisterRequest`：`r`是指向请求结构体的指针，避免复制整个对象。
+- `!condition`：逻辑取反，相当于 Java 的 `!condition`。
+- `if err := call(); err != nil`：把变量声明和判断写在同一个 `if`里，`err`只在这个 `if`作用域可见。
+- `&api.Empty{}`：创建一个 `api.Empty`结构体并取得它的地址。
+- `filepath.Join`：按操作系统路径规则安全拼接，不是普通字符串相加。
+
+### 5.1 为什么 resourceName 必须是扩展资源名
+
+插件不能注册一个裸名字 `gpu`去冒充 Kubernetes 内置资源。`nvidia.com/gpu`中的域名前缀形成了所有权边界：
+
+```text
+nvidia.com/gpu
+└─ 厂商/组织域名 ─┘ └资源名┘
+```
+
+这避免第三方插件覆盖 `cpu`、`memory`等核心资源语义。
+
+### 5.2 为什么 Endpoint 只报文件名
+
+direct 路径由 kubelet掌握 socket 根目录，插件只报告 endpoint：
+
+```text
+s.socketDir = /var/lib/kubelet/device-plugins/
+r.Endpoint  = nvidia-gpu.sock
+最终路径    = /var/lib/kubelet/device-plugins/nvidia-gpu.sock
+```
+
+如果插件容器的 hostPath、mountPath 或 endpoint 参数对不上，Plugin Pod 可以是 Running，但 kubelet 回连仍然失败。
+
+---
+
+## 6. Register 成功之前，connectClient 实际完成了什么
+
+源码：`pkg/kubelet/cm/devicemanager/plugin/v1beta1/handler.go::connectClient`
+
+```go
+// connectClient 为一个 resourceName 创建并连接 Device Plugin client。
+func (s *server) connectClient(ctx context.Context, name string, socketPath string) error {
+	// 获取本次注册链路使用的 logger。
+	logger := klog.FromContext(ctx)
+	// 先创建只保存 resourceName、socketPath 和回调接口的 client 对象。
+	c := NewPluginClient(name, socketPath, s.chandler)
+
+	// 先把 client 放入 server.clients；连接失败时下面会删掉。
+	s.registerClient(logger, name, c)
+	// Connect 会拨号，并同步调用 DeviceManager.PluginConnected。
+	if err := c.Connect(ctx); err != nil {
+		// 连接失败就回滚刚才登记的 client。
+		s.deregisterClient(logger, name)
+		// 记录具体 resourceName。
+		logger.Error(err, "Failed to connect to new client", "resource", name)
+		// 把错误传回 direct Register 或 generic handler。
+		return err
+	}
+
+	// 到这里说明连接阶段成功，但 ListAndWatch 的第一份 response 还没处理。
+	logger.V(2).Info("Connected to new client", "resource", name)
+	// 启动一个新的 goroutine，在后台长期运行 ListAndWatch。
+	go func() {
+		// runClient 会一直等到 stream 结束，再执行 disconnect。
+		s.runClient(ctx, name, c)
+	}()
+
+	// 主协程立即返回，因此注册完成与 first snapshot 之间天然存在时间差。
+	return nil
+}
+```
+
+**大白话总结：** `connectClient`先同步完成连接，再异步启动长流。也就是说：注册 RPC 可以先返回成功，而真正的设备清单仍在后台等待。这正是本案“已经 connected，但 Node 资源 absent”的源码基础。
+
+**顺手学 Go：**
+
+- `c := NewPluginClient(...)`：`:=`同时声明并赋值。
+- `go func() { ... }()`：定义一个匿名函数并马上放到新的 goroutine 执行，可类比 Java 里把任务提交给线程执行，但 goroutine 更轻量。
+- goroutine 启动后，当前函数不会等待它完成，所以后面的 `return nil`会先返回。
+- 闭包会捕获外层的 `ctx`、`name`和 `c`。
+
+### 6.1 Connect 为什么还会调用 PluginConnected
+
+`client.Connect`完成 Unix socket gRPC 拨号后，会调用 handler：
+
+```go
+// Connect 建立 kubelet 到插件 endpoint 的 gRPC 连接。
+func (c *client) Connect(ctx context.Context) error {
+	// 获取这条连接链的 logger。
+	logger := klog.FromContext(ctx)
+	// dial 返回 DevicePlugin API client、底层连接和错误。
+	client, conn, err := dial(ctx, c.socket)
+	// 拨号失败就记录路径并返回。
+	if err != nil {
+		// socket 路径是关键证据，但外发日志时要脱敏节点目录信息。
+		logger.Error(err, "Unable to connect to device plugin client with socket path", "path", c.socket)
+		// 上层 connectClient 会删除刚登记的 client。
+		return err
+	}
+	// 写共享字段前加锁，防止与 Disconnect 并发。
+	c.mutex.Lock()
+	// 保存底层 gRPC connection。
+	c.grpc = conn
+	// 保存生成的 DevicePlugin API client。
+	c.client = client
+	// 写完共享字段后解锁。
+	c.mutex.Unlock()
+	// 最后同步通知 DeviceManager；它还会调用 GetDevicePluginOptions。
+	return c.handler.PluginConnected(ctx, c.resource, c)
+}
+```
+
+**大白话总结：** “socket 能 dial 通”仍然不是完整成功。`PluginConnected`如果读取插件选项失败，`Connect`就返回错误，direct Register 也会失败。
+
+**顺手学 Go：**
+
+- `client, conn, err := dial(...)`：Go 函数可以返回多个值，这里一次接三个。
+- `c.mutex.Lock()` / `Unlock()`：保护 `c.grpc`和 `c.client`这两个会被并发访问的字段。
+- `return c.handler.PluginConnected(...)`：把下层的错误直接交给调用者，不额外包装。
+
+### 6.2 PluginConnected 先读取插件能力，再保存 endpoint
+
+源码：`pkg/kubelet/cm/devicemanager/manager.go::PluginConnected`
+
+```go
+// PluginConnected 在连接建立阶段把插件能力和 endpoint 放进 DeviceManager。
+func (m *ManagerImpl) PluginConnected(ctx context.Context, resourceName string, p plugin.DevicePlugin) error {
+	// 从调用链 context 中取得 logger。
+	logger := klog.FromContext(ctx)
+	// 同步调用插件的 GetDevicePluginOptions；当前函数自己没有另加独立超时。
+	options, err := p.API().GetDevicePluginOptions(ctx, &pluginapi.Empty{})
+	// 读取能力失败就拒绝进入 endpoints 账本。
+	if err != nil {
+		// 包装错误，告诉上层失败发生在 options 阶段。
+		return fmt.Errorf("failed to get device plugin options: %v", err)
+	}
+
+	// 用已经连接的 plugin client 创建 endpoint 实现。
+	e := newEndpointImpl(p)
+
+	// 修改共享 endpoints map 前加锁。
+	m.mutex.Lock()
+	// defer 表示函数退出时一定执行 Unlock。
+	defer m.mutex.Unlock()
+	// resourceName 作为 key，保存 endpoint 和插件选项。
+	m.endpoints[resourceName] = endpointInfo{e, options}
+
+	// 这条日志证明 endpoint 已保存，仍不证明 ListAndWatch 已经产生设备快照。
+	logger.V(2).Info("Device plugin connected", "resourceName", resourceName)
+	// 连接阶段成功。
+	return nil
+}
+```
+
+**大白话总结：** 本案已经看到 `Device plugin connected`，因此可以把断点放到 `GetDevicePluginOptions`之后。但这条日志之前还没启动 `ListAndWatch`接收循环，所以不能据此宣称 8 个 device ID 已进入 kubelet。
+
+**顺手学 Go：**
+
+- `defer m.mutex.Unlock()`：无论后面正常返回还是提前返回，函数结束前都解锁。
+- `endpointInfo{e, options}`：按字段声明顺序构造结构体；阅读时要回到类型定义确认两个位置各代表什么。
+- `fmt.Errorf`：构造带上下文的错误字符串；这里使用 `%v`嵌入原错误。
+
+### 6.3 一个很容易抄错的超时结论
+
+通用 plugin watcher 在调用 `GetInfo`时显式使用 1 秒 timeout；但上面的 `GetDevicePluginOptions`没有在该函数内部再创建一个 1 秒 timeout。
+
+```text
+generic GetInfo 有 1 秒 timeout
+  != DevicePlugin GetDevicePluginOptions 也有同一个 timeout
+```
+
+direct 路径沿用传入的 RPC context；generic handler 当前又用背景 context 调用 `connectClient`。排障时必须按实际入口分别看，不能把一个函数的 timeout 记到另一个函数头上。
+
+---
+
+## 7. 本案真正断住的地方：ListAndWatch 第一份快照
+
+Device Plugin API 把 `ListAndWatch`定义为 server-streaming：kubelet发一个空请求，插件可以持续返回多份完整设备清单。
+
+当前源码在这里使用了 `context.TODO()`。下面仍是 Go 源码，使用 `text`围栏只是为了把这个上游待改进点保留下来，不把它当成推荐写法。
+
+源码：`pkg/kubelet/cm/devicemanager/plugin/v1beta1/client.go::Run`
+
+```text
+// Run 在一个后台 goroutine 里维护 ListAndWatch 接收循环。
 func (c *client) Run(ctx context.Context) {
+    // 取出 logger；ctx 主要用于日志上下文。
     logger := klog.FromContext(ctx)
-    stream, err :=
-        c.client.ListAndWatch(
-            context.TODO(),
-            &api.Empty{},
-        )
+    // 当前源码没有把传入 ctx 直接交给长流，而是使用 context.TODO()。
+    stream, err := c.client.ListAndWatch(context.TODO(), &api.Empty{})
+    // 建流失败就记录错误并退出，不在这个函数内部自动重连。
     if err != nil {
-        logger.Error(
-            err,
-            "ListAndWatch ended unexpectedly...",
-        )
+        logger.Error(err, "ListAndWatch ended unexpectedly for device plugin", "resource", c.resource)
         return
     }
 
+    // 建流成功后进入无限接收循环。
     for {
+        // Recv 会阻塞，直到插件推来下一份 response 或 stream 出错。
         response, err := stream.Recv()
+        // stream 结束或接收失败就退出循环。
         if err != nil {
-            logger.Error(
-                err,
-                "ListAndWatch ended unexpectedly...",
-            )
+            logger.Error(err, "ListAndWatch ended unexpectedly for device plugin", "resource", c.resource)
             return
         }
-        c.handler.
-            PluginListAndWatchReceiver(
-                logger,
-                c.resource,
-                response,
-            )
+        // resourceCapacity 只是本次 response.Devices 的长度。
+        logger.V(2).Info("State pushed for device plugin", "resource", c.resource, "resourceCapacity", len(response.Devices))
+        // 把整份 response 交给 DeviceManager 重建设备账。
+        c.handler.PluginListAndWatchReceiver(logger, c.resource, response)
     }
 }
 ```
 
-Go现场补——`for { stream.Recv() }`：
+**大白话总结：** `ListAndWatch`不是 kubelet 每隔几秒去轮询一次，也不是注册 RPC 顺带带回设备列表。它是一条独立长流。`Recv()`在第一份 response 到来之前可以一直阻塞，所以 Plugin Pod Running、Register 成功、connected 成功都可能与 Node 资源 absent 同时成立。
 
-- 无条件循环持续收server-stream消息；
-- `Recv`阻塞等待下一份response；
-- `err != nil`立即return，本层没有自动backoff/reconnect；
-- 它与遍历slice的 `for _, x := range xs`不是同一种循环。
+**顺手学 Go：**
 
-### 9.1 server-streaming怎么理解
+- `for {}`：没有条件的无限循环，相当于 Java 的 `while (true)`。
+- `stream.Recv()`：阻塞式调用；没有消息时 goroutine 会等待，不会自动返回空列表。
+- `len(response.Devices)`：读取 slice 长度；它是输入条目数，不等于去重后的 Capacity。
+- `context.TODO()`：表示调用者知道这里应该有更合适的 context，但当前还没有整理好；它不是 timeout。
 
-```text
-kubelet发一次ListAndWatch请求
-  -> 插件持续往同一条stream发response
-  -> 每次设备集合或health变化时再发新清单
-```
+### 7.1 为什么 first snapshot 是独立里程碑
 
-它不是：
+把时间线精确拆开：
 
 ```text
-每10秒一次固定心跳
-每个device一个增量事件
-Kubernetes watch resourceVersion
+T0 Plugin 进程启动并监听 nvidia-gpu.sock
+T1 Plugin 调用 direct Register
+T2 kubelet 校验版本和 resourceName
+T3 kubelet dial 插件 endpoint
+T4 GetDevicePluginOptions 成功
+T5 Device plugin connected 日志出现
+T6 后台 goroutine 调用 ListAndWatch
+T7 第一份 response 到达
+T8 DeviceManager 重建三张设备表
+T9 下次 Node Status 组装时读取 Capacity/Allocatable
+T10 API Server 中 Node status 更新
+T11 scheduler cache 观察到新 Node 资源
 ```
 
-### 9.2 第一份response为什么关键
+本案证据只到 T5，所以最小断点是 T6～T7，不应该直接跳到 scheduler。
 
-注册完成时：
+### 7.2 当前 client.Run 自己没有重连循环
+
+`Recv()`报错后 `Run`直接返回；`runClient`随后 disconnect。重新注册依赖插件或通用 watcher 再次触发，不是这个 `for`循环悄悄重拨。
+
+因此生产日志里的这条信息很重要：
 
 ```text
-endpoints[resourceName]已经有连接
+ListAndWatch ended unexpectedly
 ```
 
-但只有第一份response到达，才有：
-
-```text
-allDevices
-healthyDevices
-unhealthyDevices
-```
-
-所以完整时间线是：
-
-```text
-registered
-  < first ListAndWatch response
-  < Node status updated
-  < scheduler cache updated
-```
-
-### 9.3 当前client没有内部自动重连循环
-
-`ListAndWatch`建流失败或 `Recv`返回错误时，`Run`直接return。恢复通常依赖：
-
-- generic入口：registration socket删除/重建被通用watcher发现，再走desired/actual reconcile；
-- direct入口：插件监测kubelet重启/`kubelet.sock`被重建等信号，重新监听自己的socket并主动调用`Register`；
-- 插件进程自身restart/reconcile，或DaemonSet/Operator按既定策略重新拉起。
-
-删除direct插件自己的socket，不能笼统描述成“通用plugin manager一定会发现并恢复”；只有它确实也作为generic registration socket被watch时才属于那条入口。两套入口是替代入口，各按自己的协议恢复。
-
-不能只等“这个goroutine自己无限重试”。
+它不是普通心跳丢一拍，而是当前这条 stream 已经结束。
 
 ---
 
-## 10. 每份response怎样重建三张设备表
+## 8. 一份 response 怎样替换成三张设备表
 
-接收：
+三张表的职责：
 
 ```text
-pkg/kubelet/cm/devicemanager/manager.go:263-322
+allDevices[resourceName][deviceID] = 完整 Device 对象
+healthyDevices[resourceName]       = 可继续分配的 ID 集合
+unhealthyDevices[resourceName]     = 已登记但不可继续分配的 ID 集合
 ```
 
+源码：`pkg/kubelet/cm/devicemanager/manager.go::genericDeviceUpdateCallback`
+
 ```go
-func (m *ManagerImpl) PluginListAndWatchReceiver(
-        logger klog.Logger,
-        resourceName string,
-        resp *pluginapi.ListAndWatchResponse,
-    ) {
-    m.genericDeviceUpdateCallback(
-        logger,
-        resourceName,
-        resp.Devices,
-    )
+// genericDeviceUpdateCallback 接收某个 resourceName 的一整份设备快照。
+func (m *ManagerImpl) genericDeviceUpdateCallback(logger klog.Logger, resourceName string, devices []*pluginapi.Device) {
+	// healthyCount 只用于最后的日志；它按输入条目递增。
+	healthyCount := 0
+	// 重建共享设备表前加锁。
+	m.mutex.Lock()
+	// 为本资源创建一个全新的 healthy ID 集合，旧集合被替换。
+	m.healthyDevices[resourceName] = sets.New[string]()
+	// 为本资源创建一个全新的 unhealthy ID 集合，旧集合被替换。
+	m.unhealthyDevices[resourceName] = sets.New[string]()
+	// 暂存上一次完整设备 map，后面用于比较健康变化。
+	oldDevices := m.allDevices[resourceName]
+	// 收集需要刷新 Pod status 的 Pod UID。
+	podsToUpdate := sets.New[string]()
+	// 为本资源创建一个全新的 allDevices map，表示 full snapshot 替换。
+	m.allDevices[resourceName] = make(map[string]*pluginapi.Device)
+	// 逐个处理插件本次上报的设备 entry。
+	for _, dev := range devices {
+
+		// 只有启用 ResourceHealthStatus 时才计算哪些已分配 Pod 需要刷新健康状态。
+		if utilfeature.DefaultFeatureGate.Enabled(features.ResourceHealthStatus) {
+			// 定义一个局部函数：device 已分配给 Pod 时，把 Pod UID 放入待更新集合。
+			updatePodUIDFn := func(deviceID string) {
+				// 通过分配账反查这个 device ID 对应的 Pod 和 container。
+				podUID, _ := m.podDevices.getPodAndContainerForDevice(deviceID)
+				// 空字符串表示没有找到已分配 Pod。
+				if podUID != "" {
+					// 集合 Insert 会去重，同一个 Pod 只需通知一次。
+					podsToUpdate.Insert(podUID)
+				}
+			}
+			// 如果旧快照里也有这个 ID，就比较健康状态是否变化。
+			if oldDev, ok := oldDevices[dev.ID]; ok {
+				// 只有健康字符串变化时才通知已分配 Pod。
+				if oldDev.Health != dev.Health {
+					// 记录需要重算 status 的 Pod。
+					updatePodUIDFn(dev.ID)
+				}
+			} else {
+				// 本次新出现的 ID 也可能是“消失后重新回来”的已分配设备。
+				updatePodUIDFn(dev.ID)
+			}
+		}
+
+		// 以 device ID 为 key 写入新的完整设备 map。
+		m.allDevices[resourceName][dev.ID] = dev
+		// 只有健康字符串精确等于协议常量 Healthy 才进入 healthy 集合。
+		if dev.Health == pluginapi.Healthy {
+			// 插入 healthy set；同一 ID 重复插入不会增加 set 长度。
+			m.healthyDevices[resourceName].Insert(dev.ID)
+			// 日志计数按输入条目加一，因此异常重复 ID 可能让日志值与 set 长度不同。
+			healthyCount++
+		} else {
+			// 其他任何健康字符串都进入 unhealthy set。
+			m.unhealthyDevices[resourceName].Insert(dev.ID)
+		}
+	}
+	// 三张内存表已经替换完成，先释放主锁。
+	m.mutex.Unlock()
+
+	// 只有启用 ResourceHealthStatus 才发送 Pod status 刷新通知。
+	if utilfeature.DefaultFeatureGate.Enabled(features.ResourceHealthStatus) {
+		// 有受影响 Pod 时才尝试写 channel。
+		if len(podsToUpdate) > 0 {
+			// select 加 default 表示 channel 满时不阻塞这条设备更新链。
+			select {
+			// 把去重后的 Pod UID 列表发给资源更新消费者。
+			case m.update <- resourceupdates.Update{PodUIDs: podsToUpdate.UnsortedList()}:
+			// channel 满时丢弃本次通知并记录错误。
+			default:
+				// 设备内存账已经更新；这里失败不会回滚刚才的三张表。
+				logger.Error(goerrors.New("device update channel is full"), "discard pods info", "podsToUpdate", podsToUpdate.UnsortedList())
+			}
+		}
+	}
+
+	// 把当前分配账和已注册 healthy IDs 写入 checkpoint。
+	if err := m.writeCheckpoint(logger); err != nil {
+		// checkpoint 失败只记录日志，不回滚已经生效的内存快照。
+		logger.Error(err, "Writing checkpoint encountered")
+	}
+	// 最后记录输入条目数和按输入统计的 healthyCount。
+	logger.V(2).Info("Processed device updates for resource", "resourceName", resourceName, "totalCount", len(devices), "healthyCount", healthyCount)
 }
 ```
 
-核心更新：
+**大白话总结：** 每一份 response 都不是在旧表上“加几个、减几个”，而是先创建新的集合和 map，再用本次清单重新填满。本次没有出现的旧 ID 会从新快照中消失。内存表先成功，Pod 更新通知和 checkpoint 后做；后两者失败都不会把设备表回滚。
 
-```go
-m.mutex.Lock()
+**顺手学 Go：**
 
-m.healthyDevices[resourceName] =
-    sets.New[string]()
-m.unhealthyDevices[resourceName] =
-    sets.New[string]()
+- `make(map[string]*pluginapi.Device)`：创建一个可写 map；只声明不 `make`的 nil map 不能直接写 key。
+- `for _, dev := range devices`：遍历 slice，`_`表示丢弃下标，只保留元素。
+- `oldDev, ok := oldDevices[dev.ID]`：map 的 comma-ok 写法；`ok=false`表示 key 不存在。
+- `func(deviceID string) { ... }`：局部匿名函数，可捕获外层的 `podsToUpdate`和 `m`。
+- `select { case ch <- value: default: }`：尝试非阻塞发送；channel 满时走 `default`。
 
-oldDevices := m.allDevices[resourceName]
-m.allDevices[resourceName] =
-    make(map[string]*pluginapi.Device)
+### 8.1 full snapshot 的四个精确后果
 
-for _, dev := range devices {
-    m.allDevices[resourceName][dev.ID] = dev
+#### 后果一：旧 ID 本次不出现，就从三张新表中消失
 
-    if dev.Health == pluginapi.Healthy {
-        m.healthyDevices[resourceName].
-            Insert(dev.ID)
-    } else {
-        m.unhealthyDevices[resourceName].
-            Insert(dev.ID)
-    }
-}
+这不是显式执行 `delete(oldID)`，而是因为新 map 从空开始重建。
 
-m.mutex.Unlock()
+#### 后果二：旧 ID 消失不会在本次循环里触发 Pod 更新通知
 
-m.writeCheckpoint(logger)
-```
+循环只遍历**新清单中的 device**。如果 `GPU-bbbb`存在于旧快照、却完全不在新快照中，这一轮不会进入它的比较分支，也就不会因为“消失”直接把已分配 Pod UID 放入 `podsToUpdate`。
 
-Go现场补——map与set重建：
+如果该 ID 以后重新出现，`else`分支才会尝试通知对应 Pod。
 
-- `make(map[...])`创建新map；
-- `sets.New[string]()`创建空集合；
-- 把它们赋回 `m.*Devices[resourceName]`会替换该resource上一版账；
-- 因而这里是full snapshot replacement，不是incremental merge。
+#### 后果三：checkpoint 失败不等于 Node 数量一定没有更新
 
-### 10.1 为什么说response是完整清单
-
-每次先：
-
-```go
-healthyDevices[resource] = empty
-unhealthyDevices[resource] = empty
-allDevices[resource] = new map
-```
-
-再按当前response全部重建。
-
-因此：
+顺序是：
 
 ```text
-上次有 device-a、device-b
-这次只发 device-a
-  -> device-b不是“保持旧状态”
-  -> 它从当前设备集合消失
+先改内存表
+  -> 解锁
+  -> 尝试通知 Pod
+  -> 尝试写 checkpoint
+  -> 失败只记日志
 ```
 
-插件不能只发送“变化的那一个逻辑device entry”而期待kubelet自动与旧列表合并。
+因此 checkpoint 写失败时，当前进程中的 `GetCapacity`仍可能读到新数量；真正增加的是 kubelet 重启后的恢复风险。
 
-### 10.2 只有精确 `Healthy` 才算健康
+#### 后果四：插件必须保证 device ID 唯一且健康状态一致
 
-```go
-if dev.Health == pluginapi.Healthy
-```
+同一 ID 重复且都是 Healthy：set 会去重，但日志里的 `healthyCount`可能按重复条目增长。
 
-其他字符串进入unhealthy集合。设备插件协议定义：
-
-```text
-Healthy
-Unhealthy
-```
-
-不要让厂商插件自创 `OK`、`healthy`、`Degraded`并假设kubelet能理解。
-
-### 10.3 device ID是opaque string
-
-`dev.ID`可能是：
-
-- GPU UUID；
-- index；
-- MIG device ID；
-- vGPU ID；
-- time-slicing插件构造的share ID；
-- 其他厂商插件自定义标识。
-
-kubelet主要按字符串唯一性消费。Node Status只暴露数量，不把这些ID写进 `capacity`。
-
-所以：
-
-```text
-Node capacity nvidia.com/gpu=8
-  != scheduler知道8个GPU UUID
-```
-
-具体哪一个ID给哪个container，留到第 16 课。
-
-### 10.4 重复ID不能用response长度掩盖
-
-`allDevices`是map、healthy/unhealthy是set。若错误插件在一份response里重复同一ID：
-
-- `len(response.Devices)`可能包含重复项；
-- 同一ID、同一Health重复时，会在同一个set里去重；
-- 同一ID若一条`Healthy`、另一条非`Healthy`，可能同时进入healthy与unhealthy两个set；
-- `allDevices` map对同一key执行最后一次写覆盖，但两个health set不会替插件做跨集合冲突消解；
-- 因此冲突Health的同一ID可能在`Capacity = healthy.Len + unhealthy.Len`里被双计；
-- 日志里的`len(response.Devices)`和循环内`healthyCount`也可能统计原始重复entry；
-- `State pushed ... resourceCapacity=<len>`日志不等于最终Node Capacity。
-
-Device Plugin协议要求device ID唯一。当前kubelet不会替错误插件修复所有重复/冲突组合；排障必须比较原始entry、`allDevices`最后值和两个health集合，不能概括成“set会自动全部去重”。
-
-### 10.5 topology不是Capacity字段
-
-一个 `pluginapi.Device`还可以带 `TopologyInfo`，描述设备NUMA node。当前 `GetCapacity`只数healthy/unhealthy集合，不把具体topology写进Node Capacity。
-
-Topology Manager怎样消费设备拓扑、具体ID怎样受hint影响，属于第 16 课。
+同一 ID 一条 Healthy、一条 Unhealthy：它可能同时进入两个 set，Capacity 求和时出现双计。kubelet不会替插件猜哪一条才是真相，正确修复应在插件端保证快照合法。
 
 ---
 
-## 11. `ResourceHealthStatus`不控制容量计算
+## 9. 从三张表算出 Capacity 与 Allocatable
 
-当前代码在feature gate开启时，还比较新旧device health，找出占用这些device的Pod UID，并发resource update。
-
-但三张表的重建和checkpoint不依赖这个feature gate：
+先记住公式：
 
 ```text
-ResourceHealthStatus关闭
-  -> 仍更新healthy/unhealthy
-  -> 仍影响Node Capacity/Allocatable
-
-ResourceHealthStatus开启
-  -> 额外通知相关Pod刷新allocatedResourcesStatus
+Capacity(resource)    = len(healthyDevices) + len(unhealthyDevices)
+Allocatable(resource) = len(healthyDevices)
 ```
 
-不能误解成：
+源码：`pkg/kubelet/cm/devicemanager/manager.go::GetCapacity`
 
-> 没开ResourceHealthStatus，kubelet就不会感知GPU Unhealthy。
-
-它主要控制已分配设备健康怎样进一步暴露到Pod status；这部分在第 17 课展开。
-
----
-
-## 12. Capacity与Allocatable的源码公式
+当前函数为了打日志使用了 `klog.TODO()`。下面用 `text`围栏保留这个上游标记，避免把它误当成推荐的 context 写法。
 
 ```text
-pkg/kubelet/cm/devicemanager/manager.go:444-493
-```
+// GetCapacity 在 kubelet 组装 Node Status 时读取 DeviceManager 的资源数量。
+func (m *ManagerImpl) GetCapacity() (v1.ResourceList, v1.ResourceList, []string) {
+	// 当前函数没有 logger 参数，源码临时取得一个背景 logger。
+	logger := klog.TODO()
+	// 创建返回用的 Capacity map。
+	var capacity = v1.ResourceList{}
+	// 创建返回用的 Allocatable map。
+	var allocatable = v1.ResourceList{}
+	// 记录已经超过停止宽限期、需要从内部清理的 resourceName。
+	deletedResources := sets.New[string]()
+	// 读取和清理共享设备表前加锁。
+	m.mutex.Lock()
+	// 先遍历每种资源的 healthy ID 集合。
+	for resourceName, devices := range m.healthyDevices {
+		// 查找该 resourceName 当前的 endpoint。
+		eI, ok := m.endpoints[resourceName]
+		// endpoint 不存在，或已停止且宽限期到期，就把资源标为待删除。
+		if (ok && eI.e.stopGracePeriodExpired()) || !ok {
+			// endpoint 不存在说明内部表出现了不一致。
+			if !ok {
+				// 记录异常，但仍继续收敛清理。
+				logger.Info("Unexpected: healthyDevices and endpoints are out of sync")
+			}
+			// 先记入集合，后面统一删除。
+			deletedResources.Insert(resourceName)
+		} else {
+			// Capacity 先写 healthy 数量。
+			capacity[v1.ResourceName(resourceName)] = *resource.NewQuantity(int64(devices.Len()), resource.DecimalSI)
+			// Allocatable 只写 healthy 数量。
+			allocatable[v1.ResourceName(resourceName)] = *resource.NewQuantity(int64(devices.Len()), resource.DecimalSI)
+		}
+	}
+	// 再遍历每种资源的 unhealthy ID 集合。
+	for resourceName, devices := range m.unhealthyDevices {
+		// 同样检查 endpoint 是否还在宽限期内。
+		eI, ok := m.endpoints[resourceName]
+		// 已到期或 endpoint 丢失时标记待删除。
+		if (ok && eI.e.stopGracePeriodExpired()) || !ok {
+			// endpoint 丢失说明内部账不一致。
+			if !ok {
+				// 记录异常但继续清理。
+				logger.Info("Unexpected: unhealthyDevices and endpoints became out of sync")
+			}
+			// 资源进入待删除集合。
+			deletedResources.Insert(resourceName)
+		} else {
+			// 取出前面已经写入的 healthy Capacity；不存在时得到零值 Quantity。
+			capacityCount := capacity[v1.ResourceName(resourceName)]
+			// 把 unhealthy set 的长度构造成 Quantity。
+			unhealthyCount := *resource.NewQuantity(int64(devices.Len()), resource.DecimalSI)
+			// Capacity 加上 unhealthy 数量；Allocatable 不加。
+			capacityCount.Add(unhealthyCount)
+			// 写回最终 Capacity。
+			capacity[v1.ResourceName(resourceName)] = capacityCount
+		}
+	}
 
-先遍历healthy：
+	// 对超过宽限期的资源统一清理 endpoint 和两张健康集合。
+	for resourceName := range deletedResources {
+		// 删除 endpoint 关系。
+		delete(m.endpoints, resourceName)
+		// 删除 healthy set。
+		delete(m.healthyDevices, resourceName)
+		// 删除 unhealthy set。
+		delete(m.unhealthyDevices, resourceName)
+	}
 
-```go
-capacity[resourceName] =
-    quantity(healthyDevices.Len())
+	// 内存读取和清理完成，释放主锁。
+	m.mutex.Unlock()
 
-allocatable[resourceName] =
-    quantity(healthyDevices.Len())
-```
-
-再遍历unhealthy：
-
-```go
-capacityCount :=
-    capacity[resourceName]
-
-capacityCount.Add(
-    quantity(unhealthyDevices.Len()),
-)
-
-capacity[resourceName] =
-    capacityCount
-```
-
-所以：
-
-```text
-Capacity    = healthy + unhealthy
-Allocatable = healthy
-```
-
-这里的`healthy/unhealthy`单位是**插件上报的逻辑 Device entry**，不是PCI/NVML物理卡：
-
-```text
-Capacity
-  = 被DeviceManager两个health集合计数的逻辑entry数
-  != 必然等于物理GPU张数
-```
-
-例如 NVIDIA time-slicing把8张物理GPU配置为每张10个replica时，插件可以上报80个可调度逻辑entry，Node的`nvidia.com/gpu` Capacity可能是80。MIG也可能按策略暴露不同resource name及逻辑实例。第21课再讲共享与隔离；本课先形成纪律：**每次看到数量，都先问resource name、插件策略和一个entry代表什么。**
-
-### 12.1 三个手算场景
-
-以下三个场景为方便手算，明确假设：无MIG、无sharing/time-slicing，每个逻辑entry恰好对应一张完整物理GPU。公式本身不依赖这个假设。
-
-#### 场景 A：8个逻辑entry都健康
-
-```text
-healthy=8
-unhealthy=0
-
-Capacity=8
-Allocatable=8
-```
-
-#### 场景 B：1个逻辑entry被插件标记Unhealthy
-
-```text
-healthy=7
-unhealthy=1
-
-Capacity=8
-Allocatable=7
-```
-
-含义：
-
-```text
-物理/逻辑设备仍在插件清单
-但1个暂不允许新分配
-```
-
-#### 场景 C：1个逻辑entry从新清单完全消失
-
-```text
-healthy=7
-unhealthy=0
-
-Capacity=7
-Allocatable=7
-```
-
-含义：
-
-```text
-插件当前不再承认第8个device存在
-```
-
-“Unhealthy”和“消失”对Capacity影响不同。
-
-### 12.2 最重要纠偏：Allocatable不是“剩余未使用”
-
-节点有8个健康、可分配逻辑GPU资源单位，已有6个Pod各请求1个单位：
-
-```text
-Node.status.capacity[nvidia.com/gpu]    = 8
-Node.status.allocatable[nvidia.com/gpu] = 8
-```
-
-通常仍是8，不会自动变2。
-
-scheduler计算：
-
-```text
-可继续调度
-  = Node Allocatable
-  - NodeInfo中现有Pod requests
-  - 调度周期内assumed Pod requests
-```
-
-这与第 09 课 CPU/memory账本完全一致。Node Allocatable表达“节点可供Pod使用的总预算”，不是动态空闲量。
-
-因此看到：
-
-```text
-Allocatable GPU=8
-FailedScheduling: Insufficient nvidia.com/gpu
-```
-
-并不矛盾。还要看该Node已有Pod的GPU requests。
-
----
-
-## 13. 数量怎样进入 Node Status
-
-调用链：
-
-```text
-ListAndWatchResponse
-  -> genericDeviceUpdateCallback
-  -> healthyDevices/unhealthyDevices
-  -> kubelet syncNodeStatus
-  -> nodestatus.MachineInfo setter
-  -> containerManager.GetDevicePluginResourceCapacity
-  -> deviceManager.GetCapacity
-  -> node.Status.Capacity/Allocatable
-  -> PatchNodeStatus
-  -> apiserver
-  -> scheduler Node informer
-```
-
-### 13.1 Node setter写Capacity
-
-```text
-pkg/kubelet/nodestatus/setters.go:260-286
-```
-
-```go
-devicePluginCapacity,
-devicePluginAllocatable,
-removedDevicePlugins =
-    devicePluginResourceCapacityFunc()
-
-for k, v := range devicePluginCapacity {
-    node.Status.Capacity[k] = v
-}
-
-for _, removedResource :=
-    range removedDevicePlugins {
-
-    node.Status.Capacity[
-        v1.ResourceName(removedResource)
-    ] = *resource.NewQuantity(
-        0,
-        resource.DecimalSI,
-    )
+	// 只有实际清理了资源，才需要重写 checkpoint。
+	if deletedResources.Len() > 0 {
+		// checkpoint 失败只记录错误，不回滚刚才的内存删除。
+		if err := m.writeCheckpoint(logger); err != nil {
+			// 这意味着当前状态可能已清理，但重启恢复文件没有同步成功。
+			logger.Error(err, "Failed to write checkpoint file")
+		}
+	}
+	// 返回 Capacity、Allocatable 和需要在 Node status 写 0 的已删除资源名。
+	return capacity, allocatable, deletedResources.UnsortedList()
 }
 ```
 
-### 13.2 再覆盖Device Plugin Allocatable
+**大白话总结：** `GetCapacity`不看 `nvidia-smi`，也不直接调用插件。它只读 DeviceManager 已经收敛好的集合。**在本案这种新节点、没有可读 checkpoint 的前提下**，没有 first snapshot 就没有对应 resource key；若旧 checkpoint 成功恢复，则 first snapshot 前也可能已经存在 stopped endpoint 和空集合，暂时呈现 0/0。8 healthy + 0 unhealthy 得到 8/8；7 healthy + 1 unhealthy 得到 8/7；endpoint 断开并超过宽限期后，资源进入 deletedResources 并从内存表清掉。
 
-普通资源先按capacity减Node reservation形成allocatable；随后：
+**顺手学 Go：**
 
-```text
-pkg/kubelet/nodestatus/setters.go:306-337
-```
+- `v1.ResourceList{}`：创建一个空 map，key 是资源名，value 是 `resource.Quantity`。
+- `sets.New[string]()`：Go 泛型函数，创建元素类型为 `string`的集合。
+- `for resourceName, devices := range map`：同时取得 map 的 key 和 value；遍历顺序不保证固定。
+- `delete(m.endpoints, resourceName)`：删除 map key；key 不存在也不会 panic。
+- `*resource.NewQuantity(...)`：函数返回指针，前面的 `*`取出指针指向的 Quantity 值，因为 ResourceList 保存的是值。
 
-```go
-for k, v :=
-    range devicePluginAllocatable {
+### 9.1 五个场景必须会手算
 
-    node.Status.Allocatable[k] = v
-}
-```
-
-Device Plugin extended resource通常没有像CPU/memory那样的kube/system reserved减法；它由DeviceManager健康集合给出。
-
-### 13.3 removed resource为什么写0而不是删字段
-
-源码注释明确：
-
-```text
-写0用于表示：
-  这个extended resource以前由Device Plugin管理过
-```
-
-直接从Node Status删除，会难以区分：
-
-- 从未注册过；
-- 曾注册但现在已移除；
-- 其他集群级opaque resource。
-
-#### 13.3.1 absent与显式`0/0`状态表
-
-| 阶段 | Node API常见最终状态 | 解释边界 |
-|---|---|---|
-| 从未注册，或首次清单尚未进入本地账 | resource absent | 也可能仍在异步传播，需对时 |
-| 活跃插件发送空的完整清单 | Capacity=0，Allocatable=0 | 插件明确上报当前没有entry |
-| kubelet从checkpoint恢复、等待插件重注册/首包 | Capacity=0，Allocatable=0 | 记得“以前有此resource”，不复用旧Health |
-| stream断连，下一次`GetCapacity`和Node patch已完成，仍在宽限期 | Capacity=N，Allocatable=0 | 总量暂保留，禁止新分配 |
-| 超过宽限且Node Status传播完成 | Capacity=0，Allocatable=0 | removed resource被显式写0，不是长期删除字段 |
-
-表中是各阶段完成异步传播后的典型状态。任一瞬间都可能暂时看到上一次Node值，所以要同时记录kubelet本地日志、Node `resourceVersion`和时间。
-
-### 13.4 Node Lease不带GPU容量
-
-Node Lease是轻量心跳，不保存 `status.capacity/allocatable`。GPU数量变化必须通过Node Status patch传播。
-
-所以可能有短窗口：
-
-```text
-插件本地账已经变
-  -> kubectl get node仍是旧值
-  -> scheduler cache也可能仍是旧值
-```
-
-这不是要求你等待无限久，而是要按链逐层验证时间：
-
-```text
-kubelet日志更新时间
-Node metadata.resourceVersion / managedFields时间
-scheduler看到的Node更新
-FailedScheduling Event新旧时间
-```
-
----
-
-## 14. 注册成功到可调度资源出现的完整时间线
-
-```text
-t0  插件进程启动，发现GPU
-t1  插件监听自己的DevicePlugin socket
-t2  direct Register请求到达并完成字段校验
-    或generic GetInfo/ValidatePlugin完成
-t3  connectClient完成dial
-t4  PluginConnected/GetDevicePluginOptions成功
-t5  ListAndWatch goroutine已启动；
-    direct Register现在可以返回成功，
-    或generic RegisterPlugin完成后NotifyRegistrationStatus(true)
-t6  第一份完整设备清单到达
-t7  DeviceManager重建三张表并写checkpoint
-t8  kubelet下一轮syncNodeStatus
-t9  PatchNodeStatus成功
-t10 scheduler informer拿到新Node
-t11 之前Pending的GPU Pod因Node资源变化重新排队
-t12 scheduler重新Filter并可能绑定
-```
-
-这是一组**因果完成点**，不是要求日志时间戳绝对串行。`connectClient`在启动`ListAndWatch` goroutine后返回，goroutine调度与direct RPC响应/generic Notify可能发生细小交错；但“注册调用可以成功返回”仍不能替代“kubelet已经处理first response”这一独立证据。
-
-因此：
-
-| 截止证据 | 最多能证明 |
-|---|---|
-| 插件Pod Running | 进程容器还活着 |
-| 插件日志“Starting to serve” | 自己的gRPC socket开始监听 |
-| kubelet“Device plugin connected” | 连接和GetOptions成功 |
-| kubelet“Processed device updates” | 至少处理了一份设备清单 |
-| Node Status出现resource | 数量已上报到apiserver |
-| GPU Pod重新被调度 | scheduler缓存和队列也已消费变化 |
-
-任何一格都不能自动替代下一格。
-
----
-
-## 15. 插件断连怎样分两阶段收敛
-
-### 15.1 stream结束会走disconnect
-
-`client.Run`返回后：
-
-```text
-pkg/kubelet/cm/devicemanager/plugin/v1beta1/handler.go:122-133
-```
-
-```go
-func (s *server) runClient(
-    ctx context.Context,
-    name string,
-    c Client,
-) {
-    c.Run(ctx)
-
-    c = s.getClient(name)
-    if c == nil {
-        return
-    }
-    s.disconnectClient(
-        logger,
-        name,
-        c,
-    )
-}
-```
-
-`Client.Disconnect`：
-
-```text
-关闭gRPC连接
-  -> ManagerImpl.PluginDisconnected
-```
-
-### 15.2 第一阶段：立即把healthy移到unhealthy
-
-```text
-pkg/kubelet/cm/devicemanager/manager.go:247-261
-```
-
-```go
-if ep, exists :=
-    m.endpoints[resourceName]; exists {
-
-    m.markResourceUnhealthy(
-        logger,
-        resourceName,
-    )
-    ep.e.setStopTime(time.Now())
-}
-```
-
-`markResourceUnhealthy`：
-
-```text
-healthy集合清空
-unhealthy = unhealthy ∪ 原healthy
-```
-
-若原来8个逻辑entry健康：
-
-```text
-插件刚断连
-Capacity=8
-Allocatable=0
-```
-
-这是DeviceManager下一次`GetCapacity`根据本地集合会算出的结果；Node API还要等`syncNodeStatus/PatchNodeStatus`，scheduler又要等Node informer更新。刚看见断连日志的同一瞬间，`kubectl get node`仍可能短暂显示旧的`8/8`。
-
-含义：
-
-```text
-暂时保留已知设备总量
-但禁止新Pod继续分配
-给插件短暂重连留宽限
-```
-
-### 15.3 第二阶段：5分钟宽限期后移除内部resource
-
-当前常量：
-
-```text
-pkg/kubelet/cm/devicemanager/types.go
-
-endpointStopGracePeriod = 5 * time.Minute
-```
-
-`GetCapacity`发现endpoint停用超过宽限期后：
-
-```text
-delete endpoints[resource]
-delete healthyDevices[resource]
-delete unhealthyDevices[resource]
-return removed resource name
-```
-
-Node setter再把Capacity置0，Allocatable随之归0。
-
-时间线：
-
-```text
-刚断连：
-  Capacity=原总量
-  Allocatable=0
-
-宽限期后且Node Status完成传播：
-  Capacity=0
-  Allocatable=0
-```
-
-五分钟是当前源码实现值，不应写进平台永恒SLA；升级版本后重新校准。
-
-### 15.4 重连会发生什么
-
-插件在宽限期内重新注册：
-
-```text
-新endpoint覆盖/恢复
-  -> 新ListAndWatch清单
-  -> 三张表按新事实重建
-  -> Node Status再收敛
-```
-
-不能只看到Pod重启完成就宣布恢复；必须等新清单和Node Status。
-
----
-
-## 16. checkpoint在本课只读一条窄边界
-
-每次设备清单更新后：
-
-```go
-m.writeCheckpoint(logger)
-```
-
-checkpoint里的 `registeredDevs`当前取自healthy设备集合。kubelet重启读取checkpoint时，会：
-
-```text
-恢复已知resource键
-  -> healthy/unhealthy先建空集合
-  -> endpoint先设为stopped
-  -> 等插件重新注册和第一份ListAndWatch
-```
-
-这能避免把旧健康设备盲目当成当前可分配资源。
-
-本课只记：
-
-```text
-checkpoint帮助知道“以前有这个resource”
-但不会把旧health直接当新事实
-```
-
-具体已分配device ID、Pod/container账本、重启恢复和PodResources留到第 17 课。
-
----
-
-## 17. 四种容量变化必须会区分
-
-| 变化 | healthy | unhealthy | Capacity | Allocatable |
+| 场景 | healthy set | unhealthy set | Capacity | Allocatable |
 |---|---:|---:|---:|---:|
-| 8个逻辑entry首次健康上报 | 8 | 0 | 8 | 8 |
-| 1个entry的Health变Unhealthy | 7 | 1 | 8 | 7 |
-| 1个entry从ListAndWatch清单消失 | 7 | 0 | 7 | 7 |
-| 插件刚断连 | 0 | 8 | 8 | 0 |
-| 断连超宽限并完成Node更新 | 0 | 0 | 0 | 0 |
+| 第一份 8 个都 Healthy | 8 | 0 | 8 | 8 |
+| 其中 1 个变 Unhealthy | 7 | 1 | 8 | 7 |
+| 插件发空的完整清单 | 0 | 0 | 0 | 0 |
+| 插件刚断连，仍在宽限期 | 0 | 8 | 8 | 0 |
+| 断连超过宽限期 | 资源被清理 | 资源被清理 | Node 后续写 0 | Node 后续写 0 |
 
-这张表是本课最重要的手算题。
+### 9.2 Allocatable 不是“当前剩余未使用 GPU”
 
-### 17.1 已分配中的设备变Unhealthy
+假设 Node Status：
 
-Node Allocatable下降，阻止新分配只是第一步。已经在跑的Pod是否：
+```text
+Capacity nvidia.com/gpu = 8
+Allocatable nvidia.com/gpu = 8
+```
 
-- 继续运行；
-- Pod status显示allocated resource health；
-- 被平台隔离/迁移；
-- 由Operator/DCGM策略处理；
+已有 6 个已绑定 Pod 各 request 1：
 
-不是DeviceManager自动统一杀Pod。第 17、19、21 课再讲健康联动。
+```text
+scheduler 账本剩余 = Node Allocatable 8 - 已有 Pod requests 6 = 2
+```
 
-### 17.2 设备从清单消失
+此时一个 request 3 GPU 的新 Pod 会 FailedScheduling，但 Node 的 Allocatable 字段仍然可以是 8。scheduler 不会把每次绑定后的剩余量反写到 Node Status。
 
-可能方向：
+这和你熟悉的 CPU 完全一样：
 
-- Driver/NVML不再枚举；
-- MIG重配；
-- vGPU/profile变化；
-- 插件过滤策略变化；
-- 插件bug漏报；
-- 设备ID策略变化。
+```text
+Node Allocatable CPU=64
+  != 现在还空闲 64 核
 
-若该ID仍被Pod占用，会进入更复杂的已分配账本一致性问题，不能只把Capacity数字改回去。
+Node Allocatable GPU=8
+  != 现在还剩 8 个 GPU 资源单位
+```
 
----
-
-## 18. 从生产现象反查源码断点
-
-| 现象 | 首个源码断点 | 下一证据 |
-|---|---|---|
-| Plugin Pod不在目标Node | DaemonSet调度/Node selector/taint | Pod spec、owner、nodeName |
-| Pod Running但没有plugin socket | 插件初始化/hostPath/runtime | plugin日志、mount、目标Node socket |
-| direct Register反复失败 | `server.Register` | Version、ResourceName、Endpoint |
-| generic watcher发现socket但注册失败 | `GenerateRegisterPluginFunc` | GetInfo Type/Name/Endpoint/Versions、Notify错误 |
-| “Device plugin connected”后资源仍无 | `client.Run/ListAndWatch` | 第一份response、stream错误 |
-| response有8个entry，Node只有7 | `genericDeviceUpdateCallback` | 唯一ID、Health、重复/冲突ID |
-| Capacity=8/Allocatable=0 | 全部Unhealthy或刚断连 | endpoint日志、health清单、stopTime时间线 |
-| Capacity/Allocatable本地已算新值，API仍旧 | Node status链 | syncNodeStatus/PatchNodeStatus错误 |
-| Node显示8但仍Insufficient | scheduler request账本 | 已有Pod requests，不是看实时利用率 |
+`nvidia-smi`显示利用率 0 也不能改变 scheduler 的 request 账本。
 
 ---
 
-## 19. 日志、Event与指标：哪些证据真的存在
+## 10. 数量怎样写进 Node Status
 
-### 19.1 这条链没有专用 Kubernetes Event
+DeviceManager 返回三样东西：
 
-当前注册、ListAndWatch、三张表和Capacity更新主链没有发专用Event。
+```text
+devicePluginCapacity
+devicePluginAllocatable
+removedDevicePlugins
+```
+
+kubelet 的 Node status setter 再把它们合并进节点状态。
+
+### 10.1 先写 Capacity；被移除的旧资源写显式 0
+
+源码：`pkg/kubelet/nodestatus/setters.go`
+
+```go
+// 调用 ContainerManager，最终会进入 DeviceManager.GetCapacity。
+devicePluginCapacity, devicePluginAllocatable, removedDevicePlugins = devicePluginResourceCapacityFunc()
+// 把当前仍活跃的 Device Plugin Capacity 逐项写入 Node status。
+for k, v := range devicePluginCapacity {
+	// 数量新出现或发生变化时记录日志。
+	if old, ok := node.Status.Capacity[k]; !ok || old.Value() != v.Value() {
+		// 这条日志只说明 setter 看到了变化，还要继续观察 API 更新是否成功。
+		logger.V(2).Info("Updated capacity for device plugin", "plugin", k, "capacity", v.Value())
+	}
+	// 覆盖 Node status 中对应资源的 Capacity。
+	node.Status.Capacity[k] = v
+}
+
+// 遍历已经超过宽限期并从 DeviceManager 内存表移除的资源名。
+for _, removedResource := range removedDevicePlugins {
+	// 记录将旧 Device Plugin 资源设为 0。
+	logger.V(2).Info("Set capacity for removed resource to 0 on device removal", "device", removedResource)
+	// 不删除字段，而是写显式 0，保留“它曾由 Device Plugin 管理”的区别。
+	node.Status.Capacity[v1.ResourceName(removedResource)] = *resource.NewQuantity(int64(0), resource.DecimalSI)
+}
+```
+
+**大白话总结：** 新节点从未形成过资源时，字段可以 absent；一个曾经注册过、后来超过宽限期被清理的资源，则会被写成显式 `0`。所以 absent 和 `0/0`不是完全相同的历史状态。
+
+**顺手学 Go：**
+
+- `for k, v := range devicePluginCapacity`：遍历 ResourceList map。
+- `old, ok := node.Status.Capacity[k]`：同时拿旧值和“是否存在”。
+- `!ok || old.Value() != v.Value()`：先判断 key 不存在，或数量发生变化。
+- `int64(0)`：把整数常量显式转换成 `int64`。
+
+### 10.2 再用 Device Plugin 的 healthy 数量覆盖 Allocatable
+
+```go
+// 遍历 DeviceManager 算出的、只含 healthy 数量的 Allocatable。
+for k, v := range devicePluginAllocatable {
+	// 新出现或数量变化时记录日志。
+	if old, ok := node.Status.Allocatable[k]; !ok || old.Value() != v.Value() {
+		// 日志中的 device 是 resourceName，不是具体 GPU UUID。
+		logger.V(2).Info("Updated allocatable", "device", k, "allocatable", v.Value())
+	}
+	// 覆盖对应扩展资源的 Node Allocatable。
+	node.Status.Allocatable[k] = v
+}
+```
+
+**大白话总结：** CPU/内存 Allocatable 会考虑节点保留；Device Plugin 扩展资源则由它自己的 healthy set 数量覆盖。这个值仍是节点可分配上限，不是 scheduler 的实时余额。
+
+**顺手学 Go：**
+
+- 这里的 `k`类型是 `v1.ResourceName`，`v`类型是 `resource.Quantity`。
+- `node.Status.Allocatable[k] = v`是 map 赋值；同 key 的旧值会被覆盖。
+- `Value()`把 Quantity 读成整数值，适合 Device Plugin 这种不可超卖的小整数资源单位。
+
+### 10.3 Node Lease 为什么帮不上这个问题
+
+Node Lease 主要是轻量心跳，不携带完整 Capacity/Allocatable。看到 Node Ready、Lease 持续更新，只说明 kubelet 心跳链大体还活着，不证明 GPU 数量已经写入 Node Status。
+
+### 10.4 resourceVersion 和 managedFields 怎么用
+
+```text
+resourceVersion：
+  可以判断对象更新的先后顺序
+  不能直接当成墙上时钟
+
+managedFields.time：
+  不能可靠代表“GPU Capacity 写入的精确时刻”
+```
+
+需要精确时间线时，用持续 watch 的本地采样时间、API audit、kubelet 原始日志和插件日志对齐；不要从 managedFields 猜一个不存在的精确写入时刻。
+
+---
+
+## 11. 回到主案例：断点现在已经可以精确定位
+
+把现有证据放进源码链：
+
+| 里程碑 | 需要的证据 | 本案状态 | 能说明什么 |
+|---|---|---|---|
+| host 枚举 | `nvidia-smi -L` 8 张 | 已通过 | Driver/NVML 能看见硬件 |
+| plugin 进程 | Pod UID、image digest、containerID、socket listener | 已通过 | 插件进程和 socket 存在 |
+| Register 请求 | direct registration 日志/计数 | 已通过 | kubelet 收到请求，不代表校验后成功 |
+| endpoint connected | `Device plugin connected` | 已通过 | dial 和 GetDevicePluginOptions 成功 |
+| first snapshot | `State pushed` + `Processed device updates` | **缺失** | 三张设备表尚无形成证据 |
+| Node 广告 | Capacity/Allocatable | absent | GetCapacity 尚未产出或未传播 |
+| scheduler | FailedScheduling | 失败 | scheduler 当前账本没有可用资源 |
+
+因此本案结论不是“scheduler 有 bug”，而是：
+
+```text
+断点位于 ListAndWatch 建流/首包阶段；
+在 first snapshot 被证明到达之前，
+没有必要先追 scheduler cache。
+```
+
+### 11.1 修复后应看到的闭环
+
+假设最终发现插件初始化 goroutine 卡在设备发现，修复配置并由批准的 canary 变更重新发布后：
+
+```text
+T1 新 Plugin Pod 启动并使用正确 image/config
+T2 direct Register 成功
+T3 Device plugin connected
+T4 first ListAndWatch 返回 8 个唯一、Healthy 的 device IDs
+T5 Processed device updates: totalCount=8 healthyCount=8
+T6 Node Capacity=8 Allocatable=8
+T7 scheduler cache 观察到新 Node 资源
+T8 prod/game-infer Pod 被调度到 gpu-node-07
+```
+
+到 T6 只能说明数量链恢复；T8 之后还要在第 16 课继续验证具体 device ID 的选择、Allocate、CDI/runtime 注入和容器内 CUDA 可见性。
+
+---
+
+## 12. 对照分支：当前 kubelet 为什么还有 generic plugin watcher
+
+当前源码同时保留两套 Device Plugin 注册入口：
+
+| 入口 | 谁先发起 | 发现目录 | 身份信息从哪里来 | 典型用途 |
+|---|---|---|---|---|
+| direct registration | 插件主动调用 kubelet | 固定 `/var/lib/kubelet/device-plugins/kubelet.sock` | `RegisterRequest` | 主流传统 Device Plugin，包括本课 NVIDIA 主案 |
+| generic watcher | kubelet 发现插件 socket 后反向询问 | kubelet root 下的 `plugins_registry` | `GetInfo` | 统一 plugin manager 管理的插件注册框架 |
+
+两条入口不是两套设备账。它们最后都会进入：
+
+```text
+DeviceManager server.connectClient
+  -> client.Connect
+  -> DeviceManager.PluginConnected
+  -> client.Run/ListAndWatch
+```
+
+因此排障时要先确认入口，再从汇合点继续追。
+
+### 12.1 generic 注册事务为什么更长
+
+generic watcher 只知道“某个 Unix socket 出现了”，还不知道它是什么插件，所以必须反向问：
+
+```text
+watch socket
+  -> desired state
+  -> reconciler
+  -> dial registration API
+  -> GetInfo
+  -> 按 Type 找 handler
+  -> ValidatePlugin
+  -> 写 actual state
+  -> handler.RegisterPlugin
+  -> NotifyRegistrationStatus
+```
+
+核心源码：`pkg/kubelet/pluginmanager/operationexecutor/operation_generator.go`
+
+```go
+// 为 GetInfo 单独创建 1 秒截止时间；它只属于 generic registration API。
+ctxWithTimeout, cancel := context.WithTimeout(ctx, time.Second)
+// 函数退出时释放 timer 相关资源。
+defer cancel()
+
+// 反向调用插件的 GetInfo，取得 Name、Type、Endpoint 和支持版本。
+infoResp, err := client.GetInfo(ctxWithTimeout, &registerapi.InfoRequest{})
+// GetInfo 超时或失败就终止这一轮 generic 注册。
+if err != nil {
+	// 返回的错误保留 socketPath，方便定位是哪一个注册 socket。
+	return fmt.Errorf("RegisterPlugin error -- failed to get plugin info using RPC GetInfo at socket %s, err: %v", socketPath, err)
+}
+
+// 用插件声明的 Type 在 handler map 中查找消费者。
+handler, ok := pluginHandlers[infoResp.Type]
+// 没有对应 handler 时不能继续把它当成 Device Plugin。
+if !ok {
+	// 先通知插件注册失败；通知本身也可能失败。
+	if err := og.notifyPlugin(ctx, client, false, fmt.Sprintf("RegisterPlugin error -- no handler registered for plugin type: %s at socket %s", infoResp.Type, socketPath)); err != nil {
+		// 若失败通知也发不出去，返回更具体的错误。
+		return fmt.Errorf("RegisterPlugin error -- failed to send error at socket %s, err: %v", socketPath, err)
+	}
+	// 通知成功后仍然返回“没有 handler”的原始注册错误。
+	return fmt.Errorf("RegisterPlugin error -- no handler registered for plugin type: %s at socket %s", infoResp.Type, socketPath)
+}
+
+// 插件没有另报业务 endpoint 时，就直接使用 watcher 发现的 socketPath。
+if infoResp.Endpoint == "" {
+	// 空字符串在这里有明确语义，不等于随便补默认值。
+	infoResp.Endpoint = socketPath
+}
+// 交给 Type 对应的 handler 校验名字、endpoint 和协议版本。
+if err := handler.ValidatePlugin(infoResp.Name, infoResp.Endpoint, infoResp.SupportedVersions); err != nil {
+	// 校验失败时通知插件失败状态。
+	if err = og.notifyPlugin(ctx, client, false, fmt.Sprintf("RegisterPlugin error -- plugin validation failed with err: %v", err)); err != nil {
+		// 失败通知也失败时，返回通知错误。
+		return fmt.Errorf("RegisterPlugin error -- failed to send error at socket %s, err: %v", socketPath, err)
+	}
+	// 校验失败结束本轮事务。
+	return fmt.Errorf("RegisterPlugin error -- pluginHandler.ValidatePluginFunc failed")
+}
+```
+
+**大白话总结：** generic watcher 发现 socket 只是“发现一个门牌”，`GetInfo`才问清它叫什么、是什么类型。这里的 1 秒 timeout 只保护 `GetInfo`，不能拿来解释 direct 路径里的 `GetDevicePluginOptions`。
+
+**顺手学 Go：**
+
+- `context.WithTimeout`返回一个子 context 和 `cancel`函数。
+- `handler, ok := pluginHandlers[key]`是 map 的存在性判断，不能只看 `handler`是否为 nil。
+- `err = og.notifyPlugin(...)`使用已有的 `err`变量，所以是 `=`，不是重新声明用的 `:=`。
+- `infoResp.Endpoint == ""`用空字符串表达“插件没有提供另一个 endpoint”。
+
+### 12.2 generic 路径的三个 timeout 不要混
+
+当前源码边界：
+
+| 动作 | timeout |
+|---|---:|
+| registration socket dial | 10 秒 |
+| `GetInfo` | 1 秒 |
+| `NotifyRegistrationStatus` | 5 秒 |
+
+这些 timeout 保护的是 generic registration 事务。进入 Device Plugin handler 后，当前 `RegisterPlugin`使用背景 context 调用 `connectClient`，`GetDevicePluginOptions`本身没有再加固定 timeout。
+
+### 12.3 Notify 失败为什么还要做补偿
+
+generic 路径的顺序特意设计为：
+
+```text
+Validate
+  -> actual state AddPlugin
+  -> handler.RegisterPlugin
+  -> Notify success
+```
+
+若最后的 Notify 失败，源码会移除 actual state 并调用 DeRegister。因为插件没有收到明确成功反馈，kubelet不能一边对外说失败、一边把它长期保留为已注册。
+
+---
+
+## 13. ResourceHealthStatus：它不参与 Capacity 公式，但有一个危险边界
+
+在当前源码基线中：
+
+```text
+ResourceHealthStatus: Beta，默认开启
+ResourceHealthStatusMessage: Beta，默认开启
+DRAExtendedResource: Beta，默认开启
+```
+
+依赖关系也要一起看：`ResourceHealthStatus`和 `DRAExtendedResource`依赖 `DynamicResourceAllocation`，`ResourceHealthStatusMessage`又依赖 `ResourceHealthStatus`；当前 commit 中 Dynamic Resource Allocation 已默认开启并锁定。生产仍必须按实际 Kubernetes 版本和 feature-gate 配置校准。本案明确没有 DRA Extended Resource 映射，仍走普通 Device Plugin。
+
+### 13.1 它做的是“已分配设备健康写进 Pod status”
+
+Capacity/Allocatable 始终来自 healthy/unhealthy set；`ResourceHealthStatus`只是让 kubelet把已分配 device ID 的健康状态放进 container status。
+
+源码：`pkg/kubelet/cm/devicemanager/manager.go::UpdateAllocatedResourcesStatus`
+
+```go
+// UpdateAllocatedResourcesStatus 把 DeviceManager 的已分配设备健康写进 PodStatus。
+func (m *ManagerImpl) UpdateAllocatedResourcesStatus(pod *v1.Pod, status *v1.PodStatus) {
+	// 读取 allDevices 与 podDevices 前持有同一把主锁。
+	m.mutex.Lock()
+	// 函数退出时保证解锁。
+	defer m.mutex.Unlock()
+
+	// 当前源码只遍历普通 ContainerStatuses，不遍历 initContainerStatuses。
+	for i, containerStatus := range status.ContainerStatuses {
+		// 从分配账查出该 Pod/Container 已拿到的设备。
+		devices := m.podDevices.getContainerDevices(string(pod.UID), containerStatus.Name)
+
+		// 第一轮按 resourceName 更新每个已分配 device instance 的内部 Health。
+		for resourceName, deviceInstances := range devices {
+			// 遍历这个 container 已分配的每个 device ID。
+			for id, d := range deviceInstances {
+				// 先把默认值设为协议 Healthy。
+				health := pluginapi.Healthy
+				// 只有 allDevices 里还存在这个 resourceName 才继续查。
+				if r, ok := m.allDevices[resourceName]; ok {
+					// 只有具体 device ID 也存在时才覆盖默认健康值。
+					if _, ok := r[id]; ok {
+						// 读取最新 ListAndWatch 快照中的 Health。
+						health = m.allDevices[resourceName][id].Health
+					}
+				}
+
+				// 把最终结果写进这个 device instance。
+				d.Health = health
+
+				// map 保存的是结构体值，所以修改后要按 ID 显式写回。
+				deviceInstances[id] = d
+			}
+		}
+
+		// 第二轮把内部 device instance 转成 Pod API 的 ResourceStatus。
+		for resourceName, dI := range devices {
+			// 为当前扩展资源创建一条状态对象。
+			resourceStatus := v1.ResourceStatus{
+				// Name 例如 nvidia.com/gpu。
+				Name: v1.ResourceName(resourceName),
+				// 先创建空的 device 健康列表。
+				Resources: []v1.ResourceHealth{},
+			}
+
+			// 把每个 device ID 转成 API 层的健康记录。
+			for id, d := range dI {
+				// API 层同样先默认 Healthy。
+				health := v1.ResourceHealthStatusHealthy
+				// Device Plugin 只要不是精确 Healthy，就映射为 Unhealthy。
+				if d.Health != pluginapi.Healthy {
+					// 当前 Device Plugin 路径不会在这里生成 Unknown。
+					health = v1.ResourceHealthStatusUnhealthy
+				}
+				// 把 device ID 和健康状态追加到资源状态列表。
+				resourceStatus.Resources = append(resourceStatus.Resources, v1.ResourceHealth{
+					// ResourceID 保存 opaque device ID。
+					ResourceID: v1.ResourceID(id),
+					// Health 保存刚才完成的 API 状态映射。
+					Health: health,
+				})
+			}
+
+			// 第一次写该 container 状态时，先初始化 slice。
+			if status.ContainerStatuses[i].AllocatedResourcesStatus == nil {
+				// 创建空的 ResourceStatus 列表。
+				status.ContainerStatuses[i].AllocatedResourcesStatus = []v1.ResourceStatus{}
+			}
+
+			// found 记录同名 resource 状态是否已经存在。
+			found := false
+			// 在当前 container 的已有状态中按资源名查找。
+			for j, rs := range status.ContainerStatuses[i].AllocatedResourcesStatus {
+				// 找到同名资源时覆盖旧状态。
+				if rs.Name == resourceStatus.Name {
+					// 用本次完整计算结果替换旧 ResourceStatus。
+					status.ContainerStatuses[i].AllocatedResourcesStatus[j] = resourceStatus
+					// 标记已经完成覆盖。
+					found = true
+					// 同一个 resourceName 不需要继续向后查。
+					break
+				}
+			}
+
+			// 原列表中没有同名资源时，追加一条新状态。
+			if !found {
+				// append 返回新的 slice，必须赋值回原字段。
+				status.ContainerStatuses[i].AllocatedResourcesStatus = append(status.ContainerStatuses[i].AllocatedResourcesStatus, resourceStatus)
+			}
+		}
+	}
+}
+```
+
+**大白话总结：** 这段代码最反直觉的地方是“先默认 Healthy”。如果一个已分配 device ID 从新 `ListAndWatch`快照中直接消失，`allDevices`找不到它时不会自动写 Unknown 或 Unhealthy，最后仍可能保留 Healthy。这是源码事实，不是理想化语义。
+
+**顺手学 Go：**
+
+- `for i, containerStatus := range ...`：`i`是下标，`containerStatus`是当前元素的副本。
+- `string(pod.UID)`：把强类型 UID 转成普通字符串作为 map key。
+- `for id, d := range deviceInstances`：若 map value 是结构体值，修改 `d`后要再写回 `deviceInstances[id]`。
+- `v1.ResourceStatus{Name: ..., Resources: ...}`：按字段名构造结构体，比按位置构造更容易读。
+- `append(slice, value)`：可能返回新的底层 slice，所以必须把返回值赋回原字段。
+- `break`：只跳出当前最内层循环，这里表示同名 resource 找到后停止继续查找。
+
+### 13.2 三个生产上必须知道的限制
+
+1. **旧 ID 直接消失，不会在更新 callback 中触发 Pod 刷新。** 因为 callback 只遍历新快照中的 entry。
+2. **PluginDisconnected 只移动 healthy/unhealthy set。** 它不会同步改写 `allDevices[ID].Health`，也不会向 Pod 更新 channel 发送通知。
+3. **Device Plugin 路径最终只映射 Healthy/Unhealthy。** 这段逻辑不会为“查不到的 ID”生成 API 层 Unknown，也不填充 Device Plugin 的健康消息。
+
+于是可能出现：
+
+```text
+Node Allocatable 已经从 8 降到 0
+但某个正在运行 Pod 的 allocatedResourcesStatus 仍显示旧 Healthy
+```
+
+这不是在说 GPU 一定健康，而是说明两个状态面更新机制不同。硬件事故仍要结合 DCGM、Xid/ECC、插件日志和应用 CUDA 行为。
+
+---
+
+## 14. 插件断连：为什么先 8/0，再 0/0
+
+### 14.1 第一阶段：立即把 healthy set 移入 unhealthy set
+
+源码：`pkg/kubelet/cm/devicemanager/manager.go::PluginDisconnected`
+
+```go
+// PluginDisconnected 按 resourceName 处理插件断开。
+func (m *ManagerImpl) PluginDisconnected(logger klog.Logger, resourceName string) {
+	// 修改 endpoints 和健康集合前加主锁。
+	m.mutex.Lock()
+	// 函数退出时解锁。
+	defer m.mutex.Unlock()
+
+	// 只有 endpoints 中仍存在这个 resourceName 才继续。
+	if ep, exists := m.endpoints[resourceName]; exists {
+		// 把该资源当前所有 healthy IDs 合并到 unhealthy set。
+		m.markResourceUnhealthy(logger, resourceName)
+		// 记录 endpoint 进入不健康状态。
+		logger.V(2).Info("Endpoint became unhealthy", "resourceName", resourceName)
+
+		// 保存停止时间，后面 GetCapacity 用它判断 5 分钟宽限期。
+		ep.e.setStopTime(time.Now())
+	}
+}
+```
+
+同一个动作的集合变化：
+
+```go
+// 先准备一个空集合，用来接住原 healthy IDs。
+healthyDevices := sets.New[string]()
+// healthyDevices map 中存在这个 resourceName 时才读取。
+if _, ok := m.healthyDevices[resourceName]; ok {
+	// 保存原 healthy set。
+	healthyDevices = m.healthyDevices[resourceName]
+	// 把当前 healthy set 替换为空集合，所以 Allocatable 将变成 0。
+	m.healthyDevices[resourceName] = sets.New[string]()
+}
+// 如果原来没有 unhealthy set，就先创建。
+if _, ok := m.unhealthyDevices[resourceName]; !ok {
+	// 初始化可写的空集合。
+	m.unhealthyDevices[resourceName] = sets.New[string]()
+}
+// 把原 healthy IDs 与已有 unhealthy IDs 做并集，所以 Capacity 暂时保留。
+m.unhealthyDevices[resourceName] = m.unhealthyDevices[resourceName].Union(healthyDevices)
+```
+
+**大白话总结：** 断连第一阶段不是删除设备，而是把“还能继续分配”的集合清空，同时把原来的 ID 全部保留为 unhealthy。因此 8 张已登记设备会先表现为 Capacity=8、Allocatable=0。
+
+**顺手学 Go：**
+
+- `if ep, exists := map[key]; exists`：同时取得 value 和存在标记，`ep`只在 `if`作用域可见。
+- `sets.Set.Union`返回并集集合，不是简单拼接 slice。
+- `time.Now()`取得当前时间，保存到 endpoint 自己的 stopTime。
+- 两段代码都在调用者已经持有的主锁保护下修改共享 map。
+
+### 14.2 第二阶段：5 分钟不是定时器主动清理
+
+源码常量：`pkg/kubelet/cm/devicemanager/types.go`
+
+```go
+// endpoint 停止后允许它在缓存中保留的固定宽限期。
+const endpointStopGracePeriod = time.Duration(5) * time.Minute
+```
+
+**大白话总结：** 这不是启动一个“5 分钟后必定准点执行”的 timer。真正删除发生在后续某次 `GetCapacity`调用时，它发现 `time.Since(stopTime)`已经超过宽限期，才把资源放进 `deletedResources`。
+
+**顺手学 Go：**
+
+- `time.Duration(5)`把数字转换成 Duration。
+- `5 * time.Minute`得到五分钟时长；它不是时间戳。
+
+完整传播仍要走：
+
+```text
+超过 5 分钟
+  -> 某次 GetCapacity 执行
+  -> 删除 endpoint/healthy/unhealthy 内存项
+  -> 返回 removedResources
+  -> Node setter 把 Capacity 写显式 0
+  -> Node status patch 成功
+  -> scheduler cache 观察到更新
+```
+
+所以 `kubectl get node`不保证在第五分钟整恰好变化。
+
+### 14.3 重注册竞争时，断开的不一定只是“那个旧对象”
+
+当前 client map 以 resourceName 为 key。`runClient`结束后会再次按 resourceName 从 map 读取 client；新注册也可能覆盖同一个 key。
+
+这意味着有旧 stream 结束和新注册并发时，源码行为是“按资源名处理当前映射”，不能简单描述成：
+
+```text
+哪个旧 connection 断了
+  -> 只标记那个旧 endpoint
+```
+
+生产排障要把 Pod UID、socket inode/路径、注册时间和 kubelet日志放到同一条时间线，避免把新旧实例混成一个对象。
+
+### 14.4 四种相近现象的对照
+
+| 现象 | Capacity | Allocatable | 关键原因 |
+|---|---:|---:|---|
+| 新节点从未收到 first snapshot | absent | absent | 没形成资源账 |
+| 插件主动发送空完整清单 | 0 | 0 | endpoint 活着，但快照为空 |
+| 插件刚断连 | 8 | 0 | 全部 healthy 转 unhealthy，仍在宽限期 |
+| 断连超宽限且已执行 GetCapacity | 0 | 0 | 资源被清理，Node setter 写显式 0 |
+
+---
+
+## 15. checkpoint：它保存恢复账，但没有事务回滚
+
+源码：`pkg/kubelet/cm/devicemanager/manager.go::writeCheckpoint`
+
+```go
+// writeCheckpoint 把当前分配账和 registered healthy IDs 写到磁盘。
+func (m *ManagerImpl) writeCheckpoint(logger klog.Logger) error {
+	// 复制共享内存状态前加锁。
+	m.mutex.Lock()
+	// 创建 resourceName 到 device ID slice 的新 map。
+	registeredDevs := make(map[string][]string)
+	// 遍历当前 healthy set。
+	for resource, devices := range m.healthyDevices {
+		// 把集合复制为无固定顺序的字符串 slice。
+		registeredDevs[resource] = devices.UnsortedList()
+	}
+	// 同时复制 Pod/Container 的设备分配账，构造 checkpoint 数据对象。
+	data := checkpoint.New(m.podDevices.toCheckpointData(logger), registeredDevs)
+	// 内存快照复制完成就解锁，不在主锁内做磁盘 I/O。
+	m.mutex.Unlock()
+	// 在锁外尝试创建或覆盖 checkpoint 文件。
+	err := m.checkpointManager.CreateCheckpoint(kubeletDeviceManagerCheckpoint, data)
+	// 磁盘写入失败时返回 error。
+	if err != nil {
+		// 增加 checkpoint 文件名上下文。
+		err2 := fmt.Errorf("failed to write checkpoint file %q: %v", kubeletDeviceManagerCheckpoint, err)
+		// 同时记录底层错误。
+		logger.Error(err, "Failed to write checkpoint file")
+		// 调用者决定是继续、记录还是返回；本函数本身不回滚内存。
+		return err2
+	}
+	// 成功时只在更高日志级别记录。
+	logger.V(4).Info("Checkpoint file written", "checkpoint", kubeletDeviceManagerCheckpoint)
+	// 返回 nil 表示这次磁盘持久化成功。
+	return nil
+}
+```
+
+**大白话总结：** 源码先在锁内复制一份内存快照，再在锁外写磁盘，避免慢 I/O 长时间堵住 DeviceManager。但这不是数据库事务：磁盘写失败时，前面已经更新的内存表、插件 Allocate 副作用或已清理的 endpoint 不会自动恢复。
+
+**顺手学 Go：**
+
+- `make(map[string][]string)`：value 类型是字符串 slice。
+- `UnsortedList()`明确告诉你返回顺序不稳定，测试不能依赖自然排序。
+- `err2 := fmt.Errorf(...)`创建一个更有上下文的新 error。
+- 锁内复制、锁外 I/O 是常见并发设计：缩短临界区，但需要接受快照与后续内存变化之间存在时间差。
+
+### 15.1 读失败也不会阻止 registration server 启动
+
+第 4 节已经看到：`Start`记录 checkpoint 读取错误后，仍执行 `m.server.Start(logger)`。
+
+所以真实状态可能是：
+
+```text
+checkpoint 文件存在但损坏
+  -> readCheckpoint 报错
+  -> DeviceManager 继续启动
+  -> 历史分配账可能不完整
+  -> 等插件重新注册和新快照逐步收敛
+```
+
+更细的边界是：启动时用于判断“是否需要 reset 扩展资源”的保护逻辑关注目录状态，不等价于完整校验这个 checkpoint 可读。看到文件存在，不能当成恢复成功证据。
+
+### 15.2 正确告警语义
+
+```text
+checkpoint write failed
+  -> 当前内存 Capacity 仍可能已经更新
+  -> 当前 Node status 仍可能继续变化
+  -> kubelet 下次重启恢复风险上升
+```
+
+不要写成“checkpoint 写失败，所以本次 ListAndWatch 没生效”；这与源码顺序相反。
+
+---
+
+## 16. 一个隐藏断点：cAdvisor MachineInfo 失败时，GetCapacity 可能根本没被调用
+
+Node status setter 先调用 `machineInfoFunc()`。当前源码把 `devicePluginResourceCapacityFunc()`放在 MachineInfo 成功的 `else`分支里。
 
 因此：
 
 ```text
-kubectl get events没有Device Plugin错误
-  != Device Plugin注册正常
+DeviceManager 内已经有 8 healthy IDs
+  + 本轮 cAdvisor MachineInfo 获取失败
+  -> 这一轮不会调用 DeviceManager.GetCapacity
+  -> Node 上旧 GPU Capacity 可能继续保留
 ```
 
-你可能看到：
+这给“Processed device updates 已经是 8/8，但 Node 仍没变化”增加了一个真实分支：
 
 ```text
-FailedScheduling: Insufficient nvidia.com/gpu
-UnexpectedAdmissionError: Allocate failed ...
+不要只查 PatchNodeStatus
+还要查同一轮 Node status 组装前是否有 Error getting machine info
 ```
 
-它们分别是：
+这是 Kubernetes 组合 Node 状态时的历史耦合：Device Plugin 数量本身不依赖 cAdvisor 枚举 GPU，但当前 setter 的控制流仍受 MachineInfo 分支影响。
 
-- scheduler看到资源不足的下游结果；
-- 第 16 课Allocate/本机准入失败的下游结果。
+---
 
-都不是“注册成功”的直接证据。
+## 17. 从生产现象反查源码断点
 
-### 19.2 direct入口关键kubelet日志
+| 生产现象 | 最小可证断点 | 下一份证据 | 先不要做什么 |
+|---|---|---|---|
+| Plugin Pod Running，Node 字段 absent | 进程账之后 | exact Pod UID/image/config、direct Register 日志 | 不先怪 scheduler |
+| direct registration counter 增加 | 收到请求 | 校验错误、`Connected to new client` | 不把 counter 当成功率 |
+| `Device plugin connected`，无 first snapshot | `PluginConnected`之后 | `State pushed`、stream error、插件初始化日志 | 不改 Node label |
+| `State pushed=8`，无 `Processed` | callback 前后 | kubelet panic/error、同一 boot 日志完整性 | 不重启整台 Node 掩盖证据 |
+| `Processed 8/8`，Node 仍旧 | GetCapacity/Node setter | MachineInfo 错误、capacity 日志、status patch 错误 | 不直接清 scheduler cache |
+| Node 8/8，新 Pod仍 Insufficient | scheduler 传播/占用账 | scheduler cache、现有 Pod requests、queue event | 不把 Allocatable 当余额 |
+| stream 结束后 8/0 | disconnect 第一阶段 | 重注册、stopTime 后续变化 | 不删 socket 做实验 |
+| 约 5 分钟后仍 8/0 | 还没执行/传播清理 | 后续 GetCapacity、Node status patch | 不把 5 分钟当准点 timer |
+| Node 数量减少，运行 Pod status仍 Healthy | ResourceHealthStatus 边界 | ID 是否直接消失、allDevices、应用/DCGM | 不用 Pod status反证硬件健康 |
+
+### 17.1 主案需要的证据优先级
+
+```text
+第一优先：对象身份和同一时间线
+  Node name/systemUUID/bootID
+  Plugin Pod UID/image digest/containerID
+  kubelet version/commit或发行版版本
+
+第二优先：链路里程碑
+  Register
+  Connected
+  State pushed
+  Processed device updates
+  Node status values
+
+第三优先：根因组件
+  NVIDIA plugin init/NVML日志
+  socket/mount/permission
+  Node status MachineInfo/patch日志
+  scheduler cache与Pod request账
+```
+
+日志里“没有某行”只能在以下前提下当证据：
+
+- kubelet `V(2)`日志确实被采集；
+- 时间窗覆盖插件启动与注册；
+- boot ID 没换；
+- 没有日志采集丢弃、限流或保留期缺口。
+
+否则“没看到”只是证据缺口，不等于代码路径一定没执行。
+
+---
+
+## 18. 日志、Event 与指标分别能证明什么
+
+### 18.1 direct 路径关键日志
 
 ```text
 Got registration request from device plugin with resource
-Bad registration request from device plugin with resource
-Error connecting to device plugin client
-```
-
-### 19.3 generic watcher关键日志
-
-```text
-Plugin Watcher Start
-Adding socket path or updating timestamp to desired state cache
-Registering plugin at endpoint
-Device plugin validated
-OperationExecutor.RegisterPlugin failed
-```
-
-### 19.4 共同后半段日志
-
-```text
+Connected to new client
 Device plugin connected
 State pushed for device plugin
 Processed device updates for resource
 ListAndWatch ended unexpectedly for device plugin
-Device plugin disconnected
 Endpoint became unhealthy
-Mark all resources Unhealthy for resource
 Updated capacity for device plugin
 Updated allocatable
-Set capacity for removed resource to 0 on device removal
 ```
 
-许多成功日志是 `V(2)`或更高。默认日志级别看不到，不等于代码没走；也不能为了临时取证就在生产全量Node长期打开高verbosity。
+不要只搜一条。至少按同一 resourceName 和时间窗组成序列。
 
-### 19.5 NVIDIA插件日志要与kubelet日志对时
+### 18.2 这条链没有专用 Kubernetes Event 逐步记录
 
-不同版本文本会变化，常见阶段包括：
+`kubectl get events`可以看到 Pod FailedScheduling，但 direct Register、first snapshot 和三张表重建主要靠组件日志与 Node status。Event 还可能被聚合、限流或过期，不能作为完整审计日志。
+
+### 18.3 两个容易被名字骗到的指标
+
+#### `kubelet_device_plugin_registration_total`
+
+- Alpha 指标；
+- direct `Register`一进函数、校验前就递增；
+- kubelet 重启后进程内计数重新开始；
+- 能证明收到过请求，不能证明版本、资源名、回连和 first snapshot 成功。
+
+#### `plugin_manager_total_plugins`
+
+- Alpha 指标；
+- 标签是 `socket_path`和 `state`；
+- 描述 generic plugin manager 的 desired/actual state；
+- 某 socket 进入 actual state，不等于它一定是 `nvidia.com/gpu`，也不等于清单健康。
+
+当前核心 DeviceManager没有直接暴露下面这种可依赖指标：
 
 ```text
-发现NVML/设备
-Starting to serve '<resource>' on <socket>
-Registered device plugin for '<resource>' with Kubelet
-health check / Xid状态
-配置重载或插件restart
+kubelet_device_plugin_healthy_devices{resource="nvidia.com/gpu"}
 ```
 
-必须记录：
-
-- plugin image digest/version；
-- Pod UID、restartCount、containerID；
-- Node name；
-- 日志时间；
-- kubelet同一时间窗。
-
-只看插件一边会漏掉kubelet的版本校验、endpoint连接和stream结束。
+数量应以 Node Status 和 kubelet处理日志为准；硬件健康应以厂商插件、DCGM 与应用证据补充。
 
 ---
 
-## 20. 两个容易被指标名字骗到的地方
+## 19. NVIDIA 场景的六个常见分支
 
-### 20.1 `kubelet_device_plugin_registration_total`
+### 19.1 `FAIL_ON_INIT_ERROR`不要只背二进制默认值
 
-定义：
-
-```text
-pkg/kubelet/metrics/metrics.go
-```
-
-labels：
+NVIDIA Device Plugin二进制的默认行为与 Operator/Helm 实际传入配置可能不同。若现场配置让初始化失败时进程继续等待，就可能看到：
 
 ```text
-resource_name
+Plugin Pod Running
+  + socket/进程存在
+  + 没有可用设备快照
 ```
 
-但当前只在direct `server.Register`里递增，而且位置在：
+要同时记录：
+
+- 镜像 digest；
+- container args；
+- env；
+- 挂载的配置文件内容与其来源；
+- 实际启动日志。
+
+不能拿“官方默认”覆盖现场 manifest。
+
+### 19.2 DaemonSet 不一定覆盖目标 Node
+
+检查目标 Pod 的 `spec.nodeName`，不要看集群里任意一个 Device Plugin Pod。常见原因有 nodeSelector/affinity、taint/toleration、Operator 节点标签、canary 策略或节点排除配置。
+
+### 19.3 hostPath、mountPath 与 endpoint 可能对不上
+
+direct registration 根目录固定为 `/var/lib/kubelet/device-plugins`。插件容器必须看到正确的 hostPath；容器化 kubelet、SELinux、权限或发行版补丁都可能改变现场可见性。
+
+### 19.4 MIG 与 sharing 会改变“资源单位”的含义
 
 ```text
-Version校验之前
-ResourceName校验之前
-connectClient之前
+8 张物理卡
+  + MIG profile
+  -> 可能暴露 nvidia.com/mig-<profile>
+
+8 张物理卡
+  + time-slicing 每卡 10 replicas
+  -> nvidia.com/gpu Capacity 可能是 80
 ```
 
-所以它统计：
+本课关闭这些策略只是为了学习公式，不代表生产应该关闭。
 
-```text
-direct registration请求次数
-```
-
-不是：
-
-```text
-成功注册数
-当前已连接插件数
-第一份ListAndWatch已收到数
-```
-
-generic watcher路径也不会递增这个counter。
-
-### 20.2 `plugin_manager_total_plugins`
-
-当前descriptor：
-
-```text
-labels:
-  socket_path
-  state
-```
-
-它反映通用plugin manager desired/actual state，覆盖CSI、DRA、DevicePlugin；没有plugin type label。
-
-所以：
-
-```text
-state="actual_state_of_world"且值为1
-  -> 某socket进入actual state
-  != 它一定是nvidia.com/gpu
-  != ListAndWatch设备清单健康
-```
-
-socket path本身可能暴露节点内部目录，外发前脱敏。
-
-### 20.3 核心DeviceManager没有GPU健康数量指标
-
-当前核心代码没有直接提供：
-
-```text
-kubelet_device_plugin_healthy_devices{resource=...}
-kubelet_device_plugin_unhealthy_devices{resource=...}
-```
-
-数量最终看Node Status；硬件健康和Xid/ECC看厂商插件/DCGM。不要编造不存在的Prometheus指标。
-
----
-
-## 21. 只读取证实验 1：持续观察 Node 数量
-
-> 仓库当前未连接GPU实验集群，以下脚本未执行，不写假PASS。
-
-```powershell
-$ErrorActionPreference = 'Stop'
-
-$ApprovedContext = '__APPROVED_KUBE_CONTEXT__'
-$Node = '__GPU_NODE__'
-$Resource = 'nvidia.com/gpu'
-$Samples = 30
-$IntervalSeconds = 2
-
-if ($ApprovedContext -like '__*' -or $Node -like '__*') {
-  throw '先填写批准的context和经过确认的GPU Node'
-}
-$actualContext = kubectl config current-context
-if ($LASTEXITCODE -ne 0 -or -not $actualContext) {
-  throw '读取current-context失败或为空'
-}
-if (($actualContext | Out-String).TrimEnd() -cne $ApprovedContext) {
-  throw '当前kubectl context不是批准值'
-}
-
-$rows = for ($i = 0; $i -lt $Samples; $i++) {
-  $nodeJson = kubectl --context $ApprovedContext get node $Node -o json
-  if ($LASTEXITCODE -ne 0 -or -not $nodeJson) {
-    throw "第$i次读取Node失败"
-  }
-
-  $nodeObject = $nodeJson | ConvertFrom-Json
-  if ($nodeObject.metadata.name -cne $Node) {
-    throw "第$i次API返回Node名称与批准值不一致"
-  }
-  $capProperty = $nodeObject.status.capacity.
-    PSObject.Properties[$Resource]
-  $allocProperty = $nodeObject.status.allocatable.
-    PSObject.Properties[$Resource]
-
-  [pscustomobject]@{
-    Time = Get-Date -Format 'yyyy-MM-dd HH:mm:ss.fff'
-    NodeResourceVersion = $nodeObject.metadata.resourceVersion
-    Capacity = if ($capProperty) {
-      $capProperty.Value
-    } else {
-      '<absent>'
-    }
-    Allocatable = if ($allocProperty) {
-      $allocProperty.Value
-    } else {
-      '<absent>'
-    }
-  }
-
-  if ($i -lt ($Samples - 1)) {
-    Start-Sleep -Seconds $IntervalSeconds
-  }
-}
-
-$rows | Format-Table -AutoSize
-```
-
-它能观察：
-
-- 字段absent、首次出现或归0；当前DeviceManager的removed resource路径长期写显式0，不把它描述成“正常删除后字段消失”；
-- Capacity与Allocatable分叉；
-- Node `resourceVersion`是否变化。
-
-它不能单独说明：
-
-- 哪个device ID变了；
-- 是Health变化、清单消失还是插件断连；
-- scheduler cache已在同一毫秒更新；
-- GPU硬件根因。
-
-要与插件/kubelet日志同时间线关联。
-
----
-
-## 22. 只读取证实验 2：先把Plugin Pod精确对到Node
-
-不要直接看“集群里任意一个nvidia-device-plugin Pod”的日志。DaemonSet每个Node一份，必须对到目标Node。
-
-```powershell
-$ErrorActionPreference = 'Stop'
-
-$ApprovedContext = '__APPROVED_KUBE_CONTEXT__'
-$Node = '__GPU_NODE__'
-$Selector = '__YOUR_PLUGIN_LABEL_SELECTOR__'
-
-if (
-  $ApprovedContext -like '__*' -or
-  $Node -like '__*' -or
-  $Selector -like '__*'
-) {
-  throw '先填写批准的context、目标Node和真实label selector'
-}
-$actualContext = kubectl config current-context
-if ($LASTEXITCODE -ne 0 -or -not $actualContext) {
-  throw '读取current-context失败或为空'
-}
-if (($actualContext | Out-String).TrimEnd() -cne $ApprovedContext) {
-  throw '当前kubectl context不是批准值'
-}
-
-$podsJson = kubectl --context $ApprovedContext get pods -A `
-  -l $Selector `
-  --field-selector "spec.nodeName=$Node" `
-  -o json
-if ($LASTEXITCODE -ne 0 -or -not $podsJson) {
-  throw '读取目标Node的Device Plugin Pod失败'
-}
-
-$pods = @(
-  ($podsJson | ConvertFrom-Json).items
-)
-if ($pods.Count -lt 1) {
-  throw '目标Node没有匹配的Device Plugin Pod'
-}
-
-foreach ($pod in $pods) {
-  if ($pod.spec.nodeName -cne $Node) {
-    throw "API返回了不在目标Node上的Pod：$($pod.metadata.namespace)/$($pod.metadata.name)"
-  }
-
-  [pscustomobject]@{
-    Namespace = $pod.metadata.namespace
-    Name = $pod.metadata.name
-    UID = $pod.metadata.uid
-    Phase = $pod.status.phase
-    Node = $pod.spec.nodeName
-    Containers = (
-      $pod.spec.containers.name -join ','
-    )
-    Restarts = (
-      $pod.status.containerStatuses.restartCount |
-        Measure-Object -Sum
-    ).Sum
-  } | Format-List
-
-  $podYaml = kubectl --context $ApprovedContext get pod $pod.metadata.name `
-    -n $pod.metadata.namespace `
-    -o yaml
-  if ($LASTEXITCODE -ne 0 -or -not $podYaml) {
-    throw "读取Pod YAML失败：$($pod.metadata.namespace)/$($pod.metadata.name)"
-  }
-  $podYaml
-
-  foreach ($container in $pod.spec.containers.name) {
-    $currentLog = kubectl --context $ApprovedContext logs $pod.metadata.name `
-      -n $pod.metadata.namespace `
-      -c $container `
-      --timestamps `
-      --tail=500
-    if ($LASTEXITCODE -ne 0 -or -not $currentLog) {
-      throw "读取当前日志失败或为空：$($pod.metadata.name)/$container"
-    }
-    $currentLog
-
-    $containerStatus = @($pod.status.containerStatuses) |
-      Where-Object { $_.name -ceq $container } |
-      Select-Object -First 1
-    if ($containerStatus -and $containerStatus.restartCount -gt 0) {
-      $previousLog = kubectl --context $ApprovedContext logs $pod.metadata.name `
-        -n $pod.metadata.namespace `
-        -c $container `
-        --previous `
-        --timestamps `
-        --tail=500
-      if ($LASTEXITCODE -ne 0 -or -not $previousLog) {
-        throw "container有重启但previous日志读取失败或为空：$($pod.metadata.name)/$container"
-      }
-      $previousLog
-    }
-  }
-}
-```
-
-安全边界：
-
-- selector来自实际DaemonSet/Operator对象，不猜通用label；
-- 输出含image、env、hostPath、Node名，外发需脱敏；
-- `--tail`限制日志量；
-- 不执行delete、rollout restart或改ConfigMap；
-- 多套Device Plugin并存时全部记录，不能随便挑一个。
-
----
-
-## 23. 只读取证实验 3：检查两类socket
-
-先通过平台资产/堡垒机审批链，把登录目标与Kubernetes Node对象对应起来；推荐同时记录Node `.status.nodeInfo.systemUUID`、当前boot ID及资产ID。`hostname -f`只是本机线索，**不保证等于Kubernetes Node name**。
-
-在身份已经确认的目标GPU Node上，先把`__ACTUAL_KUBELET_ROOT__`替换为该进程实际`--root-dir`：
-
-```bash
-date -Is
-hostname -f
-cat /sys/class/dmi/id/product_uuid 2>/dev/null || true
-cat /proc/sys/kernel/random/boot_id
-
-direct_dir=/var/lib/kubelet/device-plugins
-generic_dir=__ACTUAL_KUBELET_ROOT__/plugins_registry
-test "$generic_dir" != '__ACTUAL_KUBELET_ROOT__/plugins_registry' || {
-  echo '先填写实际kubelet root' >&2
-  exit 2
-}
-
-sudo find \
-  "$direct_dir" \
-  "$generic_dir" \
-  -maxdepth 3 \
-  -type s \
-  -printf '%p %u:%g %m %TY-%Tm-%TdT%TH:%TM:%TS\n' \
-  2>/dev/null
-
-sudo ss -xlpn |
-  grep -E 'device-plugins|plugins_registry' ||
-  true
-
-sudo stat \
-  /var/lib/kubelet/device-plugins/kubelet.sock \
-  /var/lib/kubelet/device-plugins/DEPRECATION \
-  2>/dev/null ||
-  true
-```
-
-解释纪律：
-
-```text
-看到kubelet.sock
-  -> direct入口监听条件存在
-  != NVIDIA插件已注册
-
-看到nvidia-gpu.sock
-  -> 某进程创建了socket文件
-  != kubelet已连接
-
-看到plugins_registry中的socket
-  -> 通用watcher可发现
-  != Type一定是DevicePlugin
-
-看到DEPRECATION
-  -> 有兼容信号文件
-  != 当前commit必然由主链创建
-```
-
-当前upstream边界要分别记：
-
-- direct目录固定为`/var/lib/kubelet/device-plugins`，不随普通`--root-dir`变化；
-- generic `plugins_registry`跟随kubelet root；
-- 容器化kubelet的mount namespace或发行版源码补丁可能改变宿主机可见路径，需额外核对进程mount与DaemonSet hostPath。
-
-不要：
-
-```text
-删除socket试试能否重建
-touch DEPRECATION
-改owner/mode
-停止监听进程
-```
-
----
-
-## 24. 只读取证实验 4：抓同一时间窗kubelet日志
-
-目标Node：
-
-```bash
-sudo journalctl -u kubelet \
-  --since '-30 minutes' \
-  --no-pager |
-grep -E \
-  'registration request from device plugin|Registering plugin at endpoint|Device plugin validated|Device plugin connected|State pushed for device plugin|Processed device updates|ListAndWatch ended unexpectedly|Device plugin disconnected|Endpoint became unhealthy|Updated capacity|Updated allocatable|removed resource'
-```
-
-注意：
-
-- 非systemd/托管发行版要改用平台日志入口；
-- kubelet日志可能进入journald、文件或集中日志；
-- `grep`无输出可能只是verbosity不足；
-- 记录原始完整行，不只截图一个关键字；
-- Node、时间、boot ID、kubelet版本必须同一份证据。
-
-如果需要临时提高verbosity，属于Node变更，另走审批和回退；本实验不自动改。
-
----
-
-## 25. 只读取证实验 5：检查两个指标
-
-需要Node proxy RBAC：
-
-```powershell
-$ErrorActionPreference = 'Stop'
-
-$ApprovedContext = '__APPROVED_KUBE_CONTEXT__'
-$Node = '__GPU_NODE__'
-if ($ApprovedContext -like '__*' -or $Node -like '__*') {
-  throw '先填写批准的context和目标Node'
-}
-$actualContext = kubectl config current-context
-if ($LASTEXITCODE -ne 0 -or -not $actualContext) {
-  throw '读取current-context失败或为空'
-}
-if (($actualContext | Out-String).TrimEnd() -cne $ApprovedContext) {
-  throw '当前kubectl context不是批准值'
-}
-
-$metrics = kubectl --context $ApprovedContext get --raw `
-  "/api/v1/nodes/$Node/proxy/metrics"
-if ($LASTEXITCODE -ne 0 -or -not $metrics) {
-  throw '读取kubelet metrics失败；核对RBAC与Node proxy'
-}
-
-$metrics -split "`n" |
-  Select-String `
-    'device_plugin_registration_total|plugin_manager_total_plugins'
-```
-
-解读：
-
-```text
-direct counter增加
-  -> 有direct Register请求
-  != 注册成功
-
-generic actual state出现
-  -> socket进入通用plugin manager实际状态
-  != 第一份设备清单已到
-```
-
-不要把Node proxy权限授给不需要的普通业务账号；metrics可能暴露大量节点内部标签。
-
----
-
-## 26. 受控观察实验：只跟随已批准的canary变更
-
-若平台本来就安排了Device Plugin/Operator canary升级，可在变更窗口观察：
-
-```text
-T0  旧Plugin Pod UID/image/restart
-T1  socket/listener变化
-T2  registration日志
-T3  Device plugin connected
-T4  first ListAndWatch processed
-T5  Node Capacity/Allocatable变化
-T6  canary CUDA workload通过
-```
-
-验收表：
-
-| 时刻 | Plugin Pod UID | connected | first list | Capacity | Allocatable | 结论 |
-|---|---|---|---|---:|---:|---|
-| T0 | 旧UID | 是 | 是 | 实测 | 实测 | 基线 |
-| T1 | 新旧切换 | 未知 | 否 | 实测 | 实测 | 只记录 |
-| T2 | 新UID | 是/否 | 否 | 实测 | 实测 | registration证据，不能宣布恢复 |
-| T3 | 新UID | 是 | 否/未知 | 实测 | 实测 | connected，仍等first list |
-| T4 | 新UID | 是 | 是 | 实测 | 实测 | first list，仍等Node Status |
-| T5 | 新UID | 是 | 是 | 预期 | 预期 | Node Status已传播 |
-| T6 | 新UID | 是 | 是 | 预期 | 预期 | CUDA smoke通过才验收 |
-
-本章**禁止为了实验主动制造**：
-
-- 删除生产Device Plugin socket；
-- 重启生产DaemonSet；
-- 停kubelet/containerd；
-- 修改GPU health；
-- 删除 `kubelet_internal_checkpoint`；
-- 切换MIG；
-- 改Device Plugin resource name。
-
-源码理解不值得拿生产GPU任务做破坏性演示。
-
----
-
-## 27. 本地源码测试边界
-
-当前仓库 `go.mod`要求 Go 1.26，本机已知Go 1.19.4，因此不声称已运行下列测试。
-
-具备匹配工具链后可选择：
-
-```powershell
-$ErrorActionPreference = 'Stop'
-
-$SourceRoot = '__KUBERNETES_SOURCE_ROOT__'
-if ($SourceRoot -like '__*') {
-  throw '先填写当前commit对应的Kubernetes源码根目录'
-}
-$resolvedRoot = (Resolve-Path -LiteralPath $SourceRoot).Path
-if (-not (Test-Path -LiteralPath (Join-Path $resolvedRoot 'go.mod'))) {
-  throw 'SourceRoot不是Kubernetes源码根：缺少go.mod'
-}
-
-$deviceRegex = 'Test(UpdateCapacityAllocatable|EndpointSyncOnDisconnect|DevicePluginReRegistration)$'
-$watcherRegex = 'Test(PluginRegistration|PluginRegistrationAtKubeletStart|PluginReRegistration)$'
-
-Push-Location -LiteralPath $resolvedRoot
-try {
-  $deviceList = & go test ./pkg/kubelet/cm/devicemanager `
-    -list $deviceRegex
-  if ($LASTEXITCODE -ne 0) {
-    throw 'devicemanager go test -list失败'
-  }
-  if (-not (@($deviceList | Where-Object { $_ -match '^Test' }).Count)) {
-    throw 'devicemanager正则没有匹配任何测试，拒绝假通过'
-  }
-
-  & go test ./pkg/kubelet/cm/devicemanager `
-    -run $deviceRegex `
-    -count=1
-  if ($LASTEXITCODE -ne 0) {
-    throw 'devicemanager目标测试失败'
-  }
-
-  $watcherList = & go test ./pkg/kubelet/pluginmanager/pluginwatcher `
-    -list $watcherRegex
-  if ($LASTEXITCODE -ne 0) {
-    throw 'pluginwatcher go test -list失败'
-  }
-  if (-not (@($watcherList | Where-Object { $_ -match '^Test' }).Count)) {
-    throw 'pluginwatcher正则没有匹配任何测试，拒绝假通过'
-  }
-
-  & go test ./pkg/kubelet/pluginmanager/pluginwatcher `
-    -run $watcherRegex `
-    -count=1
-  if ($LASTEXITCODE -ne 0) {
-    throw 'pluginwatcher目标测试失败'
-  }
-}
-finally {
-  Pop-Location
-}
-```
-
-脚本先固定源码根、用`go test -list`确认每组正则至少匹配一个测试，再逐条检查原生命令退出码，并在`finally`恢复原目录。即便如此，仍要先提供与`go.mod`匹配的Go工具链；本机当前版本不满足，所以这里没有实际PASS记录。
-
-本课当前验证方式是：
-
-- 静态读当前源码；
-- 代码块/PowerShell语法检查；
-- 生产实验设计安全审查；
-- 不伪造运行结果。
-
----
-
-## 28. NVIDIA场景最常见的六个具体分支
-
-### 28.1 `FAIL_ON_INIT_ERROR=false`可能让Pod活着但资源不出现
-
-NVIDIA Device Plugin有“初始化失败是否退出”的配置。某些版本/模式下，设为false会让插件在找不到GPU/Driver时阻塞等待，而不是CrashLoop。
-
-于是：
-
-```text
-Plugin Pod phase=Running
-  -> 进程仍活着
-  -> 但可能没有为nvidia.com/gpu成功serve/register/list
-```
-
-所以要查实际配置、镜像版本和日志，不能用Pod Running反证NVML初始化成功。
-
-### 28.2 插件DaemonSet没覆盖目标Node
-
-常见原因：
-
-- nodeSelector/affinity不匹配；
-- GPU Node taint没有被插件tolerate；
-- Operator节点标签还没形成；
-- DaemonSet update strategy/canary选择；
-- Node被配置排除；
-- 插件Pod调度到了同名但不是故障Node。
-
-先用 `spec.nodeName`做精确关联。
-
-### 28.3 hostPath/socket mount不一致
-
-插件容器通常要访问kubelet Device Plugin目录。若：
-
-```text
-upstream direct固定目录没有按正确hostPath挂进插件容器
-容器内mountPath与插件参数不一致
-SELinux/permission阻止socket访问
-发行版源码补丁或容器化kubelet的mount视图与默认假设不同
-```
-
-就可能出现“插件进程在跑，但注册socket永远对不上”。
-
-### 28.4 MIG策略改变resource name与数量
-
-不同MIG策略可能暴露：
-
-```text
-nvidia.com/gpu
-nvidia.com/mig-<profile>
-```
-
-不要固定只grep `nvidia.com/gpu`后就说“插件没上报任何资源”。先查看Node完整extended resources和插件实际配置。
-
-MIG实例如何创建、重配和隔离留到第 21 课，本课只看它对ListAndWatch资源名/设备清单的影响。
-
-### 28.5 device ID策略不等于resource name策略
-
-NVIDIA插件可以用UUID或index等方式表达device ID；这改变后续分配标识，不会把 `nvidia.com/gpu`自动改成另一个resource name。
-
-同理，`deviceListStrategy`主要影响第 16 课Allocate后怎样把已选device交给runtime：
+### 19.5 `deviceListStrategy`主要影响 Allocate 后的交付方式
 
 ```text
 envvar
@@ -2232,356 +1719,655 @@ cdi-annotations
 cdi-cri
 ```
 
-它不是“Node没有Capacity”时第一个要改的开关。
+它们是第 16 课“已选 device ID 怎样交给 runtime”的重点。Node Capacity absent 时，第一优先仍是 registration/ListAndWatch 快照，不是先改 `deviceListStrategy`。
 
-### 28.6 插件健康检测不等于完整硬件诊断
+### 19.6 `Health=Healthy`不是完整硬件体检
 
-官方NVIDIA插件能报告部分GPU health，但不能替代：
+它只是 Kubernetes Device Plugin 分配层认可的状态，不替代：
 
-- DCGM/Xid/ECC完整观测；
-- NVLink/NVSwitch/Fabric Manager健康；
-- 应用真实CUDA/NCCL测试；
-- 长时间温度、功耗、错误趋势。
-
-所以 `ListAndWatch Health=Healthy`是Kubernetes分配层事实，不是硬件全量体检报告。第 19 课再补。
-
----
-
-## 29. 一次完整故障推演
-
-### 29.1 证据
-
-```text
-10:00:00 host nvidia-smi -L有8卡
-10:00:05 Plugin Pod Running，restartCount=0
-10:00:06 插件日志：Starting to serve nvidia.com/gpu
-10:00:07 插件日志：Registered ... with Kubelet
-10:00:10 Node Capacity无nvidia.com/gpu
-10:00:20 GPU Pod FailedScheduling
-```
-
-### 29.2 不能直接得出的结论
-
-```text
-不能说scheduler缓存坏
-不能说DeviceManager一定收到8卡
-不能说Registered日志就是first ListAndWatch
-不能说host 8卡等于Kubernetes 8个healthy device
-```
-
-### 29.3 按源码补证据
-
-1. 目标Node kubelet是否有 `Device plugin connected`；
-2. 是否有 `State pushed`和 `Processed device updates`；
-3. `totalCount/healthyCount`是多少；
-4. 是否马上出现 `ListAndWatch ended unexpectedly`；
-5. direct还是generic入口；
-6. plugin endpoint是否同一socket；
-7. Node Status patch有没有失败；
-8. Node `resourceVersion`和Capacity何时变化。
-
-### 29.4 两种可能分叉
-
-#### 分叉 A：connected后没有first list
-
-```text
-断点：
-  client.Run -> ListAndWatch建流/Recv
-
-方向：
-  插件server实现、初始化阻塞、stream错误、socket被替换
-```
-
-#### 分叉 B：processed healthyCount=8，但Node仍无
-
-```text
-断点：
-  GetCapacity -> nodestatus.MachineInfo -> PatchNodeStatus
-
-方向：
-  node status sync/Patch错误、对象身份/Node名、传播时间
-```
-
-只有第二种才进入Node Status传播，而不是一开始就怪scheduler。
+- Xid/ECC；
+- 温度、功耗和降频；
+- NVLink/NVSwitch/Fabric Manager；
+- CUDA/NCCL 真实测试；
+- 长时间趋势。
 
 ---
 
-## 30. Java平台经验在这里怎样继续复用
+## 20. 反事实：如果设计成别的样子，会发生什么
 
-篇幅只留一小段，因为本课已是GPU主案例。
+| 假设计法 | 表面上更简单 | 实际问题 | 当前设计的取舍 |
+|---|---|---|---|
+| 插件直接 patch Node | 少一层 kubelet | 多写者冲突、权限膨胀、校验分散 | kubelet统一写 Node Status |
+| ListAndWatch只发 delta | 每次消息小 | 重连或丢事件后账永久漂移 | full snapshot 重建 |
+| Unhealthy直接从 Capacity删除 | 数字看着干净 | 看不出“存在但不可分配” | Capacity保留，Allocatable下降 |
+| 断连立刻 0/0 | 收敛很快 | 插件瞬时重启导致节点硬件身份抖动 | 先8/0，5分钟后0/0 |
+| Node Allocatable实时减已分配 | 一眼看“剩余” | kubelet与scheduler成为双写占用账 | scheduler独立维护 request 余额 |
+| checkpoint失败回滚全部 | 状态更像事务 | 插件外部副作用和内存并非总可逆 | 记录风险，依赖后续收敛与重启恢复治理 |
 
-你熟悉的：
-
-```text
-Java进程Running
-  != Service endpoint ready
-```
-
-现在对应：
-
-```text
-Device Plugin进程Running
-  != gRPC registered
-  != first ListAndWatch processed
-  != Node resource ready
-```
-
-你熟悉的：
-
-```text
-Node Allocatable CPU=64核
-  != 还有64核可调度
-```
-
-现在对应：
-
-```text
-Node Allocatable GPU=8
-  != 还有8个资源单位可调度
-```
-
-底层都是：
-
-```text
-总预算 - 已有Pod request账本
-```
-
-新知识只是“这个总预算怎样由Device Plugin健康逻辑entry形成”；它是否等于物理卡数取决于MIG/sharing等插件策略。
+这张表就是本章真正要掌握的 Kubernetes 设计思想：它优先保证**职责边界、幂等收敛和故障隔离**，而不是让每一个瞬时状态都只靠一个数字表达。
 
 ---
 
-## 31. Go语法复习索引
+## 21. 只读取证：先看证据模型，再看命令
 
-| 写法 | 大白话 | 为什么影响源码结论 |
+> 当前工作区没有连接 GPU 生产集群。以下命令未执行，不写假 PASS；它们只用于已经批准的 context、节点和日志访问链。
+
+### 21.1 Node 数量观察
+
+```powershell
+$ErrorActionPreference = 'Stop'
+$Kubeconfig = '__APPROVED_KUBECONFIG_PATH__'
+$ExpectedKubeconfigSha256 = '__APPROVED_KUBECONFIG_SHA256__'
+$Context = '__APPROVED_CONTEXT__'
+$ExpectedCluster = '__APPROVED_CLUSTER_NAME__'
+$ExpectedServer = '__APPROVED_APISERVER_URL__'
+$ExpectedUser = '__APPROVED_CONTEXT_USER__'
+$Node = '__APPROVED_GPU_NODE__'
+$ExpectedNodeUID = '__APPROVED_NODE_UID__'
+$Resource = 'nvidia.com/gpu'
+$RequestTimeout = '10s'
+
+$Required = @(
+  $Kubeconfig,
+  $ExpectedKubeconfigSha256,
+  $Context,
+  $ExpectedCluster,
+  $ExpectedServer,
+  $ExpectedUser,
+  $Node,
+  $ExpectedNodeUID
+)
+if ($Required | Where-Object {
+  [string]::IsNullOrWhiteSpace($_) -or $_ -like '__*'
+}) {
+  throw '先填写完整的批准身份：kubeconfig、hash、context、cluster/server/user、Node和Node UID'
+}
+
+$ResolvedKubeconfig = (Resolve-Path -LiteralPath $Kubeconfig).Path
+$ActualKubeconfigSha256 = (Get-FileHash -LiteralPath $ResolvedKubeconfig -Algorithm SHA256).Hash
+if ($ActualKubeconfigSha256 -cne $ExpectedKubeconfigSha256) {
+  throw 'kubeconfig hash与批准值不一致，拒绝继续取证'
+}
+
+$ConfigRaw = & kubectl --kubeconfig $ResolvedKubeconfig config view -o json
+if ($LASTEXITCODE -ne 0 -or -not $ConfigRaw) {
+  throw '读取指定kubeconfig失败'
+}
+$Config = $ConfigRaw | ConvertFrom-Json
+$Current = (& kubectl --kubeconfig $ResolvedKubeconfig config current-context | Out-String).Trim()
+if ($LASTEXITCODE -ne 0 -or $Current -cne $Context) {
+  throw "当前 context [$Current] 与批准值 [$Context] 不一致"
+}
+
+$ContextObject = @($Config.contexts) |
+  Where-Object { $_.name -ceq $Context } |
+  Select-Object -First 1
+if (-not $ContextObject) {
+  throw '批准context不存在于指定kubeconfig'
+}
+if (
+  $ContextObject.context.cluster -cne $ExpectedCluster -or
+  $ContextObject.context.user -cne $ExpectedUser
+) {
+  throw 'context绑定的cluster或user与批准值不一致'
+}
+$ClusterObject = @($Config.clusters) |
+  Where-Object { $_.name -ceq $ExpectedCluster } |
+  Select-Object -First 1
+if (-not $ClusterObject -or $ClusterObject.cluster.server -cne $ExpectedServer) {
+  throw 'API Server地址与批准值不一致'
+}
+
+$KubectlBase = @(
+  '--kubeconfig', $ResolvedKubeconfig,
+  '--context', $Context,
+  '--request-timeout', $RequestTimeout
+)
+
+1..20 | ForEach-Object {
+  $Raw = & kubectl @KubectlBase get node $Node -o json
+  $NodeExit = $LASTEXITCODE
+  if ($NodeExit -ne 0 -or -not $Raw) {
+    throw "第 $_ 次读取Node失败，exit=$NodeExit，node=$Node，uid=$ExpectedNodeUID"
+  }
+  $Object = $Raw | ConvertFrom-Json
+  if (
+    $Object.kind -cne 'Node' -or
+    $Object.metadata.name -cne $Node -or
+    $Object.metadata.uid -cne $ExpectedNodeUID
+  ) {
+    throw "第 $_ 次返回的Node身份与批准对象不一致"
+  }
+  $Capacity = $Object.status.capacity.PSObject.Properties[$Resource]
+  $Allocatable = $Object.status.allocatable.PSObject.Properties[$Resource]
+  [pscustomobject]@{
+    Time = Get-Date -Format 'yyyy-MM-dd HH:mm:ss.fff'
+    NodeUID = $Object.metadata.uid
+    ResourceVersion = $Object.metadata.resourceVersion
+    Capacity = if ($Capacity) { $Capacity.Value } else { '<absent>' }
+    Allocatable = if ($Allocatable) { $Allocatable.Value } else { '<absent>' }
+  }
+  if ($_ -lt 20) {
+    Start-Sleep -Seconds 2
+  }
+}
+```
+
+脚本不只比较 context 名称：还固定 kubeconfig 文件 hash，并核对 context 绑定的 cluster、server 和 user；这样可以防止另一个同名 context 指向错误集群。它只能证明**这 20 个采样点中观测到的快照顺序**；2 秒间隔内的中间状态仍可能被漏掉。它也不能单独证明是哪个 device ID、哪个插件实例或哪次 Patch 导致。
+
+### 21.2 精确对到目标 Node 上的 Plugin Pod
+
+```powershell
+$Namespace = 'gpu-operator'
+$Selector = '__ACTUAL_DEVICE_PLUGIN_SELECTOR__'
+$ExpectedDaemonSetUID = '__APPROVED_DAEMONSET_UID__'
+$ExpectedPodUID = '__APPROVED_PLUGIN_POD_UID__'
+$ExpectedContainer = 'nvidia-device-plugin-ctr'
+$ExpectedImageID = '__APPROVED_IMAGE_DIGEST__'
+$PluginRequired = @(
+  $Selector,
+  $ExpectedDaemonSetUID,
+  $ExpectedPodUID,
+  $ExpectedContainer,
+  $ExpectedImageID
+)
+if (-not $KubectlBase -or ($PluginRequired | Where-Object {
+  [string]::IsNullOrWhiteSpace($_) -or $_ -like '__*'
+})) {
+  throw '先完成21.1身份校验，并填写真实selector、DaemonSet UID、Pod UID和image digest'
+}
+
+$PodArgs = @(
+  'get', 'pods',
+  '-n', $Namespace,
+  '-l', $Selector,
+  '--field-selector', "spec.nodeName=$Node",
+  '-o', 'json'
+)
+$PodRaw = & kubectl @KubectlBase @PodArgs
+$PodListExit = $LASTEXITCODE
+if ($PodListExit -ne 0 -or -not $PodRaw) {
+  throw "读取目标Node的Device Plugin Pod失败，exit=$PodListExit，node=$Node"
+}
+
+$PodList = $PodRaw | ConvertFrom-Json
+if ($PodList.kind -cne 'PodList') {
+  throw 'API返回对象不是PodList'
+}
+$Pods = @($PodList.items)
+if ($Pods.Count -ne 1) {
+  throw "预期恰好一个匹配 Pod，实际为 $($Pods.Count)"
+}
+
+$Pod = $Pods[0]
+$PodName = $Pod.metadata.name
+$PodNamespace = $Pod.metadata.namespace
+$Owner = @($Pod.metadata.ownerReferences) |
+  Where-Object {
+    $_.controller -eq $true -and
+    $_.kind -ceq 'DaemonSet' -and
+    $_.uid -ceq $ExpectedDaemonSetUID
+  } |
+  Select-Object -First 1
+$ContainerSpec = @($Pod.spec.containers) |
+  Where-Object { $_.name -ceq $ExpectedContainer } |
+  Select-Object -First 1
+$ContainerStatus = @($Pod.status.containerStatuses) |
+  Where-Object { $_.name -ceq $ExpectedContainer } |
+  Select-Object -First 1
+
+if (
+  $Pod.metadata.uid -cne $ExpectedPodUID -or
+  $Pod.spec.nodeName -cne $Node -or
+  $Pod.status.phase -cne 'Running' -or
+  $Pod.metadata.deletionTimestamp -or
+  -not $Owner -or
+  -not $ContainerSpec -or
+  -not $ContainerStatus -or
+  $ContainerStatus.imageID -cne $ExpectedImageID -or
+  [string]::IsNullOrWhiteSpace($ContainerStatus.containerID)
+) {
+  throw 'Pod UID、owner、Node、phase、删除状态、目标container、image digest或containerID与批准对象不一致'
+}
+
+$Pod | Select-Object `
+  @{n='Namespace';e={$_.metadata.namespace}}, `
+  @{n='Name';e={$_.metadata.name}}, `
+  @{n='UID';e={$_.metadata.uid}}, `
+  @{n='Node';e={$_.spec.nodeName}}, `
+  @{n='OwnerUID';e={$Owner.uid}}, `
+  @{n='TargetContainer';e={$ExpectedContainer}}, `
+  @{n='ImageID';e={$ContainerStatus.imageID}}, `
+  @{n='ContainerID';e={$ContainerStatus.containerID}}, `
+  @{n='RestartCount';e={$ContainerStatus.restartCount}} |
+  Format-List
+
+$LogArgs = @(
+  'logs', $PodName,
+  '-n', $PodNamespace,
+  '-c', $ExpectedContainer,
+  '--prefix=true',
+  '--timestamps',
+  '--tail=1000'
+)
+$LogIdentity = "$PodNamespace/$PodName uid=$ExpectedPodUID container=$ExpectedContainer"
+"[LOG IDENTITY] $LogIdentity"
+$Logs = & kubectl @KubectlBase @LogArgs
+$LogExit = $LASTEXITCODE
+if ($LogExit -ne 0) {
+  throw "目标container当前日志命令失败，exit=$LogExit，$LogIdentity"
+}
+if (-not $Logs) {
+  "[EVIDENCE GAP] 目标container日志命令成功但stdout为空；$LogIdentity；继续检查日志入口和时间窗"
+} else {
+  $Logs
+}
+
+if ($ContainerStatus.restartCount -gt 0) {
+  $PreviousLogs = & kubectl @KubectlBase @LogArgs --previous
+  $PreviousExit = $LASTEXITCODE
+  if ($PreviousExit -ne 0) {
+    "[EVIDENCE GAP] restartCount>0但previous日志不可读，exit=$PreviousExit，$LogIdentity"
+  } elseif (-not $PreviousLogs) {
+    "[EVIDENCE GAP] previous日志命令成功但stdout为空；$LogIdentity"
+  } else {
+    $PreviousLogs
+  }
+}
+
+$AfterRaw = & kubectl @KubectlBase get pod $PodName -n $PodNamespace -o json
+$AfterExit = $LASTEXITCODE
+if ($AfterExit -ne 0 -or -not $AfterRaw) {
+  throw "日志读取后复核Pod身份失败，exit=$AfterExit，pod=$PodNamespace/$PodName"
+}
+$AfterPod = $AfterRaw | ConvertFrom-Json
+if ($AfterPod.kind -cne 'Pod' -or $AfterPod.metadata.uid -cne $ExpectedPodUID) {
+  throw '日志读取期间Pod已被同名重建，拒绝把日志归入原实例'
+}
+```
+
+“目标插件 container 日志为空”与“命令失败”要分开。空日志可能是进程没输出、日志轮转、采集入口不对或时间窗不对；如果 Pod 在读取期间被同名重建，脚本会因 UID 变化拒绝把新旧日志拼在一起。
+
+### 21.3 目标 Node 上的 socket 与 kubelet日志
+
+先从批准的 Node 对象和资产系统记录 `.status.nodeInfo.systemUUID`、`.status.nodeInfo.bootID`，填入脚本；脚本会在第一次 `sudo`前与宿主机 product UUID、当前 boot ID 做 fail-closed 比较。只有完全一致才继续：
+
+```bash
+set -o pipefail
+
+approved_system_uuid='__APPROVED_NODE_SYSTEM_UUID__'
+approved_boot_id='__APPROVED_NODE_BOOT_ID__'
+direct_dir='/var/lib/kubelet/device-plugins'
+
+if test -z "$approved_system_uuid" ||
+   test -z "$approved_boot_id" ||
+   test "$approved_system_uuid" = '__APPROVED_NODE_SYSTEM_UUID__' ||
+   test "$approved_boot_id" = '__APPROVED_NODE_BOOT_ID__'; then
+  echo '[IDENTITY FAILED] 先从批准的Node对象记录systemUUID和bootID' >&2
+  exit 2
+fi
+
+if ! observed_at=$(date -Is); then
+  echo '[COMMAND FAILED] date -Is' >&2
+  exit 3
+fi
+if ! host_fqdn=$(hostname -f); then
+  echo '[COMMAND FAILED] hostname -f' >&2
+  exit 4
+fi
+if ! test -r /sys/class/dmi/id/product_uuid; then
+  echo '[IDENTITY FAILED] product_uuid不可读' >&2
+  exit 5
+fi
+if ! test -r /proc/sys/kernel/random/boot_id; then
+  echo '[IDENTITY FAILED] boot_id不可读' >&2
+  exit 6
+fi
+
+actual_system_uuid=$(tr -d '-' < /sys/class/dmi/id/product_uuid | tr '[:upper:]' '[:lower:]')
+actual_boot_id=$(tr '[:upper:]' '[:lower:]' < /proc/sys/kernel/random/boot_id)
+expected_system_uuid=$(printf '%s' "$approved_system_uuid" | tr -d '-' | tr '[:upper:]' '[:lower:]')
+expected_boot_id=$(printf '%s' "$approved_boot_id" | tr '[:upper:]' '[:lower:]')
+
+if test -z "$actual_system_uuid" ||
+   test -z "$actual_boot_id" ||
+   test "$actual_system_uuid" != "$expected_system_uuid" ||
+   test "$actual_boot_id" != "$expected_boot_id"; then
+  echo '[IDENTITY FAILED] 当前宿主机systemUUID/bootID与批准Node不一致' >&2
+  exit 7
+fi
+
+printf 'observed_at=%s\nhost_fqdn=%s\nsystem_uuid=%s\nboot_id=%s\n' \
+  "$observed_at" "$host_fqdn" "$actual_system_uuid" "$actual_boot_id"
+
+if ! sudo -n true; then
+  echo '[COMMAND FAILED] 当前批准会话没有非交互sudo读取权限' >&2
+  exit 8
+fi
+
+if ! sudo -n find "$direct_dir" \
+  -maxdepth 1 \
+  -type s \
+  -printf '%p %u:%g %m %TY-%Tm-%TdT%TH:%TM:%TS\n'; then
+  echo '[COMMAND FAILED] 读取Device Plugin socket目录失败' >&2
+  exit 9
+fi
+
+sudo -n ss -xlpn | grep -F "$direct_dir/"
+ss_rc=( "${PIPESTATUS[@]}" )
+if test "${ss_rc[0]}" -ne 0; then
+  echo '[COMMAND FAILED] ss读取失败' >&2
+  exit 10
+elif test "${ss_rc[1]}" -eq 1; then
+  echo '[EVIDENCE GAP] 没有匹配Device Plugin目录的监听socket' >&2
+elif test "${ss_rc[1]}" -ne 0; then
+  echo '[COMMAND FAILED] socket过滤失败' >&2
+  exit 11
+fi
+
+sudo -n journalctl -b -u kubelet --since '-30 minutes' --no-pager |
+  grep -E 'Got registration request|Connected to new client|Device plugin connected|State pushed for device plugin|Processed device updates|ListAndWatch ended unexpectedly|Endpoint became unhealthy|Updated capacity|Updated allocatable|Error getting machine info'
+log_rc=( "${PIPESTATUS[@]}" )
+if test "${log_rc[0]}" -ne 0; then
+  echo '[COMMAND FAILED] 当前boot的kubelet日志读取失败' >&2
+  exit 12
+elif test "${log_rc[1]}" -eq 1; then
+  echo '[EVIDENCE GAP] 当前boot和时间窗内没有匹配日志；核对verbosity与日志入口' >&2
+elif test "${log_rc[1]}" -ne 0; then
+  echo '[COMMAND FAILED] kubelet日志过滤失败' >&2
+  exit 13
+fi
+```
+
+这些命令不修改 kubelet、Device Plugin 或 GPU 状态，但 `sudo`仍可能写入系统认证/审计日志并影响 sudo timestamp cache，所以只能在批准的节点会话中使用。不要为了观察主动执行任何同义变更：
+
+```text
+删除、移动、chmod/chown Device Plugin socket
+删除或重建 Device Plugin Pod，修改 DaemonSet/Operator/ConfigMap
+kill 插件进程，重启 kubelet、containerd、节点或 NVIDIA Driver
+删除或改写 kubelet_internal_checkpoint
+cordon/drain Node，修改 Node label/taint
+切换 MIG、执行 GPU reset、伪造或修改 health
+```
+
+### 21.4 证据外发前脱敏
+
+至少处理：
+
+- Node name、hostname/FQDN、systemUUID、boot ID；
+- Plugin Pod UID、containerID、镜像仓库凭据；
+- GPU/MIG UUID；
+- socket path、宿主机本地用户/组、进程名、PID/FD；
+- Pod YAML 中的 env、secret/config 路径和内部 registry；
+- kubelet日志整行中的内部 resourceName、路径和错误上下文；
+- 游戏业务 namespace、镜像名和服务名。
+
+---
+
+## 22. 受控 canary 观察表
+
+只有平台本来就安排 Device Plugin/Operator canary 变更时，才跟随观察；不要为了学习主动制造生产故障。
+
+| 时刻 | Plugin Pod UID/image | direct Register | connected | first snapshot | Node Capacity/Allocatable | Java canary |
+|---|---|---|---|---|---|---|
+| T0 | 旧实例 | 基线 | 基线 | 基线 | 基线 | 基线 |
+| T1 | 新实例启动 | 未知 | 否 | 否 | 只观察 | 不启动 |
+| T2 | 新实例 | 是 | 未知 | 否 | 只观察 | 不启动 |
+| T3 | 新实例 | 是 | 是 | 否 | 只观察 | 不启动 |
+| T4 | 新实例 | 是 | 是 | 8/8 | 等 Node 更新 | 不启动 |
+| T5 | 新实例 | 是 | 是 | 8/8 | 8/8 | request 1 GPU |
+| T6 | 新实例 | 是 | 是 | 8/8 | 8/8 | 容器内 CUDA smoke 与应用探针通过 |
+
+验收不能停在 Plugin Pod Running，也不能停在 Node 8/8。Java canary 最终仍要验证第 16 课的设备注入链。
+
+---
+
+## 23. Go 语法回看：这章真正需要掌握的只有这些
+
+| Go 写法 | 大白话 | 本章为什么重要 |
 |---|---|---|
-| `handler, ok := m[key]` | 查map并判断key是否存在 | 区分“没注册handler”和“handler执行失败” |
-| `context.WithTimeout` | 为RPC加截止时间 | GetInfo不会无限挂住 |
-| `defer cancel()` | 函数返回时释放context资源 | 常与timeout成对 |
-| `go s.runClient(...)` | 后台启动长流 | 注册完成早于first list |
-| `for { stream.Recv() }` | 持续阻塞收server stream | error后直接退出 |
-| `make(map[...])` | 创建新map | 每份清单替换旧snapshot |
-| `sets.New[string]()` | 创建单个集合内去重的集合 | 同一ID仍可能因冲突Health同时进入两个集合并被Capacity双计 |
-| `m.mutex.Lock()` | 保护共享设备账 | ListAndWatch与Node status可能并发 |
-| `defer m.mutex.Unlock()` | 退出前必解锁 | 避免early return漏解锁 |
-| `*resource.NewQuantity(...)` | 构造Quantity指针后取值 | 写入ResourceList需要Quantity值 |
+| `func (m *ManagerImpl)` | 给对象定义实例方法 | 看清状态属于哪个 manager |
+| `*Type` / `&Type{}` | 指针类型 / 创建对象并取地址 | gRPC 请求和共享对象常用 |
+| `:=` | 首次声明并赋值 | 源码局部变量大量使用 |
+| `value, ok := map[key]` | 查值并判断 key 是否存在 | 区分 absent 与零值 |
+| `defer Unlock()` | 函数结束前保证解锁 | 避免 early return 漏锁 |
+| `go func(){}` | 后台启动 goroutine | 注册早于 first snapshot 的根因 |
+| `for { Recv() }` | 无限阻塞接收长流 | ListAndWatch 没有固定轮询周期 |
+| `make(map...)` | 创建可写 map | full snapshot 重建新表 |
+| `sets.New[string]()` | 创建字符串集合 | device ID 去重与计数 |
+| `select/default` | 非阻塞尝试 channel 操作 | Pod 更新通知满时可被丢弃 |
+| 多返回值 | 一个函数返回多份结果 | Capacity/Allocatable/removed 一次返回 |
+| `resource.Quantity` | Kubernetes 资源数量类型 | GPU 数量不是普通 YAML 字符串 |
 
-### 31.1 为什么锁内不做所有事情
-
-`genericDeviceUpdateCallback`：
-
-```text
-锁内：
-  重建共享map/set
-
-解锁后：
-  通知Pod更新
-  写checkpoint
-  打日志
-```
-
-大白话：
-
-```text
-只在修改共享账时占锁
-慢I/O和channel通知尽量不长期堵住其他读写
-```
-
-但 `writeCheckpoint`内部还会重新加锁复制数据；读源码不能只看函数名猜“完全无锁”。
-
-### 31.2 `sets.Set`为什么适合device ID
-
-需要：
-
-- 去重；
-- `Insert`；
-- `Len`；
-- `Union`；
-- 转list。
-
-这比手写 `map[string]bool`更直接。要注意这里有healthy和unhealthy**两个**set：同ID同Health重复不会增加同一set的`Len()`；同ID冲突Health却可能各占一个set，求和时出现双计。正确修复在插件端保证ID唯一、Health一致，而不是依赖kubelet猜测哪条为真。
+你暂时不需要先学反射、泛型实现原理、gRPC 生成代码和 channel 调度器内部。先能顺着 receiver、map、锁、goroutine、error 返回把状态链读通，就已经够支撑这一阶段的源码排障。
 
 ---
 
-## 32. 哪些必须读深，哪些留到后面
+## 24. 本章自测
 
-### 本课必须S3
+### 24.1 必须能口述的十二个问题
 
-- 两套registration入口的真实并存；
-- direct Register字段校验与endpoint拼接；
-- generic watcher desired/actual/reconcile/GetInfo/Notify；
-- 两条入口汇合到connectClient；
-- GetDevicePluginOptions与ListAndWatch；
-- full snapshot重建三张表；
-- Health精确判断；
-- Capacity/Allocatable公式；
-- Node Status异步传播；
-- disconnect立即unhealthy与5分钟移除；
-- Event与指标证据边界。
+1. 为什么 Device Plugin Pod Running 不能证明 Node 已有 `nvidia.com/gpu`？
+2. direct Register成功时，为什么 first snapshot 仍可能没到？
+3. `GetDevicePluginOptions`与 generic `GetInfo`的 timeout 为什么不能混？
+4. `ListAndWatch`为什么是完整快照而不是增量日志？
+5. 7 Healthy + 1 Unhealthy 时 Capacity/Allocatable 各是多少？
+6. Node Allocatable=8、已有 6 个 Pod request GPU 时，scheduler 为什么只剩 2？
+7. 新节点字段 absent 与历史资源显式 0 有什么差别？
+8. 插件断连为什么先 8/0，再 0/0？
+9. checkpoint 写失败为什么不代表本次内存快照被回滚？
+10. device ID 从新快照消失时，为什么运行 Pod status 仍可能显示 Healthy？
+11. `Processed device updates=8/8`后 Node 不变，为什么要检查 cAdvisor MachineInfo？
+12. 两个 registration/plugin manager 指标分别不能证明什么？
 
-### 本课只做边界
-
-- NVIDIA插件内部NVML枚举/health实现；
-- gRPC底层HTTP/2；
-- plugin manager所有CSI/DRA分支；
-- `DEPRECATION`兼容函数的静态死角与非法重复ID的全部异常组合（二读即可）；
-- Topology Manager算法；
-- checkpoint具体schema；
-- scheduler NodeResourcesFit已在08～10学过，不重复读。
-
-### 第 16 课再读
-
-- requests里怎么识别device plugin resource；
-- `devicesToAllocate`怎样选opaque ID；
-- Topology hint；
-- `GetPreferredAllocation`；
-- `Allocate`请求与响应；
-- env/mount/device/annotation/CDI怎样进入container。
-
-### 第 17 课再读
-
-- `kubelet_internal_checkpoint`；
-- kubelet重启恢复；
-- device health怎样暴露到Pod status；
-- PodResources API；
-- CDI device与已分配账本。
-
----
-
-## 33. 本章自测
-
-### 33.1 十四个必须口述的问题
-
-1. 为什么Device Plugin Pod Running不能证明Node有GPU resource？
-2. 当前commit的两套注册入口分别是什么？
-3. direct Register和generic GetInfo的endpoint处理有什么差别？
-4. direct与generic入口在socket消失后分别依靠什么机制重新注册？
-5. `PluginConnected`后为什么还不能说资源已上报？
-6. `ListAndWatch`为什么不是固定周期心跳？
-7. 新response为什么会让上次有、本次没有的device消失？
-8. 只有什么Health字符串会进入healthy集合？
-9. 7 healthy + 1 unhealthy时Capacity/Allocatable各是多少？
-10. Node Allocatable GPU=8、已有6块被请求时，为什么Allocatable字段仍可能是8？
-11. 插件刚断连和断连超过宽限期的字段分别怎样变化？
-12. 哪两个指标名字最容易被误读，它们实际证明什么？
-13. 8张物理GPU、time-slicing每卡10个replica时，为什么`nvidia.com/gpu` Capacity可能是80？
-14. resource从未注册时的absent，与活跃插件空清单/断连超宽限后的显式`0/0`，分别说明什么？
-
-### 33.2 现场题一
+### 24.2 现场题一：本课主案
 
 ```text
-host有8卡
+host 8 cards
+Plugin Running
+Register success
+Device plugin connected
+no State pushed
+Node resource absent
+Pod Insufficient nvidia.com/gpu
+```
+
+请回答：
+
+- 最小断点在哪两个源码函数之间？
+- 还缺哪两条 kubelet里程碑日志？
+- 为什么此时不先排 scheduler？
+- 什么证据能把断点移动到 Node status 链？
+
+### 24.3 现场题二：健康变化
+
+```text
 Processed device updates:
   totalCount=8
   healthyCount=7
 Node:
-  capacity=8
-  allocatable=7
+  Capacity=8
+  Allocatable=7
 ```
 
-回答：
+请回答：
 
-- 哪张表里有1个ID？
-- scheduler能否给新Pod分配8个资源单位？
-- 这是否证明对应的物理GPU消失？
-- 已占用异常entry的Pod会不会被kubelet立刻自动删除？
+- unhealthy set 中有几个 ID？
+- scheduler 能否给新 Pod 分配 8 个单位？
+- 这是否证明一张物理 GPU 已经消失？
+- 已占用该 ID 的 Pod 会不会被 kubelet自动删除？
 
-### 33.3 现场题二
+### 24.4 现场题三：断连
 
 ```text
-10:00 ListAndWatch ended unexpectedly
-10:00 Capacity=8 Allocatable=0
-10:03 Capacity=8 Allocatable=0
-10:06 Capacity=0 Allocatable=0
+10:00 stream ended
+10:00 Node 8/0
+10:03 Node 8/0
+10:06 Node 0/0
 ```
 
-回答：
+请回答：
 
-- 10:00发生了哪两个内部动作？
-- 10:03为什么Capacity仍保留？
-- 10:06是哪条宽限逻辑？
-- 状态为什么不一定精确在第五分钟整出现在kubectl？
+- 10:00 内部哪两个集合发生了什么变化？
+- 10:03 为什么 Capacity 还能保留？
+- 10:06 为什么不保证精确等于第五分钟整？
+- 哪条源码链最终把 Node 字段写成 0？
 
-### 33.4 现场题三
+### 24.5 参考答案
 
-```text
-Node Capacity=8
-Node Allocatable=8
-已有6个Pod各request 1 GPU
-新Pod request 3 GPU
-```
+<details>
+<summary>展开查看；建议先自己口述</summary>
 
-回答：
+1. Running只证明进程/容器状态；注册、回连、选项读取、first snapshot和Node传播都是后续独立阶段。
+2. `connectClient`同步连接成功后，用 goroutine异步启动 `runClient`；注册 RPC 可以先返回。
+3. generic `GetInfo`显式 1 秒；`GetDevicePluginOptions`当前没有在自身函数内创建同样的 timeout。
+4. full snapshot在重连和丢事件后可以整体替换旧状态，保证幂等收敛。
+5. Capacity=8，Allocatable=7。
+6. scheduler 自己用 8 减去已绑定 Pod requests 6，剩余 2；Node字段不反写实时余额。
+7. absent可表示从未形成过该资源账；显式 0保留“它曾由 Device Plugin 管理、后来被清理”的历史语义。
+8. 断连先把 healthy并入 unhealthy，保留 Capacity并阻止新分配；宽限期后清理资源并由Node setter写0。
+9. 内存先更新，checkpoint在锁外尝试写；失败只返回/记录error，没有事务回滚。
+10. callback只遍历新快照，missing ID不触发更新；status读取时找不到 ID 又默认 Healthy。
+11. 当前 Node setter只在 MachineInfo成功分支调用 DeviceManager.GetCapacity。
+12. direct counter只证明收到请求；generic total plugins只证明某socket处于desired/actual状态，不证明first snapshot和GPU健康数。
 
-- Node status字段是否自相矛盾？
-- scheduler剩余账是多少？
-- 为什么会FailedScheduling？
-- `nvidia-smi`实时利用率为0能否改变结论？
+主案最小断点是 `client.Run`调用 `ListAndWatch`到第一次 `stream.Recv()`返回之间。缺少 `State pushed`与 `Processed device updates`。若两条日志已经显示8/8，才把断点移向 GetCapacity、MachineInfo、Node setter和status patch。
 
-### 33.5 通过标准
+健康题中 unhealthy set有1个ID，新Pod不能申请8个健康单位；这只能说明插件把一个逻辑entry标为不可分配，不足以证明物理卡消失；kubelet也不会因这一变化自动删除运行Pod。
 
-你能：
+断连题中 healthy set变空，原ID并入unhealthy set，并记录stopTime。5分钟只是判断阈值，仍要等后续GetCapacity与Node status传播。
 
-- 从插件Pod一路画到scheduler informer；
-- 区分registered、connected、first list、Node patched；
-- 手算五种容量变化；
-- 从日志判断断在入口、stream、账本还是Node Status；
-- 不把Allocatable当实时剩余；
-- 不靠删除socket或重启生产组件做实验；
+</details>
 
-才算通过第 15 课。
+### 24.6 通过标准
+
+你能做到下面五件事，才算真正学完：
+
+- 从 NVIDIA Plugin Pod 画到 scheduler cache，而不是只画到 Register；
+- 区分 registered、connected、first snapshot、Node published；
+- 手算 absent、8/8、8/7、8/0、0/0；
+- 从生产证据判断断在 stream、内存账、MachineInfo、Node status还是scheduler账；
+- 不靠删 socket、删 checkpoint或重启生产组件制造实验。
 
 ---
 
-## 34. 官方资料与版本校准
+## 25. 源码锚点与本地测试边界
 
-> 链接于 2026-07-13核对。生产必须锁定实际Kubernetes、NVIDIA插件和GPU Operator版本。
+### 25.1 源码锚点
 
-- [Kubernetes Device Plugins](https://kubernetes.io/docs/concepts/extend-kubernetes/compute-storage-net/device-plugins/): 协议角色、注册、ListAndWatch、扩展资源使用。
-- [NVIDIA k8s-device-plugin](https://github.com/NVIDIA/k8s-device-plugin): 官方实现、部署、配置、MIG、device ID/list strategy。
-- [Kubernetes当前Device Plugin API](https://github.com/kubernetes/kubernetes/tree/master/staging/src/k8s.io/kubelet/pkg/apis/deviceplugin/v1beta1): `Register`、`ListAndWatch`、`Allocate`等协议定义。
-- [Kubernetes当前plugin manager](https://github.com/kubernetes/kubernetes/tree/master/pkg/kubelet/pluginmanager): 通用socket watcher、desired/actual state与registration operation。
+| 问题 | 当前 commit 的文件/函数 |
+|---|---|
+| DeviceManager 启动 | `pkg/kubelet/cm/devicemanager/manager.go::Start` |
+| direct Register | `pkg/kubelet/cm/devicemanager/plugin/v1beta1/server.go::Register` |
+| 建立 client | `handler.go::connectClient`、`client.go::Connect` |
+| 读取插件选项 | `manager.go::PluginConnected` |
+| ListAndWatch | `client.go::Run` |
+| 重建设备表 | `manager.go::genericDeviceUpdateCallback` |
+| Capacity/Allocatable | `manager.go::GetCapacity` |
+| Node status | `pkg/kubelet/nodestatus/setters.go` |
+| disconnect | `client.go::Disconnect`、`manager.go::PluginDisconnected` |
+| 5分钟宽限 | `types.go::endpointStopGracePeriod` |
+| checkpoint | `manager.go::readCheckpoint/writeCheckpoint` |
+| 已分配设备健康 | `manager.go::UpdateAllocatedResourcesStatus` |
 
-本课源码结论以本地commit为准；GitHub `master`会继续变化，链接用于找项目，不替代commit校准。
+### 25.2 与本章结论最贴近的现有测试
+
+```text
+pkg/kubelet/cm/devicemanager/manager_test.go
+  TestDevicePluginReRegistration
+  TestUpdateCapacityAllocatable
+  TestEndpointSyncOnDisconnect
+  TestUpdateAllocatedResourcesStatus
+
+pkg/kubelet/pluginmanager/pluginwatcher/plugin_watcher_test.go
+  TestPluginRegistration
+  TestPluginReRegistration
+  TestPluginRegistrationAtKubeletStart
+```
+
+### 25.3 当前机器的真实执行结果
+
+本地源码要求 Go `1.26.0`，当前机器是 Go `1.19.4`。2026-07-18 已实际尝试下面两组目标测试，两组都在读取 `go.work`时终止，尚未进入包加载、编译和测试执行：
+
+```text
+invalid go version '1.26.0': must match format 1.23
+unknown directive: godebug
+```
+
+因此本课当前测试状态是：**工具链不满足，目标测试未运行**。这既不是源码测试 FAIL，也不是 PASS；需要换成匹配 `go.mod/go.work`的 Go 工具链后重新执行。
+
+可在匹配工具链环境执行：
+
+```powershell
+go test ./pkg/kubelet/cm/devicemanager `
+  -run 'Test(DevicePluginReRegistration|UpdateCapacityAllocatable|EndpointSyncOnDisconnect|UpdateAllocatedResourcesStatus)$' `
+  -count=1
+
+go test ./pkg/kubelet/pluginmanager/pluginwatcher `
+  -run 'Test(PluginRegistration|PluginReRegistration|PluginRegistrationAtKubeletStart)$' `
+  -count=1
+```
 
 ---
 
-## 35. 一页收口
+## 26. 官方资料与版本校准
+
+> 链接于 2026-07-18核对。生产必须固定实际 Kubernetes、NVIDIA Device Plugin、GPU Operator 和配置版本。
+
+- [Kubernetes Device Plugins](https://kubernetes.io/docs/concepts/extend-kubernetes/compute-storage-net/device-plugins/)：注册、ListAndWatch、扩展资源和设备健康的官方概念边界。
+- [Kubernetes Device Plugin v1beta1 API](https://github.com/kubernetes/kubernetes/tree/master/staging/src/k8s.io/kubelet/pkg/apis/deviceplugin/v1beta1)：协议定义；滚动分支只用于导航，源码结论仍以本地 commit 为准。
+- [NVIDIA k8s-device-plugin](https://github.com/NVIDIA/k8s-device-plugin)：官方部署、配置、MIG、sharing 和 device list strategy。
+- [Kubernetes plugin manager](https://github.com/kubernetes/kubernetes/tree/master/pkg/kubelet/pluginmanager)：generic watcher、desired/actual state和注册事务。
+
+---
+
+## 27. 一页收口
 
 ```text
-Device Plugin进程
-  -> 监听自己的socket
+host 有 8 张 GPU
+  != Kubernetes 已有 8 个 GPU resource
+
+NVIDIA Device Plugin Running
   -> direct Register
-     或 generic GetInfo/Notify
-  -> connectClient
+  -> kubelet 回连 endpoint
   -> GetDevicePluginOptions
-  -> ListAndWatch
-  -> full device snapshot
-  -> all/healthy/unhealthy
-  -> Capacity=healthy+unhealthy
-  -> Allocatable=healthy
-  -> Node Status patch
-  -> scheduler informer/queue
+  -> 后台 ListAndWatch
+  -> first full snapshot
+  -> all/healthy/unhealthy 三张表
+  -> Capacity = healthy + unhealthy
+  -> Allocatable = healthy
+  -> Node Status
+  -> API Server
+  -> scheduler cache - 已绑定 Pod requests
 ```
 
-三个“不等于”：
+本案最终结论：
 
 ```text
-Plugin Pod Running != registered
-registered != first ListAndWatch processed
-Node Allocatable != 当前未使用剩余量
+Device plugin connected
+  + 没有 first snapshot 证据
+  + 新节点 Node resource absent
+  -> 先排 ListAndWatch 建流、首包与插件初始化
+  -> 不先排 scheduler
 ```
 
-下一课从这里接：
+四个最容易记错的边界：
 
 ```text
-Node已经上报 nvidia.com/gpu=8
-GPU Pod已经调度到该Node
-  -> kubelet怎样从container limits识别请求
-  -> 怎样从healthy集合选具体opaque device ID
-  -> Topology hint/GetPreferredAllocation怎样参与
-  -> 何时调用Allocate
-  -> 返回的env/mount/device/annotation/CDI
-  -> 怎样进入RunContainerOptions与CRI ContainerConfig
+registration counter 增加 != 注册成功
+registered/connected != first snapshot
+Node Allocatable != 实时剩余
+checkpoint 写失败 != 内存状态已回滚
 ```
 
-第 16 课会把“数量资源”继续读成“某个container真正拿到哪块device”。
+下一课继续顺着成功路径读：
+
+```text
+Node 已经 8/8
+Java 推理 Pod 已调度到 gpu-node-07
+  -> kubelet 怎样识别 container limit
+  -> 怎样选择具体 opaque device ID
+  -> Topology/GetPreferredAllocation 怎样参与
+  -> 何时调用 Allocate
+  -> env/mount/device/CDI 怎样进入 runtime ContainerConfig
+```

@@ -1,0 +1,4 @@
+interface:
+  display_name: "Kubernetes 源码讲义编写"
+  short_description: "把真实运维事故改写成设计驱动、逐句注释的 Kubernetes 源码课"
+  default_prompt: "使用 $write-k8s-source-lessons，以真实运维事故为入口，按设计思想、调用链和逐句源码注释标准重构这章 Kubernetes 讲义。"
