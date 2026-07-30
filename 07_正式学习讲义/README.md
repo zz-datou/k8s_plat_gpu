@@ -16,7 +16,7 @@
 
 然后直接进入真正的第一篇：
 
-- [第 07 课：Deployment 为什么宁愿卡住也不缩旧 Pod——从 rollout 读懂 Kubernetes 控制循环](07_源码热身_Deployment_rollout卡住如何沿控制器找原因.md)
+- [第 07 课：Java 应用滚动发布停在“3 个旧 Pod + 1 个新 Pod”——Deployment 在等什么](07_源码热身_Deployment_rollout卡住如何沿控制器找原因.md)
 
 不要求先按 `01~06` 重学基础。
 
@@ -53,15 +53,15 @@ scheduler
 
 | 编号 | 课程 | 深度 | 状态 |
 |---:|---|---|---|
-| 07 | [Deployment 为什么宁愿卡住：声明式控制循环与 rollout 安全边界](07_源码热身_Deployment_rollout卡住如何沿控制器找原因.md) | S2 | 已按设计思想与逐行源码注释重构，待自测 |
+| 07 | [Java 发布停在“3 个旧 Pod + 1 个新 Pod”：Deployment 控制循环与安全边界](07_源码热身_Deployment_rollout卡住如何沿控制器找原因.md) | S2 | 已按设计思想重构；固定提交源码、教学与运维终审通过，Go 测试受本机工具链版本阻塞，待个人自测 |
 | 08 | [scheduler：Java Pod 为什么宁愿 Pending——Filter/Score、Assume/Bind](08_scheduler源码主线_Pending到ScheduleOne与Filter_Score.md) | S3 | 已按设计思想重构，源码与教学已校验 |
 | 09 | [scheduler：NodeResourcesFit 与 Java Pod CPU/memory request 计算](09_NodeResourcesFit_JavaPod_request计算与Insufficient资源.md) | S3 | 已按设计思想重构，源码与教学已校验 |
 | 10 | [scheduler：Java Pod Unschedulable、重入队、抢占与稀缺资源](10_scheduler_JavaPod_Unschedulable重入队与抢占.md) | 队列 S3 / 抢占 S3（二遍进阶） | 已按设计思想重构，静态源码与教学已校验 |
 | 11 | [kubelet：Java Pod 已绑定却 FailedMount——持久交接、podWorkers 与 SyncPod](11_kubelet_JavaPod已绑定到syncLoop_podWorkers与SyncPod.md) | S3 | 已按设计思想重构，静态源码与教学已校验 |
-| 12 | [kubelet：Java Pod 从 runtime manager 到 PodSandbox、CRI 与容器启动](12_kubelet_JavaPod从runtimeManager到PodSandbox_CRI与容器启动.md) | S3 | 正文讲解完成，待自测 |
-| 13 | [kubelet：Java Pod Running 不 Ready 与重启——probe、statusManager、PLEG](13_kubelet_JavaPod_Running不Ready与重启_probe_statusManager_PLEG.md) | S2；liveness/PLEG窄链 S3 | 正文讲解完成，待自测 |
-| 14 | [NVIDIA 节点栈：Driver、CUDA 用户态、Container Toolkit、containerd/CDI](14_NVIDIA节点栈_Driver_CUDA_ContainerToolkit_containerd_CDI.md) | 运维深 / 源码 S0 | 正文与技术/实验安全审校完成，待自测 |
-| 15 | [Device Plugin：注册、ListAndWatch、Capacity/Allocatable](15_DevicePlugin_注册_ListAndWatch_Capacity_Allocatable.md) | S3 | 正文与源码/实验安全审校完成，待自测 |
+| 12 | [kubelet：Java Pod 从 runtime manager 到 PodSandbox、CRI 与容器启动](12_kubelet_JavaPod从runtimeManager到PodSandbox_CRI与容器启动.md) | S3 | 已按设计思想重构；静态源码、教学与运维终审通过，Go 测试受本机工具链版本阻塞，待个人自测 |
+| 13 | [kubelet：Java Pod Running 不 Ready 与重启——probe、statusManager、PLEG](13_kubelet_JavaPod_Running不Ready与重启_probe_statusManager_PLEG.md) | S2；liveness/PLEG窄链 S3 | 已按设计思想重构；静态源码、教学与运维终审通过，Go 测试受本机工具链版本阻塞，待个人自测 |
+| 14 | [NVIDIA 节点栈已就绪，为什么容器仍 CreateContainerError——Driver、Toolkit、containerd 与 CDI 分账](14_NVIDIA节点栈_Driver_CUDA_ContainerToolkit_containerd_CDI.md) | 运维 S3 / 源码 S1 | 已按设计思想重构；技术、源码与运维终审通过，Go 测试受本机工具链版本阻塞，待个人自测 |
+| 15 | [Device Plugin 已注册，为什么 Java 推理 Pod 仍 FailedScheduling——ListAndWatch、Capacity/Allocatable](15_DevicePlugin_注册_ListAndWatch_Capacity_Allocatable.md) | 主链 S3 / generic 注册 S2 | 已按设计思想重构；静态源码、教学与运维终审通过，Go 测试受本机工具链版本阻塞，待个人自测 |
 | 16 | [DeviceManager：device ID、Allocate 与容器注入](16_DeviceManager_deviceID_Allocate与容器注入.md) | S3 | 正文与源码/实验安全终审完成，待自测 |
 | 17 | [checkpoint、健康变化、PodResources 与 CDI](17_checkpoint_健康状态_PodResources与CDI恢复账本.md) | S3 | 正文与源码/实验安全终审完成，待自测 |
 | 18 | [GPU Operator：组件、安装、升级与故障定位](18_GPU_Operator_组件安装升级与故障定位.md) | S1 | 正文与技术/实验安全终审完成，待自测 |
