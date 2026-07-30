@@ -1,0 +1,7 @@
+interface:
+  display_name: "Remote Main Publisher"
+  short_description: "Safely publish lesson edits directly to remote main"
+  default_prompt: "Use $publish-k8s-lessons-remote-main to update the requested lesson directly on the remote main branch without using local Git."
+
+policy:
+  allow_implicit_invocation: true
