@@ -1,11 +1,10 @@
-# 第 19 课：DCGM——指标、告警、Xid、ECC 与 GPU 健康
+# 第 19 课：有 `/metrics` 为什么还不能说 GPU 健康——DCGM、Exporter、Xid 与 ECC 怎样分账
 
-> 主案例：Prometheus 能抓到 `nvidia-dcgm-exporter` 的 `/metrics`，Grafana 也有曲线，但推理服务仍然抖动；另一块 GPU 报了 Xid，值班同学准备仅凭编号直接 RMA
-> 组件主线：GPU → NVIDIA Driver/NVML → DCGM 或 `nv-hostengine` → DCGM Exporter → `/metrics` → Prometheus → Alertmanager/Grafana
-> 源码主线：NVIDIA `dcgm-exporter` tag `4.5.3-4.8.2`、commit `691c927` 的 `pkg/cmd/app.go`、`internal/pkg/{collector,registry,server,transformation,nvmlprovider}` 和 `etc/default-counters.csv`
-> 版本基线：与第 18 课 GPU Operator `v26.3.3` 对齐，内置 DCGM Exporter `4.5.3-4.8.2`；该独立项目仍会继续发布新版本，生产判断必须先核对现场镜像 digest
-> 事实核对日期：`2026-07-14`
-> 本课深度：S1。必须能设计 GPU 监控证据链、读懂关键 exporter 源码边界、写对常见 PromQL，并能安全处理 Xid/ECC/温度/功耗/NVLink 事件；不要求实现 DCGM C API
+> 这一课只追一个主问题：**`nvidia-dcgm-exporter` 正在运行，Prometheus 抓取成功，为什么仍不能宣布 GPU 健康？** 我们从一次推理P99（最慢那1%请求的延迟边界）抖动和Xid错误事件出发，沿“设备事实 → 采集 → 暴露 → 告警 → 业务影响”逐层找证据。
+
+先直接回答：
+
+> **HTTP 200只说明exporter的网页接口成功回应了这一次请求。它没有自动证明目标GPU被发现、目标field（采集项）能采、样本是新鲜有效值、设备没有Xid错误或ECC显存错误，也没有证明推理延迟符合SLO（业务服务目标）。**
 
 ---
 
@@ -32,7 +31,15 @@ Node仍然Ready
 nvidia.com/gpu仍在Allocatable中
 ```
 
-如果把普通 Java 应用监控的直觉生搬过来，很容易得到：
+把这里几句先翻成人话：
+
+- `ServiceMonitor已创建`、`target: UP`、`HTTP 200`只说明“Prometheus找得到这个exporter，而且这次网页请求成功了”；
+- `kernel log`是Linux内核日志，`NVRM`是NVIDIA驱动写日志时使用的标记，后面的`Xid`才是GPU错误编号；
+- `Node Ready`只说明kubelet仍把节点报告为可用，不等于节点里的每块GPU都健康；
+- `Allocatable`是kubelet对外公布的“可分配资源账面值”，不等于这块GPU已经做完设备体检；
+- `P99突然升高`表示最慢那1%的请求更慢了，它是业务现象，不会自动告诉你根因在应用、GPU还是采集链。
+
+如果只看最外层，很容易得到：
 
 ```text
 exporter活着
@@ -43,90 +50,178 @@ exporter活着
 
 这条推理是错的。
 
-正确证据链至少是：
-
-```text
-Exporter进程能运行
-  -> 能连接正确的DCGM或nv-hostengine
-  -> 当前Node上的目标GPU/MIG实体被发现
-  -> 目标field被CSV启用且该型号支持
-  -> 每次scrape拿到新鲜、有效、非blank的样本
-  -> Prometheus没有因relabel丢弃series
-  -> PodResources映射在当前时刻能把device ID对应到Pod
-  -> PromQL正确区分gauge/counter、reset、缺失series
-  -> 告警结合业务SLO、kernel log和诊断证据
-  -> 人工或自动止损动作符合该GPU型号与集群变更规范
-```
-
 任意一段断掉，都可能出现“页面看起来有图，但结论是错的”。
 
-### 0.1 本课最重要的四个不等号
+### 0.1 先把会反复出现的词翻成人话
 
-```text
-GET /metrics返回200
-  != 每块GPU健康
+| 名字 | 大白话作用 | 它不能单独证明什么 |
+|---|---|---|
+| **NVIDIA Driver** | 操作系统与GPU之间的“翻译和控制层”；应用、NVML、DCGM最终都要依赖它与设备交互 | 驱动进程/模块存在，不等于GPU和业务都正常 |
+| **NVML** | NVIDIA Driver提供的GPU管理/查询库，`nvidia-smi`和DCGM会用到 | 不证明Prometheus采集正常，也不证明业务快 |
+| **DCGM** | NVIDIA的数据中心GPU管理器，负责读取设备遥测（温度、功耗、错误等远程测量数据）、健康和诊断信息 | 不是Prometheus，也不替Kubernetes调度GPU |
+| **hostengine / `nv-hostengine`** | 承载DCGM核心能力的“设备数据服务”；可嵌在exporter进程里，也可独立运行 | 进程活着不等于每个field都有有效值 |
+| **exporter** | 把DCGM结果翻译成Prometheus能抓取的文本，并通过HTTP暴露 | 网页接口活着不等于GPU健康 |
+| **field** | DCGM中的一个采集项目，例如温度、功耗、最近Xid | 配置里写了field不等于当前GPU支持它 |
+| **sample / series** | sample是一时刻的“标签+数值”；同一组标签随时间形成一条series（时间序列） | 某条series缺失不等于数值为0 |
+| **gauge** | 可升可降的当前值，例如温度、利用率、最近Xid | 不能默认用`rate()`算增长速度 |
+| **counter** | 通常只累计增加、重启时可能归零的值，例如累计错误数 | 不能只盯绝对值判断“刚发生事故” |
+| **Xid** | NVIDIA Driver写入内核日志的GPU错误编号，是排查路线提示 | 单凭编号不能直接判定进入RMA（厂商返修/换卡流程） |
+| **ECC** | 显存的纠错能力与错误计数；单比特通常可纠正，双比特风险更高 | 历史累计非零不等于刚发生新故障 |
+| **MIG** | 把一块支持的GPU切成多个硬件隔离实例 | 不能把父卡指标重复算给每个实例 |
+| **per-process** | 按宿主机进程进一步拆分GPU用量，再尝试归属到Pod | 不是所有GPU模式、所有field都能拆到进程 |
+| **SLO / P99** | SLO是业务服务目标；P99表示99%的请求不超过这个延迟，也就是观察最慢那1%的边界 | GPU指标正常不等于SLO一定达标 |
 
-某条series不存在
-  != 指标值等于0
+`Prometheus scrape` 可以先理解成“Prometheus定时来抄一次`/metrics`”；Grafana只是把Prometheus里的数据画成图。Device Plugin则是另一条Kubernetes设备分配链，负责向kubelet报告可分配设备和健康状态，不读取Prometheus告警。
 
-Device Plugin仍报告Healthy
-  != DCGM没有发现异常
+GPU性能讨论里还会看到`SM`：它是GPU上真正调度和执行大量计算线程的核心单元，不是“显存使用率”的另一个名字。
 
-出现某个Xid编号
-  != 已经证明硬件坏了、可以直接RMA
+### 0.2 必须分开的四种“健康”
+
+下面**从上往下读**。箭头表示“想下更强结论，必须再补下一层证据”，不是一次同步RPC（一个程序立刻远程调用另一个程序并等待结果）。
+
+```mermaid
+flowchart TD
+    A["1. Exporter HTTP健康<br/>/metrics能回应"] --> B["2. 采集链健康<br/>目标GPU和field有新鲜有效样本"]
+    B --> C["3. 设备健康<br/>无高风险Xid/ECC/链路/温控证据"]
+    C --> D["4. 应用健康<br/>推理或训练SLO达标"]
 ```
 
-这四个不等号会贯穿整章。
+`HTTP 200`只到第一层。即使第二层也通过，仍可能发生：设备刚报Xid但样本尚未刷新；设备没有明显硬件错，但业务因为CPU喂不满、队列拥塞或模型配置而变慢。
 
-### 0.2 和 Java 平台监控做一次准确类比
+和Java平台类比：`/actuator/prometheus`能访问，不等于订单接口P99达标；JVM线程数有曲线，也不等于没有死锁。GPU只是把中间证据层增加了。
 
-Java 场景中：
+### 0.3 四种看似“没有异常”的值，含义完全不同
 
-```text
-/actuator/prometheus能访问
-  != 订单接口健康
-JVM线程数有曲线
-  != 没有死锁
-Pod Ready
-  != P99满足SLO
+| 现场看到什么 | 真正含义 | 正确处理 |
+|---|---|---|
+| 数值确实是`0` | exporter采到了这个field，当前值是0 | 仍核对type、时间戳和身份标签 |
+| series缺失 | 根本没有这条时间序列 | 查CSV、设备发现、采集、relabel（抓取前重写或丢弃标签/series的规则）和Prometheus |
+| blank/sentinel | 底层返回“空值”或特殊占位数；sentinel就是“这个数字不是业务值”的暗号 | 不能画成0；核对版本、日志与原始输出 |
+| unsupported | 该GPU/DCGM组合明确不支持这个field | 换受支持证据或调整监控契约，不能伪造0 |
+
+所以“ECC图是0”和“根本没有ECC series”必须分开；“一个极大的温度整数”也可能是sentinel，不是GPU真的热到那个数。
+
+### 0.4 故障怎样传播：DCGM与Device Plugin不是同一条链
+
+下面**从左往右读**。实线表示事实被下一层观察或转交；两条分支各自异步更新，不表示Prometheus会调用Device Plugin。
+
+```mermaid
+flowchart LR
+    F["GPU/链路发生故障"] --> K["Driver写kernel log<br/>可能出现Xid"]
+    F --> D["DCGM读取field/health"]
+    D --> E["Exporter生成样本"] --> P["Prometheus抓取并告警"] --> H["值班人员或受控处置系统"]
+    F --> DP["Device Plugin独立观察设备"] --> KL["kubelet设备账本"]
+    F --> APP["CUDA应用报错或变慢"] --> SLO["业务SLO变化"]
 ```
 
-GPU 场景完全一样，只是证据来源更多：driver、kernel、DCGM、exporter、PodResources、Prometheus、业务框架都可能各自只看到一层。
+这张图解释了为什么会出现“DCGM先告警，但Device Plugin仍是Healthy”，也解释了为什么`Node Ready`与GPU健康不能画等号。
+
+### 0.5 首遍只走六站
+
+首遍不要把三千多行一次读完。按六站走，每站只回答一个问题：
+
+| 站点 | 阅读位置 | 这一站只学会什么 |
+|---:|---|---|
+| 1 | 第0～1节 | `/metrics` 200为什么只证明HTTP层；用第一段源码钉住空响应也可成功 |
+| 2 | 第3～5节 | DCGM、hostengine、exporter、Prometheus各负责什么，HTTP/采集/设备健康为何不能混成一件事 |
+| 3 | 第6～8节 | 会读metric name、label、gauge/counter，并分清0、缺失、sentinel、unsupported |
+| 4 | 第9～10节 | 设备series怎样映射Pod；MIG/time-slicing为什么会重复统计 |
+| 5 | 第11、14～17、20节 | Xid/ECC/温控/链路怎样传播，生产事故怎样先只读取证再止损 |
+| 6 | 第12～13、21～23节与第31.1节 | 在已有模型和源码之后读PromQL、告警和只读证据，完成首遍验收 |
+
+**二遍再读：** 第2、4节的完整版本与启动链，第8.3节扩展health字段，第10.3节per-process，第18～19节性能/安全，第24～25节主动诊断和Go并发语法，以及第31.2节二遍验收。首遍不要求背所有Xid编号、DCGM field或Go并发类型。
+
+### 0.6 源码基线与阅读边界
+
+```text
+外部项目：NVIDIA/dcgm-exporter
+固定tag：4.5.3-4.8.2
+完整commit：691c92762eb551313c825f6efe4ceeee20982801
+事实核对日期：2026-07-14
+阅读深度：本章不深挖Kubernetes仓库源码；会逐行读懂回答主问题的Exporter关键函数；GPU运维部分要求能独立判断、取证和制定安全处置顺序
+```
+
+本章第一段代码来自**外部 NVIDIA 仓库**，不在本地 `D:\datou\devops\kubernetes-master\kubernetes` 源码树里。讲义按固定commit逐行核对；中文`//`是教学注释，不是上游原注释。本机没有拉取并构建这份外部仓库，因此只能写“静态源码核对完成”，不能写对应`go test`已经通过。
+
+表格默认逐行从左往右读；流程图会单独写方向。后面的命令与PromQL都放在责任模型和源码之后；第21～23节只读，第24节是维护窗口主动诊断，不能混用。
 
 ---
 
-## 1. 本课先钉死三十个结论
+## 1. 第一段核心源码：为什么空 `/metrics` 也可能是 HTTP 200
 
-1. DCGM 是 GPU 管理和遥测能力集合；DCGM Exporter 是把选定 DCGM field 转成 Prometheus exposition 的 Go 程序，两者不是一个概念。
-2. `nv-hostengine` 是 DCGM 的独立 host engine 进程；exporter 既可以连接远端/独立 hostengine，也可以使用本地嵌入模式。
-3. GPU Operator 默认只部署 `dcgm-exporter`、关闭独立 `dcgm` operand；此时 exporter 在本地使用 DCGM 能力。现场若启用了独立 `dcgm`，网络和 `5555` 连接会成为新故障面。
-4. Prometheus/Grafana 不会读取 GPU；它们读取 exporter 已经转换好的 time series。
-5. `/metrics` 能返回 HTTP 200 只证明 HTTP handler 工作，不证明每个 collector、每块 GPU、每个 field 都有效。
-6. 当前 tag 在 hot reload 的短窗口内可以返回 HTTP 200 但没有 GPU metrics；“200”更不能当作 GPU 健康探针。
-7. CSV 决定采集哪些 DCGM field、暴露成什么 Prometheus type、HELP 写什么；没有启用的 field 不会凭空出现。
-8. 硬件/driver/DCGM 版本不支持某 field 时，缺失或 blank 不能解释成数值 0。
-9. `gauge` 是当前值或最近状态，`counter` 通常表示累计量；两者的 PromQL 完全不同。
-10. 对 counter 看“当前绝对值大不大”通常没有意义，应优先看 `rate()`、`increase()` 或“是否发生增量”。
-11. `rate()`/`increase()`能处理常见单调 counter reset，但不能把长期缺失的 series 变成真实的 0。
-12. `DCGM_FI_DEV_XID_ERRORS` 是最近 Xid 值的 gauge，不是“Xid 总次数”；不能对它直接写 `rate()`。
-13. Xid 最原始的证据在 NVIDIA driver 写入的 kernel log；exporter 指标便于告警，但不能替代原始日志上下文。
-14. Xid 是诊断起点，可能来自应用、driver、PCIe/NVLink、内存或硬件；仅凭编号直接 RMA 缺少证据。
-15. ECC 单比特、双比特、volatile、aggregate、row remap 是不同含义，不能合成一个“ECC 大于 0 就下线”的规则。
-16. 温度高、功耗高、因温度/功耗导致的 throttling 是三种不同证据；高利用率下高功耗本身未必异常。
-17. GPU utilization 是采样窗口内忙碌比例，不等于吞吐，不等于 Tensor Core 利用率，也不等于业务有效工作量。
-18. 显存 `FB_USED` 高不自动等于泄漏；推理服务常常主动占用 KV cache 或内存池。
-19. Node 级 device series 和 Pod 级归属 series 是两层；先确认设备事实，再讨论是哪个 Pod。
-20. Pod 标签依赖 kubelet PodResources 与 Pod informer；它继承第 17 课的本地账本、一致性窗口和重启竞态。
-21. `GetAllocatableResources` 表示当前健康且可分配集合，不等于当前没有被 Pod 占用的 free GPU。
-22. exporter 的 Pod 标签为空可能是“没有归属”，也可能是映射窗口、socket、device ID 格式或权限问题。
-23. MIG 下要区分整卡实体、GPU Instance 和 Compute Instance；不能把父卡 metric 重复算给每个 MIG Pod。
-24. time-slicing 下多个 Pod 可共享同一物理 GPU；传统 device 级利用率复制到每个 Pod 会造成错误归因。
-25. `4.5.3-4.8.2` 新增/合入 time-sharing 与 MIG 的 per-process 路径，但它需要显式开关和更高权限，且 MIG 下 per-process SM 利用率仍有能力边界。
-26. Device Plugin 的 `Health`、kubelet 的资源健康状态、DCGM health/告警、业务 SLO 互不自动驱动；生产需要单独定义联动控制器或人工 runbook。
-27. `dcgmi diag` 有不同侵入等级；长诊断会占用和压测 GPU，不能在承载业务的 Node 上随手运行。
-28. 生产诊断的安全顺序是先保留证据，再停止新调度，再排空受影响工作负载，再经审批运行主动诊断或 reset。
-29. exporter 默认监听 `:9400`；如果被暴露到不可信网络，GPU 型号、UUID、Pod/namespace、标签和利用率都可能成为信息泄露面。
-30. TLS、basic auth、NetworkPolicy、Service 范围、RBAC、Pod label allowlist、pprof 开关和 `SYS_ADMIN`/privileged 权限必须一起审计，不能只看一个开关。
+先只回答主问题：**exporter没有拿到任何GPU样本时，HTTP handler（接收并处理网页请求的函数）是否一定报错？**
+
+答案是：不一定。当前版本在热重载或GPU bind/unbind（GPU被重新加入或移出监控）期间，会用一个空registry（collector登记表）代替暂时不存在的registry；只要“收集空结果、渲染空结果、写响应”这三步都没有返回error（函数报告的失败），HTTP请求仍正常完成。
+
+源码位置：`internal/pkg/server/server.go:162-171,249-272`，固定tag `4.5.3-4.8.2`，完整commit `691c92762eb551313c825f6efe4ceeee20982801`。
+
+摘录类型：**两个非连续的完整函数，教学注释版**。先读`GetRegistry`，再读`Metrics`；两段之间还有reload状态和HTTP server生命周期代码，这里没有用`...`伪装成连续源码。
+
+```go
+// GetRegistry 取得当前用于采集指标的registry（collector登记表）。
+func (s *MetricsServer) GetRegistry() *registry.Registry { // 定义MetricsServer对象的取登记表方法。
+	// 原子读取（一次完整读取，不会读到一半状态）当前指针，避免与热重载并发冲突。
+	reg := s.registry.Load() // 把读取结果保存到reg。
+	// nil表示重载或GPU重新绑定期间，旧registry已清掉、新registry还没装上。
+	if reg == nil { // 判断当前是否暂时没有可用登记表。
+		// 不返回错误，而是新建一个没有collector的空registry。
+		return registry.NewRegistry() // 返回一个空登记表，调用者不会在这里收到错误。
+	} // “当前登记表为空”的分支结束。
+	// 正常时返回当前真实registry。
+	return reg // 返回已存在的登记表。
+} // GetRegistry函数结束。
+
+// Metrics处理一次HTTP /metrics请求。
+func (s *MetricsServer) Metrics(w http.ResponseWriter, _ *http.Request) { // 定义/metrics的HTTP处理函数。
+	// 加一个浏览器安全响应头；它和GPU健康无关。
+	w.Header().Set("X-Content-Type-Options", "nosniff") // 写入响应头。
+
+	// 取得当前registry；重载窗口里可能拿到上面的空registry。
+	currentRegistry := s.GetRegistry() // 把当前登记表保存到currentRegistry。
+
+	// 调用已登记的collectors采集；空registry会得到空结果，而不一定得到error。
+	metricGroups, err := currentRegistry.Gather() // 同时接收采集结果和错误。
+	// 只有Gather明确失败时才返回HTTP 500。
+	if err != nil { // 判断采集是否明确失败。
+		// 把collector失败原因写入exporter日志。
+		slog.Error("Failed to gather metrics from collectors", slog.String(logging.ErrorKey, err.Error())) // 记录采集错误。
+		// 向HTTP客户端返回500和通用错误文本。
+		http.Error(w, internalServerError, http.StatusInternalServerError) // 返回HTTP 500。
+		// 立即结束本次请求。
+		return // 不再继续渲染和写正常响应。
+	} // 采集错误分支结束。
+	// 在内存中准备Prometheus文本响应；空结果时buffer也可以为空。
+	var buf bytes.Buffer // 声明一个暂为空的内存缓冲区。
+	// 把内部metric结果渲染成Prometheus文本。
+	err = s.render(&buf, metricGroups) // 把采集结果写成Prometheus文本。
+	// 只有渲染明确失败时才返回HTTP 500。
+	if err != nil { // 判断文本渲染是否失败。
+		http.Error(w, internalServerError, http.StatusInternalServerError) // 渲染失败就返回HTTP 500。
+		return // 立即结束请求。
+	} // 渲染错误分支结束。
+	// 把结果写回客户端；若前面没设置错误状态，Go HTTP会按成功响应处理，空内容也不等于GPU健康。
+	_, err = w.Write(buf.Bytes()) // 写响应；_表示不关心实际写出的字节数。
+	// 连响应都写失败时才记录并尝试返回HTTP 500。
+	if err != nil { // 判断向客户端写数据是否失败。
+		slog.Error("Failed to write response.", slog.String(logging.ErrorKey, err.Error())) // 记录写响应错误。
+		http.Error(w, "failed to write response", http.StatusInternalServerError) // 尝试返回HTTP 500。
+		return // 结束本次请求。
+	} // 写响应错误分支结束。
+} // Metrics函数结束；若前面都成功，HTTP请求正常完成。
+```
+
+按“输入、判断、动作、结果”收束：
+
+| 项目 | 这段源码真正做什么 |
+|---|---|
+| 输入 | 一次HTTP请求和当前registry |
+| 判断 | Gather、render、Write有没有返回error |
+| 动作 | 收集现有collector、渲染文本、写HTTP响应 |
+| 结果 | 没有error就完成请求；代码没有逐块GPU做“适合承载业务”的总健康判定 |
+
+**大白话总结：** `/metrics` handler像“把仓库当前登记的货物清单打印出来”。打印机工作正常，只说明网页能回；仓库登记表可能暂时是空的，也可能没有你关心的温度/ECC field。HTTP 200不是“每张GPU体检合格证”。
+
+**顺手学 Go：** `func (s *MetricsServer)`里的`s`叫receiver（接收者），表示这个函数属于`MetricsServer`；`*MetricsServer`是对象指针。`:=`表示第一次声明并赋值；`err != nil`表示拿到了错误对象。`_ *http.Request`里的`_`表示本函数明确不使用request参数。`bytes.Buffer`是内存缓冲区。`w.Write`返回“写了多少字节”和`error`两个值；左边的`_`丢掉字节数。这里没有调用“GPU是否健康”的函数，也没有要求结果至少包含一条GPU sample。
 
 ---
 
@@ -134,39 +229,42 @@ GPU 场景完全一样，只是证据来源更多：driver、kernel、DCGM、exp
 
 ### 2.1 本课固定快照
 
+GPU Operator可以先理解成“在Kubernetes中统一安装和维护NVIDIA Driver、Device Plugin、Toolkit、Exporter等组件的控制器套件”；它管理的每个实际运行组件常被称为operand（被Operator管理的工作部件）。镜像`digest`是内容固定指纹，比可能漂移的tag更能证明现场版本。`pprof`是Go程序的性能/运行状态调试接口，默认关闭就是“必须明确打开才会暴露”。
+
 | 项目 | 本课基线 | 为什么重要 |
 |---|---:|---|
 | GPU Operator | `v26.3.3` | 第 18 课的安装与 operand 基线 |
 | DCGM Exporter image/tag | `4.5.3-4.8.2` | Operator `26.3.2/26.3.3` 组件矩阵中的 exporter |
-| Git commit | `691c927` | 防止网页 `main` 分支继续变化 |
+| Git commit | `691c92762eb551313c825f6efe4ceeee20982801` | 防止网页 `main` 分支继续变化 |
 | release date | `2026-05-07` | 表明本课不是沿用多年前的 exporter 行为 |
 | 内含 DCGM | `4.5.3` | field、health、诊断能力与 DCGM 版本相关 |
 | exporter | `4.8.2` | Go 层行为、labels、HTTP、安全开关与此版本相关 |
 | 默认 listen | `:9400` | Service、抓取与暴露面基线 |
 | 默认 collection interval | `30000ms` | scrape 频率不能凭空制造更高分辨率的 DCGM 样本 |
-| 默认 PodResources socket | `/var/lib/kubelet/pod-resources/kubelet.sock` | Pod 归属链路的本地 Unix socket |
-| pprof | 默认关闭 | `4.5.3-4.8.2` 起明确要求显式 opt-in |
+| 默认 PodResources socket | `/var/lib/kubelet/pod-resources/kubelet.sock` | Pod归属链路的本地Unix socket（同一台机器上两个进程通过特殊文件通信的接口） |
+| pprof | 默认关闭 | `4.5.3-4.8.2`起要求显式opt-in（默认不开，必须主动开启） |
 
 官方固定入口：
 
 - [DCGM Exporter `4.5.3-4.8.2` release](https://github.com/NVIDIA/dcgm-exporter/releases/tag/4.5.3-4.8.2)
-- [DCGM Exporter 固定 tag 源码](https://github.com/NVIDIA/dcgm-exporter/tree/4.5.3-4.8.2)
-- [固定 tag 的 `pkg/cmd/app.go`](https://github.com/NVIDIA/dcgm-exporter/blob/4.5.3-4.8.2/pkg/cmd/app.go)
-- [固定 tag 的默认 counters](https://github.com/NVIDIA/dcgm-exporter/blob/4.5.3-4.8.2/etc/default-counters.csv)
+- [DCGM Exporter 固定 commit 源码](https://github.com/NVIDIA/dcgm-exporter/tree/691c92762eb551313c825f6efe4ceeee20982801)
+- [固定 commit 的 `internal/pkg/server/server.go`](https://github.com/NVIDIA/dcgm-exporter/blob/691c92762eb551313c825f6efe4ceeee20982801/internal/pkg/server/server.go)
+- [固定 commit 的 `pkg/cmd/app.go`](https://github.com/NVIDIA/dcgm-exporter/blob/691c92762eb551313c825f6efe4ceeee20982801/pkg/cmd/app.go)
+- [固定 commit 的默认 counters](https://github.com/NVIDIA/dcgm-exporter/blob/691c92762eb551313c825f6efe4ceeee20982801/etc/default-counters.csv)
 - [NVIDIA DCGM 最新官方文档](https://docs.nvidia.com/datacenter/dcgm/latest/)
 - [GPU Operator 26.3 release notes](https://docs.nvidia.com/datacenter/cloud-native/gpu-operator/26.3/release-notes.html)
 
 ### 2.2 当前 release 不能忽略的新增行为
 
-`4.5.3-4.8.2` release 明确列出：
+`4.5.3-4.8.2` release（版本发布说明）明确列出。这里的hot reload是“进程不停，重新加载采集配置”；pprof是Go程序的性能/运行状态调试接口；informer cache是把apiserver对象事件保存在本进程的本地缓存：
 
 - 更新到 DCGM `4.5.3`、Exporter `4.8.2`；
-- 改进 GPU health metrics，包括 fallen-off-bus Xid 这类 GPU-wide health incident；
+- 改进GPU health metrics，包括fallen-off-bus（GPU从PCIe总线上失联）Xid这类GPU-wide health incident（影响整块物理GPU的健康事件）；
 - `/debug/pprof` 改为显式 `--enable-pprof` 或环境变量开启；
 - PodMapper 引入 informer cache；
-- 新增 time-sharing/MIG 的 per-process GPU metrics；
-- MIG 设备支持 HPC job label；
-- 更新 field metadata、deprecated alias、health constants 等。
+- 新增 time-sharing（也常写time-slicing，多个任务轮流共享同一物理GPU）/MIG 的 per-process GPU metrics；
+- MIG 设备支持 HPC（高性能计算）job label；
+- 更新field metadata（字段名称、类型、单位等说明）、deprecated alias（仍兼容但不建议继续使用的旧名字）、health constants（代码中固定的健康状态值）等。
 
 所以本课不会复述这些旧结论：
 
@@ -193,6 +291,8 @@ PodMapper每次scrape都必然全量直查apiserver
 
 ### 2.3 生产快照最少记录什么
 
+下面几个配置词先翻一下：`checksum`是文件内容指纹；`relabel`是在Prometheus接收前重写或丢弃标签/series；`retention`是指标保留多久；`scrapeTimeout`是一次抓取最多等多久；`external labels`是Prometheus给所有样本补的集群身份标签；`UID`是Kubernetes对象本次生命的唯一编号；`virtual GPU`是共享策略下对同一物理GPU暴露出的逻辑份额；`hostPID`表示容器共享宿主机进程编号视图；`capabilities`是Linux拆分出来的额外特权；DRA是Kubernetes动态资源分配机制。
+
 ```text
 ClusterPolicy.spec.dcgmExporter
 dcgm-exporter image digest
@@ -207,7 +307,7 @@ ServiceMonitor interval/scrapeTimeout/relabel
 Prometheus external labels与retention
 PodResources socket路径
 是否启用Pod labels/UID/virtual GPUs/DRA
-是否启用TLS/basic auth/pprof
+是否启用TLS（加密传输）/basic auth（用户名密码认证）/pprof
 securityContext、hostPID、capabilities
 ```
 
@@ -229,15 +329,17 @@ DCGM，Data Center GPU Manager，是 NVIDIA 面向数据中心 GPU 的管理与�
 - policy；
 - NVSwitch 等实体的部分监控能力。
 
+这里的health watch是持续观察设备子系统，diagnostics是主动运行检查/压力测试，accounting是进程用量统计，topology是GPU与PCIe/NVLink连接关系，policy是按设备事件触发回调的规则。entity就是DCGM监控对象，可以是一整块GPU、MIG实例或NVSwitch（多GPU高速互联交换芯片）。
+
 大白话：
 
 > DCGM 是靠近 GPU 和 driver 的“设备体检与遥测层”，不是 Prometheus exporter，也不是 Kubernetes 调度器。
 
 ### 3.2 `nv-hostengine`
 
-DCGM 能以内嵌 library 方式运行，也能由独立 `nv-hostengine` 进程提供服务。
+DCGM 能以内嵌library方式运行，也能由独立`nv-hostengine`进程提供服务。内嵌（embedded）表示DCGM能力就在exporter进程里；独立模式则由exporter连接另一个hostengine进程。
 
-两种常见形态：
+两种常见形态如下，均**从上往下读**。箭头表示exporter从下一层取得GPU数据；形态B中的连接才跨进程/网络，形态A不是一次远端RPC：
 
 ```text
 形态A：默认Operator方式
@@ -255,7 +357,7 @@ dcgm-exporter Pod
 
 - 远端地址是否正确；
 - `5555` 可达性；
-- Service endpoint 是否落到正确 Node；
+- Service endpoint（Service实际转发到的Pod地址）是否落到正确Node；
 - exporter 与 hostengine/DCGM 版本兼容；
 - 一个 Node 的 exporter 是否误连另一个 Node 的 hostengine；
 - 网络断开时 exporter 的表现。
@@ -273,28 +375,30 @@ Exporter 是 Go 程序，主要做四件事：
 3. 可选地用 PodResources/Pod informer/进程 cgroup 补 Kubernetes 归属；
 4. 把结果渲染成 Prometheus text exposition，通过 HTTP 提供。
 
+源码里常把这四步叫provider、collector、transformation和registry：provider是“连接DCGM的数据适配层”，collector是“按field取样的采集器”，transformation是“给样本补Pod等属性的转换步骤”，registry是“登记了哪些collector的清单”。text exposition就是Prometheus规定的文本输出格式。
+
 它不是：
 
-- GPU workload 的 admission webhook；
+- GPU workload的admission webhook（Pod创建前做准入检查/修改的回调）；
 - Device Plugin；
 - kubelet DeviceManager；
 - 自动隔离坏卡的控制器；
-- GPU reset 控制器；
+- GPU reset控制器；reset是让目标GPU重新初始化设备状态，比重启一个业务Pod影响更大；
 - RMA 判定系统。
 
 ### 3.4 Prometheus 与 Alertmanager
 
-Prometheus 定时 pull `/metrics`、存储 series、执行规则。Alertmanager 做分组、抑制、路由和通知。
+Prometheus 定时pull（主动抓取）`/metrics`、存储series、执行规则。Alertmanager做分组、抑制、路由和通知。
 
 Prometheus 不知道：
 
 - 某个 Xid 是否由当前 Pod 触发；
 - 某型号 GPU 的安全温度阈值；
 - 这个 Node 是否可以自动 drain；
-- 业务正处于不可中断训练 checkpoint 前；
+- 业务正处于不可中断训练checkpoint（训练已保存、可从中恢复的进度点）前；
 - 某次 counter 下降是重启、替换 GPU 还是 exporter bug。
 
-这些语义要由平台规则和 runbook 补齐。
+这些语义要由平台规则和runbook（经过评审的故障处置步骤）补齐。长训练不能为了排障随便丢掉尚未保存的进度。
 
 ### 3.5 Grafana
 
@@ -309,7 +413,7 @@ Dashboard 常见误导：
 - 变量只显示活跃 series，故障 GPU 从下拉框消失；
 - 面板的单位与原始 field 不一致。
 
-因此告警和排障要能回到 raw series 与原始来源。
+因此告警和排障要能回到raw series（未经面板聚合和补零的原始时间序列）与原始来源。
 
 ---
 
@@ -321,7 +425,7 @@ Dashboard 常见误导：
 
 | 路径 | 作用 | 本课阅读深度 |
 |---|---|---|
-| `pkg/cmd/app.go` | CLI/env 默认值、启动、provider、registry、server、hot reload | 深读 |
+| `pkg/cmd/app.go` | CLI（命令行）/env（环境变量）默认值、启动、provider、registry、server、hot reload | 深读 |
 | `internal/pkg/appconfig/*` | 配置结构与 CLI 到运行时配置 | 读字段 |
 | `internal/pkg/counters/*` | 解析 CSV、选择 DCGM fields | 读主线 |
 | `internal/pkg/dcgmprovider/*` | DCGM client/provider 边界 | 读接口 |
@@ -338,44 +442,46 @@ Dashboard 常见误导：
 
 ### 4.2 `NewApp()`：默认值不是猜出来的
 
-`pkg/cmd/app.go` 的 `NewApp()` 注册了当前版本的 CLI flags。关键默认值包括：
+下面仍是**外部 NVIDIA 仓库证据**。`pkg/cmd/app.go:123-143,281-286`的`NewApp()`注册了当前版本的CLI flags（命令行参数）。摘录类型是**四个非连续配置检查点，教学注释版**：每个真实struct中还含`Aliases`或`Usage`等字段，故本块不能独立编译，只用于核对默认值。
 
 ```go
-&cli.StringFlag{
-    Name:    CLIFieldsFile,
-    Value:   "/etc/dcgm-exporter/default-counters.csv",
-    EnvVars: []string{"DCGM_EXPORTER_COLLECTORS"},
-}
+&cli.StringFlag{ // 定义“采哪些field”的文件参数。
+    Name: CLIFieldsFile, // 参数内部名称是collectors。
+    Value: "/etc/dcgm-exporter/default-counters.csv", // 默认读取这份CSV。
+    EnvVars: []string{"DCGM_EXPORTER_COLLECTORS"}, // 也允许用环境变量覆盖。
+} // “采哪些field”的参数定义结束。
 
-&cli.StringFlag{
-    Name:    CLIAddress,
-    Value:   ":9400",
-    EnvVars: []string{"DCGM_EXPORTER_LISTEN"},
-}
+&cli.StringFlag{ // 定义HTTP监听地址参数。
+    Name: CLIAddress, // 参数内部名称是address。
+    Value: ":9400", // 默认在9400端口监听。
+    EnvVars: []string{"DCGM_EXPORTER_LISTEN"}, // 环境变量也能覆盖监听地址。
+} // HTTP监听地址参数定义结束。
 
-&cli.IntFlag{
-    Name:    CLICollectInterval,
-    Value:   30000,
-    EnvVars: []string{"DCGM_EXPORTER_INTERVAL"},
-}
+&cli.IntFlag{ // 定义DCGM采集周期参数，类型是整数。
+    Name: CLICollectInterval, // 参数内部名称是collect-interval。
+    Value: 30000, // 默认30000毫秒，也就是30秒采一次。
+    EnvVars: []string{"DCGM_EXPORTER_INTERVAL"}, // 环境变量也能覆盖采集周期。
+} // 采集周期参数定义结束。
 
-&cli.StringFlag{
-    Name:    CLIPodResourcesKubeletSocket,
-    Value:   "/var/lib/kubelet/pod-resources/kubelet.sock",
-    EnvVars: []string{"DCGM_POD_RESOURCES_KUBELET_SOCKET"},
-}
+&cli.StringFlag{ // 定义kubelet PodResources socket路径参数。
+    Name: CLIPodResourcesKubeletSocket, // 参数内部名称是pod-resources-kubelet-socket。
+    Value: "/var/lib/kubelet/pod-resources/kubelet.sock", // 默认读Node本地这个Unix socket。
+    EnvVars: []string{"DCGM_POD_RESOURCES_KUBELET_SOCKET"}, // 环境变量也能覆盖路径。
+} // PodResources socket参数定义结束。
 ```
 
-源码解释：
+**大白话总结：** 这四小段只是在登记“默认采什么、监听哪里、多久采一次、从哪里找Pod分配账本”，还没有开始判断GPU健康。
 
 - CLI flag 与环境变量都能设置同一个配置；
-- `:9400` 表示监听所有本地地址族对应的端口，是否能从集群外访问还取决于 Pod 网络、Service、Ingress/LB 和防火墙；
+- `:9400`表示监听所有本地地址族对应的端口，是否能从集群外访问还取决于Pod网络、Service、Ingress（集群入口）/LB（负载均衡器）和防火墙；
 - 默认 30 秒 collection interval 不等于 Prometheus 一定 30 秒 scrape；两套周期要分别取证；
 - PodResources socket 是 Node 本地路径，不是 apiserver URL。
 
 ### 4.3 启动主线
 
 当前源码的启动链可以压缩为：
+
+下面**从上往下读**。这些箭头主要是同一个exporter进程里的函数调用/初始化顺序；只有provider选择远端hostengine时才跨进程连接。
 
 ```text
 NewApp
@@ -397,6 +503,8 @@ NewApp
       -> config file watcher / optional GPU bind-unbind watcher
 ```
 
+这里的`prerequisites.Validate`是在启动前检查必要条件；`queryDCPMetrics`虽然函数名带DCP，作用是查询当前环境可用的DCGM profiling指标；`watcher`就是持续观察配置文件或GPU变化的任务；GPU topology是“当前有哪些GPU/MIG/NVSwitch实体及其组织关系”。
+
 这条链给排障一个很实用的顺序：
 
 ```text
@@ -404,7 +512,7 @@ NewApp
   -> 看prerequisite/provider/config
 
 进程启动成功但无目标field
-  -> 看CSV、field支持、watch list、collector
+  -> 看CSV、field支持、watch list（待监控设备清单）、collector
 
 设备metric有但Pod标签空
   -> 看transformation/PodResources/informer
@@ -415,39 +523,55 @@ NewApp
 
 ### 4.4 `buildRegistry()`：采样对象和 HTTP 不是一回事
 
-源码中 `buildRegistry()` 大意是：
+外部源码：`pkg/cmd/app.go:594-617`，固定commit `691c92762eb551313c825f6efe4ceeee20982801`。摘录类型：**完整函数，教学注释版**。
 
 ```go
-func buildRegistry(
-    ctx context.Context,
-    _ *cli.Context,
-    config *appconfig.Config,
-) (*registry.Registry, devicewatchlistmanager.Manager, error) {
-    cs := getCounters(ctx, config)
-    manager := startDeviceWatchListManager(cs, config)
-    hostName, err := hostname.GetHostname(config)
-    if err != nil {
-        return nil, nil, fmt.Errorf("failed to get hostname: %w", err)
-    }
+// buildRegistry根据当前配置和GPU拓扑创建一整套采集登记表。
+func buildRegistry( // 定义“按当前配置重建采集登记表”的函数。
+    ctx context.Context, // 传递取消信号和调用范围。
+    _ *cli.Context, // 当前函数不用CLI对象，所以用_明确丢弃。
+    config *appconfig.Config, // 已解析好的运行配置。
+) (*registry.Registry, devicewatchlistmanager.Manager, error) { // 函数返回登记表、设备清单管理器和错误。
+    slog.Info("Building registry for current GPU topology") // 记录开始按当前拓扑重建。
 
-    factory := collector.InitCollectorFactory(cs, manager, hostName, config)
-    reg := registry.NewRegistry()
-    for _, entityCollector := range factory.NewCollectors() {
-        reg.Register(entityCollector)
-    }
-    return reg, manager, nil
-}
+    cs := getCounters(ctx, config) // 从CSV/配置得到要采集的field清单。
+
+    deviceWatchListManager := startDeviceWatchListManager(cs, config) // 决定监控哪些GPU/MIG等实体。
+
+    hostName, err := hostname.GetHostname(config) // 取得要写进metric label的主机名。
+    if err != nil { // 判断读取主机名是否失败。
+        return nil, nil, fmt.Errorf("failed to get hostname: %w", err) // 主机名失败就返回错误，不继续建表。
+    } // 主机名错误分支结束。
+
+    cf := collector.InitCollectorFactory(cs, deviceWatchListManager, hostName, config) // 准备各类collector工厂。
+
+    cRegistry := registry.NewRegistry() // 先创建一个空登记表。
+    for _, entityCollector := range cf.NewCollectors() { // 遍历工厂按实体生成的collector。
+        cRegistry.Register(entityCollector) // 把每个collector登记进去，供/metrics请求时Gather。
+    } // collector遍历结束。
+
+    slog.Info("Registry built successfully", // 记录本轮登记表创建成功。
+        slog.Int("collector_count", len(cf.NewCollectors()))) // 日志带上collector数量。
+
+    return cRegistry, deviceWatchListManager, nil // 同时返回登记表、实体管理器和空错误。
+} // buildRegistry函数结束。
 ```
 
-大白话：
+**大白话总结：**
 
 > 先决定采哪些 field、监控哪些实体，再为不同实体建 collector，最后注册到 registry。HTTP server 只是后来把 registry 的结果端出去。
 
 所以看到端口监听，不代表 registry 中一定有你以为的 collector。
 
+**顺手学 Go：** 函数最后的`(..., ..., error)`表示有三个返回值；成功时第三个值是`nil`（没有错误）。`for _, entityCollector := range ...`遍历collector列表，`_`丢掉下标。`%w`把底层error包进新错误，方便上层保留根因。
+
 ### 4.5 hot reload 的 200 空窗
 
 当前 `pkg/cmd/app.go` 对 hot reload 有非常重要的注释：重载时会先清旧 registry，再建新 registry；这段约 2～3 秒的窗口内，`/metrics` 会返回 HTTP 200 但没有 metrics。
+
+触发方式里的`SIGHUP`是Linux给进程的一种信号，很多服务把它约定为“重新加载配置”；GPU bind/unbind则是设备与Driver重新绑定/解绑，可能导致GPU拓扑变化。
+
+下面**从上往下读**，表示一次配置热重载的状态变化；不是五个独立服务互相RPC：
 
 ```text
 配置文件变化或SIGHUP
@@ -461,7 +585,7 @@ func buildRegistry(
 运维含义：
 
 - `up == 1` 只表示 Prometheus 能完成 HTTP scrape；
-- 单次空 payload 可能是受控 hot reload，也可能是真故障；
+- 单次空payload（HTTP响应正文）可能是受控hot reload，也可能是真故障；
 - 应用 absent 告警要有 `for`，并结合 exporter reload 日志；
 - 不要把配置热更新做成每秒抖动；源码有最小 reload 间隔保护，但不等于外部配置系统可以无限改。
 
@@ -471,7 +595,7 @@ func buildRegistry(
 
 ### 5.1 `/metrics`
 
-`/metrics` 是 Prometheus exposition endpoint。它回答的是：
+`/metrics` 是 Prometheus exposition endpoint（指标文本接口）。结合第1节源码，它回答的是：
 
 > exporter 此刻愿意暴露哪些样本？
 
@@ -481,7 +605,9 @@ func buildRegistry(
 
 ### 5.2 exporter `/health`
 
-HTTP `/health` 通常用于 exporter 进程/服务层健康检查。即使它返回成功，也可能发生：
+固定commit的`internal/pkg/server/server.go:342-367`明确把`/health`设计成exporter进程/服务层检查：重载中registry为`nil`时，它仍写`OK - reload in progress`并保持200，另外用`X-Registry-Available: false`响应头告诉监控“采集登记表暂不可用”。这样做是为了避免Kubernetes在正常重载窗口误杀Pod，不是在替GPU签健康证明。
+
+所以即使`/health`返回成功，也可能发生：
 
 - 某个特定 GPU field 缺失；
 - 某块 GPU 从 watch list 消失；
@@ -496,7 +622,7 @@ HTTP `/health` 通常用于 exporter 进程/服务层健康检查。即使它返
 
 DCGM health 是设备/子系统层的健康监控能力，可能覆盖 PCIe、memory、NVLink 等领域。当前 exporter release 还改进了 GPU-wide health incident 的呈现。
 
-但是：
+下面两段都**从上往下读**。第一段表示观测结果怎样到达告警；第二段列的是不会自动发生的动作，不是被省略的RPC调用：
 
 ```text
 DCGM health发现异常
@@ -562,7 +688,7 @@ GPU_UTIL
 FB_USED
 ```
 
-不是“业务真正不可回收的内存泄漏量”，而是 framebuffer memory 使用量。
+不是“业务真正不可回收的内存泄漏量”，而是 framebuffer memory（GPU板载显存）使用量。
 
 ```text
 XID_ERRORS
@@ -586,14 +712,18 @@ container
 
 为什么 UUID 很关键：
 
+UUID是GPU的稳定唯一编号；PCI BDF则是设备当时所在的PCI总线地址。前者更适合跨重启/维修关联，后者更适合和kernel日志、插槽与链路现场对齐。
+
 - `gpu="0"` 只在某个 Node 的当前枚举内有意义；
 - Node 维修、PCIe 枚举变化后 index 可能变化；
-- Xid kernel log 常带 PCI BDF/GPU GUID；
+- Xid kernel log常带PCI BDF/GPU GUID（全局唯一硬件标识）；
 - RMA、换卡、历史趋势都需要稳定硬件身份。
 
 但 UUID 也不能单独当“业务 owner”：还要经 Node/Pod/时间窗口关联。
 
 ### 6.3 label cardinality 是生产成本
+
+cardinality（基数）就是“不同label组合会生成多少条独立series”。GPU数、Pod数、field数和高变化label会相乘，而不是简单相加。
 
 启用所有 Pod labels 可能把下列高变维度带进每条 GPU series：
 
@@ -606,13 +736,13 @@ request-id
 用户提交的任意标签
 ```
 
-如果每个 Pod、每块 GPU、每个 field、每个 label 组合都变成新 series，Prometheus 内存、WAL、远端写入和查询成本会迅速上升。
+如果每个 Pod、每块 GPU、每个 field、每个 label 组合都变成新 series，Prometheus内存、WAL（先写磁盘的时序日志）、remote write（把样本转发到远端存储）和查询成本会迅速上升。TSDB head series就是当前时序数据库内存中活跃的series数量。
 
 GPU Operator `26.3.2+` 提供 `enablePodLabels`、`enablePodUID` 和 `podLabelAllowlistRegex` 一类配置。生产建议：
 
 - 默认只保留稳定 owner/team/workload/service 标签；
 - Pod UID 只在确实需要跨同名 Pod 精确关联时启用；
-- 用 allowlist，而不是事后靠 metric relabel 大量删除；
+- 用allowlist（只允许明确列出的标签），而不是事后靠metric relabel大量删除；
 - 变更前估算 series 数量；
 - 观察 Prometheus TSDB head series 与 remote-write 成本。
 
@@ -660,10 +790,12 @@ Counter 代表累计量，理想情况下只增加，在进程、Node 或设备�
 常见 GPU counter：
 
 - 累计能耗；
-- PCIe replay；
+- PCIe replay（链路校验没通过后发生的重传）；
 - ECC error 累计；
-- NVLink error/replay；
-- thermal/power violation 累计时长。
+- NVLink error/replay（GPU高速互联错误/重传）；
+- thermal/power violation（因温度/功耗限制而降速）累计时长。
+
+下面metric名里的DBE是double-bit ECC error（双比特显存错误，通常不可纠正）；`VOL`表示本次运行周期视图。
 
 常见查询：
 
@@ -704,11 +836,11 @@ DCGM field 可能出现 blank、not supported、not permissioned 或特殊 senti
 1. 当前 exporter/DCGM 版本；
 2. field 是否被该 GPU 型号支持；
 3. exporter 是否正确处理 blank；
-4. raw `/metrics`；
+4. raw `/metrics`（未经Grafana加工的原始指标文本）；
 5. exporter log；
-6. 同时刻 `dcgmi dmon`/`nvidia-smi` 与 driver log。
+6. 同时刻`dcgmi dmon`（DCGM命令行连续打印设备采样）/`nvidia-smi`与driver log。
 
-不要给 Grafana 加一个 `clamp_max` 就宣布修复；那只是在隐藏证据。
+不要给Grafana加一个`clamp_max`（把超过上限的值强行压到上限）就宣布修复；那只是在隐藏证据。
 
 ### 7.5 缺失 series 不等于 0
 
@@ -740,7 +872,11 @@ DCGM FIELD, Prometheus metric type, help message
 
 以 `#` 开头的是注释，不采集。
 
+CSV可以先理解成“逗号分隔的采集清单”：第一列选DCGM field，第二列声明Prometheus类型，第三列生成`# HELP`说明；exporter还会输出`# TYPE`告诉Prometheus这是gauge还是counter。
+
 ### 8.1 当前默认启用的代表性指标
+
+表里几个硬件词先翻一下：SM是GPU执行计算线程的核心单元；HBM是GPU常用的高带宽显存；encoder/decoder是视频编解码单元；NVLink lane是GPU高速互联的一条通道；row remap是GPU发现显存坏行后把地址改映射到备用位置；profiling field用于看GPU内部执行单元活跃度，主要服务性能分析。
 
 | 类别 | metric | type | 运维含义 |
 |---|---|---|---|
@@ -774,6 +910,8 @@ DCGM FIELD, Prometheus metric type, help message
 
 ### 8.2 默认被注释的代表性指标
 
+这里的SBE是单比特可纠正错误，DBE是双比特、通常不可纠正错误；volatile是本次启动/运行周期视图，aggregate是设备累计历史视图；retired page是停止继续使用的显存页；thermal/power violation是因温度或功耗限制而被节流的累计时间；CRC error是链路数据校验发现传输内容不一致。
+
 固定 tag 的默认文件中，下列很多指标行前有 `#`：
 
 - power violation；
@@ -791,7 +929,7 @@ DCGM FIELD, Prometheus metric type, help message
 
 > 你写了告警规则，不代表 exporter 一定产出这条 metric。
 
-上线告警前必须做“metric contract”验证：
+上线告警前必须做“metric contract（指标契约）”验证，也就是把预期的名字、类型、标签、值和缺失行为逐项对上：
 
 ```text
 CSV中非注释
@@ -803,6 +941,8 @@ CSV中非注释
 ```
 
 ### 8.3 当前 exporter 扩展 health fields 怎么读
+
+这一节的P2P是peer-to-peer，指GPU之间直接通信；clock event是功耗、温度等原因触发的时钟限制事件；health枚举是“用固定数字代表不同健康状态”的对照表，数字含义必须以当前版本源码为准。
 
 固定 tag 的默认 CSV 还列出但默认注释了这些 exporter 自己扩展的名字：
 
@@ -835,7 +975,7 @@ DCGM_EXP_P2P_STATUS
 - `DCGM_EXP_GPU_HEALTH_STATUS` 按 GPU 与 `health_watch` 输出当前 health 枚举，并带 `health_error_code`；`DCGM_EXP_P2P_STATUS` 也是状态。状态可以双向变化，都不是单调 counter；
 - exporter 会按 CSV 类型生成 `# TYPE`，所以直接取消注释会把上述实现语义错误地暴露为 `counter`。
 
-生产应复制固定 tag CSV，经过评审后把这四个 field 都声明为 `gauge`，在 canary 上核对 raw `# TYPE`、labels 和窗口/状态行为，再推广。窗口数直接比较或用 `max_over_time()`；**不得**对它用 `rate()`/`increase()`。Health/P2P status 也只能按固定版本的枚举常量和实际 labels 解码，不能自行发明 `0=坏、1=好`，更不能对状态值求速率。
+生产应复制固定tag CSV，经过评审后把这四个field都声明为`gauge`，先在canary（只选少量测试节点试运行）上核对raw `# TYPE`、labels和窗口/状态行为，再推广。窗口数直接比较或用`max_over_time()`；**不得**对它用`rate()`/`increase()`。Health/P2P status也只能按固定版本的枚举常量和实际labels解码，不能自行发明`0=坏、1=好`，更不能对状态值求速率。
 
 即使 health field 准确触发，也只进入“DCGM exporter → Prometheus”链，不会自动改变 NVIDIA Device Plugin 的 `ListAndWatch.Health`。
 
@@ -859,6 +999,8 @@ DCGM_EXP_P2P_STATUS
 
 Exporter 的基本归属链是：
 
+下面两路都**从上往下读**，最后在PodMapper汇合。箭头表示“提供身份数据”，不是DCGM同步调用kubelet：
+
 ```text
 DCGM样本
   -> GPU UUID / device / MIG实体
@@ -866,7 +1008,7 @@ DCGM样本
 kubelet PodResources List
   -> namespace / pod / container / resourceName / deviceIDs
 
-PodMapper按device ID匹配
+PodMapper（设备样本与Pod账本的对照器）按device ID匹配
   -> 给样本追加pod、namespace、container等属性
 ```
 
@@ -923,7 +1065,7 @@ Pod 归属至少涉及：
 数据源C：DCGM当前device samples
 ```
 
-三者没有跨系统事务。可能发生：
+三者没有跨系统事务，也就没有“某一毫秒同时冻结三份数据”的原子快照。下面**从上往下读**，`t0`到`t5`表示时间推进：
 
 ```text
 t0 旧Pod结束
@@ -991,20 +1133,20 @@ allocatable device ID集合
 
 ### 9.6 Pod metadata 与 RBAC
 
-仅用 Node 本地 PodResources 得到 Pod 名/namespace/container/device ID，不代表能得到任意 Pod labels。当前 Operator `26.3.2+` 在开启 Pod labels 或 UID 时，会创建 cluster-scoped RBAC，让 exporter ServiceAccount 能跨集群 get/list/watch Pods，并设置相应环境变量。
+仅用 Node 本地 PodResources 得到 Pod 名/namespace/container/device ID，不代表能得到任意 Pod labels。RBAC是Kubernetes API权限控制；当前 Operator `26.3.2+` 在开启 Pod labels 或 UID 时，会创建cluster-scoped（集群范围）RBAC，让exporter ServiceAccount能跨集群get/list/watch Pods，并设置相应环境变量。
 
 风险边界：
 
-- exporter compromise 后可读取 Pod metadata；
+- exporter compromise（进程或容器被攻击者控制）后可读取Pod metadata；
 - 所有 Pod labels 可能含有内部租户、模型、版本和 owner 信息；
 - label 进入 `/metrics` 后又会复制到 Prometheus、远端存储和 Grafana；
 - RBAC 撤销后旧 series 仍可能在 retention 窗口内存在。
 
-所以要用 `podLabelAllowlistRegex` 限制标签，并把 Prometheus 数据面纳入安全审计。
+所以要用`podLabelAllowlistRegex`做allowlist（只允许明确列出的Pod标签进入指标），并把Prometheus数据面纳入安全审计。
 
 ### 9.7 DRA 版本陷阱
 
-固定 exporter 有 `--kubernetes-enable-dra` 与 ResourceSlice 映射代码；但 GPU Operator `26.3.2` release notes 明确指出：上游 DCGM Exporter Helm chart 暴露的 DRA `resourceSlices` enrichment，在该 Operator release 中还不能通过 Operator 配置支持。
+固定 exporter 有 `--kubernetes-enable-dra` 与 ResourceSlice（DRA发布可用设备清单的对象）映射代码；但 GPU Operator `26.3.2` release notes 明确指出：上游 DCGM Exporter Helm chart 暴露的 DRA `resourceSlices` enrichment（把DRA归属信息补进metric），在该 Operator release 中还不能通过 Operator 配置支持。
 
 因此必须分开说：
 
@@ -1064,7 +1206,7 @@ internal/pkg/transformation/kubernetes.go
 internal/pkg/nvmlprovider/provider.go
 ```
 
-主线是：
+这里的PID是宿主机进程编号，cgroup是Linux给进程分组并限制/统计资源的机制。下面条件中的`privileged=true`表示容器取得接近宿主机root的高权限。主线**从上往下读**；箭头表示一步步补充身份，不是一串网络RPC：
 
 ```text
 NVML查询GPU上的compute processes
@@ -1085,7 +1227,7 @@ securityContext.privileged=true
 GPU ID type与云平台/Device Plugin格式匹配
 ```
 
-这里的 `hostPID=true` 与 `privileged=true` 是该上游 per-process 功能给出的 Pod 前提，不是通用 exporter 默认值。生产绝不能为了“面板更细”未经评审就开启它们；如果平台以更小 capabilities、只读 hostPath 或其他硬化方案替代，也必须用目标镜像、cgroup 版本和 GPU 模式实测等效能力，不能把“Pod 能启动”当成映射完整。第 16、17 课的 device ID 语义、第 18 课的 Operator 配置与本课安全边界要一起评审。
+这里的`hostPID=true`表示容器能看到宿主机进程编号。它与`privileged=true`是该上游per-process功能给出的Pod前提，不是通用exporter默认值。生产绝不能为了“面板更细”未经评审就开启；如果平台以更小capabilities（拆细后的Linux特权）、只读hostPath（只读挂载宿主机目录）或其他硬化方案替代，也必须用目标镜像、cgroup版本和GPU模式实测等效能力，不能把“Pod能启动”当成映射完整。第16、17课的device ID语义、第18课的Operator配置与本课安全边界要一起评审。
 
 ### 10.4 整卡 time-slicing 能看到什么
 
@@ -1117,6 +1259,8 @@ DCGM_FI_DEV_GPU_UTIL{pod!=""}
 
 MIG 下要先分清：
 
+GPU Instance（GI）是一块父GPU切出的硬件资源片；Compute Instance（CI）是在GI内部进一步切出的计算执行单元。
+
 ```text
 父物理GPU
   -> GPU Instance
@@ -1144,7 +1288,7 @@ per-process 样本可带 `vgpu` 等 label，用于区分共享份额。但它不
 - 性能无抖动；
 - GPU fault domain 被拆开。
 
-time-slicing 仍共享物理故障域。第 21 课会把共享、MIG、多租户和成本模型单独展开。
+time-slicing仍共享物理故障域；故障域就是“一次硬件故障会一起影响哪些任务”的范围。第21课会把共享、MIG、多租户和成本模型单独展开。
 
 ### 10.7 防止重复统计的三条规则
 
@@ -1158,15 +1302,19 @@ time-slicing 仍共享物理故障域。第 21 课会把共享、MIG、多租户
 
 ### 11.1 利用率与活跃度
 
+先翻几个性能词：FLOPS是每秒浮点运算能力；Tensor Core是GPU里专门加速矩阵计算的单元；DRAM/HBM active描述显存接口有多忙，不是显存用了多少容量。
+
 | 指标 | 回答 | 不回答 |
 |---|---|---|
 | `DCGM_FI_DEV_GPU_UTIL` | 采样窗口内 GPU busy 比例 | 模型 FLOPS 效率、吞吐、Tensor Core 占用 |
-| `DCGM_FI_DEV_MEM_COPY_UTIL` | 采样期内 device/global memory 正在被读写的时间占比 | copy engine 精确占用、HBM 带宽是否饱和 |
+| `DCGM_FI_DEV_MEM_COPY_UTIL` | 采样期内 device/global memory 正在被读写的时间占比 | copy engine（GPU专门搬运数据的引擎）精确占用、HBM带宽是否饱和 |
 | `DCGM_FI_PROF_GR_ENGINE_ACTIVE` | graphics/compute engine active ratio | 每个 Pod 的有效业务贡献 |
 | `DCGM_FI_PROF_PIPE_TENSOR_ACTIVE` | tensor pipe active ratio | 模型质量或端到端性能 |
 | `DCGM_FI_PROF_DRAM_ACTIVE` | memory interface active ratio | 当前显存使用容量 |
 
 判断瓶颈至少要组合：
+
+应用侧的TTFT是“从收到请求到吐出第一个token的时间”，ITL是“后续token之间的间隔”，KV cache是大模型推理为复用注意力中间结果占用的显存，QPS是每秒处理多少请求。
 
 ```text
 GPU_UTIL
@@ -1207,6 +1355,8 @@ Pod OOM/CUDA OOM
 
 ### 11.3 温度、功耗、时钟
 
+P-state是GPU当前的功耗/性能档位；throttling是GPU因为温度、功耗等限制主动降速。它们都可能让时钟下降，但“降频”本身还不能直接等于硬件坏。
+
 | 证据 | 解释 |
 |---|---|
 | GPU temp 高 | 当前热状态，需要和型号阈值/环境温度比 |
@@ -1226,12 +1376,14 @@ Pod OOM/CUDA OOM
 
 ### 11.4 PCIe 与 NVLink
 
+PCIe是GPU连接CPU/主板的总线，NVLink是GPU之间或GPU到交换芯片的高速互联。CRC/replay/recovery分别可先理解成“校验发现传输错、重传、链路恢复”；AER是PCIe的高级错误报告；SXid是NVSwitch侧错误编号；NCCL是多GPU通信库，collective timeout表示一次多卡集体通信超时。
+
 PCIe replay、NVLink CRC/replay/recovery error 的增量提示链路质量或传输问题，但要结合：
 
-- 是否刚重启/重新训练 link；
+- 是否刚重启/重新训练link（让物理链路重新协商连接参数）；
 - 同机其他 GPU/同一 switch 是否同时异常；
 - `nvidia-smi topo -m`；
-- Fabric Manager/NVSwitch 日志；
+- Fabric Manager（管理NVSwitch互联网络的NVIDIA服务）/NVSwitch日志；
 - Xid/SXid；
 - NCCL 错误与 collective timeout；
 - 物理连接和主板/插槽维护史。
@@ -1251,13 +1403,16 @@ aggregate：设备累计/持久视图
 
 再看：
 
+- recovery action是NVIDIA针对某类错误给出的建议恢复动作等级；
 - retired pages；
 - pending retirement；
 - correctable/uncorrectable remapped rows；
 - row remap failure；
 - Xid 48、63、64 等上下文；
-- NVIDIA recovery action；
+- 对照NVIDIA recovery action；
 - 重启/reset 后状态。
+
+retired page是被停止继续使用的显存页；row remap是把出错显存行的地址映射到备用行。
 
 原则：
 
@@ -1274,14 +1429,14 @@ aggregate：设备累计/持久视图
 Xid 是 driver 报到 kernel log 的 GPU error report。它可能指向：
 
 - 应用非法访问；
-- driver/firmware；
+- driver/firmware（运行在GPU设备内部的底层控制程序）；
 - framebuffer/ECC；
 - PCIe “fallen off bus”；
 - NVLink；
-- GSP timeout；
+- GSP（GPU内部运行管理固件的处理器）timeout；
 - 硬件问题。
 
-Xid 编号用于分类和下一步，不是完整 root cause。
+Xid编号用于分类和选择下一步，不是完整root cause（根因）。
 
 ---
 
@@ -1348,11 +1503,13 @@ max_over_time(DCGM_FI_DEV_XID_ERRORS[5m]) > 0
 但这不是“窗口内新事件”检测：last-Xid 可能长期保留，窗口不断滑动仍会一直为真。生产事件告警优先使用按 8.3 节修成 gauge 的 `DCGM_EXP_XID_ERRORS_COUNT`，并组合：
 
 - exporter Xid/health metric；
-- kernel log pipeline；
-- Alert annotation 中的 GPU UUID/Node；
+- kernel log pipeline（把内核日志收集到日志平台的链路）；
+- Alert annotation（告警附加说明）中的GPU UUID/Node；
 - 官方 Xid catalog/recovery action。
 
 ### 12.5 `absent()` 是采集完整性告警，不是 GPU 利用率告警
+
+这里的fresh就是“最近仍有新样本”，不是历史上曾经出现过。
 
 例如期望每个 GPU Node 都有温度 series，可以设计：
 
@@ -1372,7 +1529,7 @@ unless on (cluster, node)
 gpu_node_with_fresh_dcgm_series
 ```
 
-这里的 `gpu_node_expected` 可以来自 kube-state-metrics/NFD label 录制规则。它回答“监控覆盖缺失”，不是“温度为 0”。
+这里的 `gpu_node_expected` 可以来自kube-state-metrics/NFD（Node Feature Discovery，给Node标记硬件特征）label录制规则。它回答“监控覆盖缺失”，不是“温度为0”。
 
 ### 12.6 谨慎使用 `or vector(0)`
 
@@ -1402,7 +1559,7 @@ Prometheus会多次读到同一批采样值
 - exporter collection interval；
 - ServiceMonitor interval；
 - scrape timeout；
-- 规则 evaluation interval；
+- 规则evaluation interval（多久重新计算一次告警表达式）；
 - 业务异常持续时间；
 - profiling 开销；
 - Prometheus series 数量。
@@ -1423,14 +1580,14 @@ Prometheus会多次读到同一批采样值
 exporter Pod是否Ready/重启
 Prometheus target是否UP
 scrape duration是否接近timeout
-目标GPU Node是否有fresh device series
+目标GPU Node是否有fresh device series（最近仍在更新的设备时间序列）
 每个预期GPU UUID是否仍有基础metric
 PodResources socket/PodMapper是否报错
 CSV hot reload是否频繁
-Prometheus是否因cardinality或remote-write积压
+Prometheus是否因cardinality或remote-write（向远端存储转发样本）积压
 ```
 
-示例规则片段，job label 要按现场修改：
+示例规则片段里的job label是Prometheus给一组抓取目标起的名字，必须按现场修改：
 
 ```yaml
 groups:
@@ -1453,7 +1610,7 @@ groups:
 - 容忍受控滚动更新；
 - 但不能长到让严重设备事故完全失明。
 
-具体时长要和 scrape interval、Pod rollout、SLO 对齐。
+具体时长要和scrape interval、Pod rollout（Pod滚动替换所需时间）、SLO对齐。
 
 这条 `up == 0` 只覆盖“Prometheus 仍发现该 target、但 scrape 失败”。如果 ServiceMonitor/relabel/Pod 消失导致 target 本身不再被发现，`up` series 也会消失；必须另配 12.5 节的“预期 GPU Node 集合 `unless` fresh DCGM series”覆盖该盲区。
 
@@ -1480,7 +1637,7 @@ groups:
 
 `DCGM_EXP_XID_ERRORS_COUNT` 是 `--xid-count-window-size` 窗口内计数，会随事件移出窗口而回落；上式读当前窗口状态，不对它做 `rate()`/`increase()`。`max by (cluster, Hostname, UUID)` 先消除 time-slicing/per-process 可能产生的 Pod/vGPU 副本，一块物理 GPU 不因归属副本产生多条同类告警。具体 Xid、原始顺序和事件时间仍以 kernel log 为事实源。
 
-默认的 `DCGM_FI_DEV_XID_ERRORS` 是 last-Xid gauge，可能长期保留非零值。`max_over_time(DCGM_FI_DEV_XID_ERRORS[5m]) > 0` 只能表示“窗口里看到了非零 sticky state”，**不能**证明最近 5 分钟新发生了 Xid；用它做告警必须另有事件去重/日志游标，否则会持续或重复 firing。
+默认的`DCGM_FI_DEV_XID_ERRORS`是last-Xid gauge，可能长期保留非零值。`max_over_time(DCGM_FI_DEV_XID_ERRORS[5m]) > 0`只能表示“窗口里看到了会黏住一段时间的非零状态”，**不能**证明最近5分钟新发生了Xid；用它做告警必须另有事件去重和日志游标（记录日志已经处理到哪里），否则告警会持续处于firing（正在触发）状态或反复通知。
 
 示例：新 DBE 增量。该 field 默认可能未启用。
 
@@ -1499,7 +1656,7 @@ groups:
           description: "Preserve UUID, node, kernel log and row-remap evidence; follow the approved drain and diagnostics runbook."
 ```
 
-示例：温度高且 thermal violation 在增加。阈值 `85` 只是某企业对特定 SKU 的演示值，不能当 NVIDIA 全型号通用值。
+示例：温度高且 thermal violation 在增加。阈值 `85` 只是某企业对特定SKU（具体产品型号）的演示值，不能当NVIDIA全型号通用值。
 
 ```yaml
       - alert: NVIDIAGPUThermalPressure
@@ -1531,7 +1688,7 @@ groups:
 - vLLM TTFT/ITL、queue、KV cache；
 - 训练 step time、checkpoint、NCCL collective timeout；
 - GPU utilization/SM/Tensor/DRAM active；
-- 应用 QPS/token throughput；
+- 应用QPS/token throughput（每秒处理的请求数/生成的token数）；
 - Pod restart、OOM、CUDA error；
 - Node/GPU UUID 维度的异常聚集。
 
@@ -1542,7 +1699,7 @@ groups:
   -> GPU_UTIL低是正常
 
 在线请求堆积 + GPU_UTIL低 + CPU满
-  -> 可能CPU/tokenization瓶颈
+  -> 可能CPU/tokenization（把文本切成模型token的预处理）瓶颈
 
 在线请求堆积 + GPU_UTIL高 + TTFT高
   -> 可能算力/批处理/显存压力
@@ -1604,6 +1761,8 @@ dmesg
 
 典型格式包含：
 
+`NVRM`是NVIDIA Driver内核日志常见前缀；PCI BDF定位GPU当时所在总线位置；GUID/UUID在这里都是用于稳定识别具体GPU的唯一标识。
+
 ```text
 NVRM: GPU at 0000:03:00: GPU-...
 NVRM: Xid (PCI:0000:03:00): 79, ...
@@ -1650,7 +1809,9 @@ metric触发发现
 
 下表是“先去哪一类证据”，不是自动维修脚本：
 
-先确认你读的是**目标 GPU 架构与现场 driver/DCGM 对应的目录**。当前官方 Xid Catalog 主表面向 Ampere 及更新架构；Volta 及更早架构要进入该页面链接的旧版目录，不能把新架构动作机械套用。目录还把动作分为 `Immediate Action` 与 `Investigatory Action` 两个 resolution bucket：前者用于先恢复/止损，后者用于后续根因调查；两者都不是 Alertmanager 可直接执行的命令，也不是单凭一个 Xid 自动 RMA 的依据。
+表中FIFO是GPU提交任务的队列，MMU负责虚拟地址到物理内存的转换，GSP是GPU内部运行部分管理固件的处理器；firmware就是运行在设备上的固件。contained/uncontained表示错误影响是否被限制在局部；Immediate Action是先恢复/止损，Investigatory Action是后续调查。`RESTART_BM`表示重启裸金属机器，不是重启Pod。
+
+先确认你读的是**目标GPU架构与现场driver/DCGM对应的目录**。Ampere、Volta都是NVIDIA GPU架构代际名称；当前官方Xid Catalog主表面向Ampere及更新架构，Volta及更早架构要进入页面链接的旧版目录，不能把新架构动作机械套用。目录还把动作分为`Immediate Action`与`Investigatory Action`两个resolution bucket（处置分类）：前者用于先恢复/止损，后者用于后续根因调查；两者都不是Alertmanager可直接执行的命令，也不是单凭一个Xid自动RMA的依据。
 
 | Xid | 常见方向 | 初始动作 |
 |---:|---|---|
@@ -1688,7 +1849,7 @@ GPU Debug Guidelines 对常见 DBE 场景给出更具体的恢复路线：如果
 注意：
 
 - “等待工作完成”不等于强杀不可恢复训练；
-- GPU reset 受型号、NVLink/NVSwitch、MIG、peer 使用和 driver 状态限制；
+- GPU reset受型号、NVLink/NVSwitch、MIG、peer（与目标GPU直接互联或共同工作的其他GPU）使用和driver状态限制；
 - 运行 reset 前仍需要审批；
 - reset 后必须重新验证 ECC、row remap、CUDA 和业务；
 - 复发才进一步按支持流程判断硬件/firmware/环境。
@@ -1707,14 +1868,14 @@ GPU Debug Guidelines 对常见 DBE 场景给出更具体的恢复路线：如果
 更合理：
 
 ```text
-保留kernel/AER/driver证据
+保留kernel/AER（PCIe高级错误报告）/driver证据
   -> 经审批标记Node不再接新业务
   -> 确认影响GPU与Pod
   -> 经审批安全排空
   -> 检查供电/PCIe/机械连接/维护史
   -> 按目标架构目录执行Immediate Action
      （当前Ampere+目录Xid 79为RESTART_BM）
-  -> dcgmi diag/CUDA smoke复验
+  -> dcgmi diag/CUDA smoke（最小功能冒烟测试）复验
   -> 按Investigatory Action观察复发/联系支持
 ```
 
@@ -1769,7 +1930,7 @@ GPU_TEMP升高
 如果整台 Node 同时热：
 
 - 查机房 inlet 温度；
-- 查风扇策略/BMC；
+- 查风扇策略/BMC（服务器带外管理控制器）；
 - 查机箱门、挡风板；
 - 查同机 CPU/NVSwitch 温度；
 - 查是否刚统一提高 power limit。
@@ -1840,6 +2001,8 @@ NCCL communicator错误
 
 ### 16.1 两条独立链
 
+下面两条都**从上往下读**。箭头表示各自内部的状态上报/采集方向；两条链异步工作，彼此之间没有一条“DCGM告警后自动改Device Plugin Health”的标准箭头。
+
 Device Plugin 链：
 
 ```text
@@ -1894,21 +2057,25 @@ Prometheus某规则firing
 Node/GPU稳定身份
 工作负载类型与checkpoint感知
 变更审批
-幂等状态机
+幂等状态机（重复执行不会不断产生额外副作用，而且每一步状态明确）
 超时/失败回滚
 审计记录
 恢复验证
 ```
 
-这更像一个专门 GPU remediation controller，不是一段 Alertmanager webhook shell。
+这更像一个专门的GPU remediation controller（按状态、审批、重试和审计执行修复的控制器），不是一段Alertmanager webhook shell（收到告警就运行几条命令的脚本）。
 
 ---
 
 ## 17. 安全止损 Runbook：先只读，后变更
 
+第17节按A→E顺序读：先保存会消失的证据，再控制影响范围，然后才允许排空、诊断和恢复。阶段标题表示状态推进顺序，不表示每起事故都能跳过审批自动执行。
+
 ### 17.1 阶段 A：只读取证
 
 目标：不改变 Node/GPU 状态，保存事故现场。
+
+先固定一组不会轻易串台的身份键：`cluster/context + Node name/UID + GPU UUID/PCI BDF + exporter Pod UID + 业务Pod UID + 时间窗`。不要只用`gpu="0"`、Pod名字或一张Grafana截图跨系统关联；Node/Pod可能重建，GPU index也可能重新编号。
 
 ```text
 1. 记录告警开始/结束时间
@@ -1943,7 +2110,7 @@ GPU workload 可能有：
 
 - 长训练 checkpoint；
 - local NVMe dataset/cache；
-- PDB；
+- PDB（限制同一时间可中断多少Pod副本）；
 - StatefulSet；
 - 手工创建 Pod；
 - daemon/静态 Pod；
@@ -2078,7 +2245,7 @@ NVSwitch/CPU entity fields
 `DCGM_FI_PROF_*` 能帮助理解 SM、Tensor、DRAM、PCIe 等活跃度，但要注意：
 
 - GPU 代际与产品支持不同；
-- 某些 profiling group 不能同时 watch，DCGM 会 multiplex；
+- 某些profiling group不能同时watch，DCGM会multiplex（在多组指标之间轮流采样）；
 - 同时启用过多 profiling fields 会影响有效采样频率；
 - Ampere 及更早代际的 profiling package/driver 依赖需核对；
 - MIG 实体与父卡支持不同；
@@ -2096,7 +2263,7 @@ NVIDIA quickstart 容器示例常见 `--cap-add SYS_ADMIN`。当前独立 chart 
 - driver/device mounts；
 - per-process/hostPID 路径；
 - GPU Operator 生成的 securityContext；
-- OpenShift SCC/SELinux/AppArmor/seccomp。
+- OpenShift SCC（容器安全约束）、SELinux/AppArmor（Linux强制访问控制）与seccomp（系统调用过滤）。
 
 不能推理：
 
@@ -2112,7 +2279,7 @@ exporter能启动
   -> 已经具有所有profiling/diag权限
 ```
 
-安全评审要做最小权限 canary：逐项去 capability、去 privileged、设 read-only rootfs、non-root，验证目标 field 和升级路径，而不是一次性授予宿主机级权限。
+安全评审要做最小权限canary：逐项去capability、去privileged、设read-only rootfs（容器根文件系统只读）、non-root（不用root用户运行），验证目标field和升级路径，而不是一次性授予宿主机级权限。
 
 ### 18.6 配置变更流程
 
@@ -2143,7 +2310,7 @@ exporter能启动
 --address=:9400
 ```
 
-这通常表示进程在 Pod 网络接口上监听 9400，不是只绑定 loopback。
+这通常表示进程在Pod网络接口上监听9400，不是只绑定loopback（只有本机能访问的回环地址）。
 
 是否暴露到哪里，由这些层叠加决定：
 
@@ -2151,7 +2318,7 @@ exporter能启动
 Pod listen address
   -> containerPort
   -> Service type/selector
-  -> NetworkPolicy/CNI
+  -> NetworkPolicy/CNI（实现Pod网络的插件）
   -> Ingress/Gateway/LoadBalancer
   -> Node firewall/security group
   -> Prometheus所在网络
@@ -2188,7 +2355,7 @@ GPU Operator 正常只需让授权 Prometheus 抓取，不应把它做成公网 
 
 - TLS 保护传输，不代替网络访问控制；
 - basic auth 密码不能明文放 ConfigMap/Git；
-- Prometheus 的 scrape config/ServiceMonitor 要同步 CA、证书或认证 secret；
+- Prometheus 的 scrape config/ServiceMonitor 要同步CA（签发/校验证书的信任机构）、证书或认证secret；
 - 证书轮换要验证 exporter-toolkit 是否热加载以及 Operator 如何 rollout；
 - 不要在 troubleshooting 时长期 `insecureSkipVerify`；
 - basic auth 不提供细粒度 metric 授权，授权后通常能看整个 endpoint。
@@ -2229,12 +2396,12 @@ spec:
 - CNI 是否实施 NetworkPolicy；
 - hostNetwork 模式下策略行为；
 - ServiceMonitor 是否跨 namespace；
-- HA Prometheus 的所有来源 Pod；
+- HA（高可用、多副本）Prometheus 的所有来源 Pod；
 - debug/运维访问通道。
 
 ### 19.5 pprof 必须保持显式、临时、受控
 
-`4.5.3-4.8.2` 将 `/debug/pprof` 设为 opt-in：
+`4.5.3-4.8.2`将`/debug/pprof`设为opt-in（默认不开，必须主动开启）：
 
 ```text
 --enable-pprof
@@ -2243,11 +2410,11 @@ DCGM_EXPORTER_ENABLE_PPROF=true
 
 pprof 可能暴露：
 
-- goroutine stack；
+- goroutine stack（并发任务一路调用了哪些函数）；
 - 内存对象；
 - 内部路径/参数；
 - 运行状态；
-- CPU profile 导致的额外开销。
+- CPU profile（采样程序把CPU时间花在哪里的记录）导致的额外开销。
 
 生产排障流程：
 
@@ -2291,7 +2458,7 @@ GPU Operator 在开启 Pod labels/UID 时扩大 exporter 对 Pods 的 list/watch
 
 ### 20.1 案例 A：推理 P99 升高，GPU utilization 只有 20%
 
-#### 现场
+#### 案例A现场
 
 ```text
 vLLM P99升高
@@ -2326,7 +2493,7 @@ GPU utilization 是症状维度，不是扩容公式。第 20 课会把 vLLM 指
 
 ### 20.2 案例 B：Xid 79，但 Device Plugin 仍是 Healthy
 
-#### 现场
+#### 案例B现场
 
 ```text
 kernel log: Xid 79
@@ -2369,7 +2536,7 @@ diag与CUDA smoke
 
 ### 20.3 案例 C：Grafana 显示所有 GPU ECC 都是 0
 
-#### 现场
+#### 案例C现场
 
 ```text
 面板绿色
@@ -2394,7 +2561,7 @@ raw /metrics没有ECC series
 
 ---
 
-## 21. 只读实验一：固定 context、namespace、Node 做证据盘点
+## 21. 【生产只读取证】固定context、namespace、Node做证据盘点
 
 这段 PowerShell 只读 Kubernetes 对象，不执行 label、cordon、drain、exec、diag、reset。三个定位参数必须由调用者显式传入；默认只输出去敏摘要，只有显式传 `-IncludeLogs` 才读取日志。Pod 名、UID、Node、namespace 和日志都属于基础设施敏感信息，输出必须进入 incident 批准的受控位置。
 
@@ -2460,6 +2627,10 @@ $nodeObject = $nodeJson | ConvertFrom-Json
 if ($nodeObject.metadata.name -ne $Node) {
     throw 'Returned node does not match the requested node'
 }
+$nodeUid = [string]$nodeObject.metadata.uid
+if ([string]::IsNullOrWhiteSpace($nodeUid)) {
+    throw 'Exact node has no UID; refusing to continue with name-only identity'
+}
 
 Write-Host '=== Exact node GPU capacity and allocatable ==='
 & kubectl --context $Context get node $Node `
@@ -2517,6 +2688,7 @@ Write-Host '=== Redacted exporter identity and configuration summary ==='
     Context = $Context
     Namespace = $Namespace
     Node = $Node
+    NodeUid = $nodeUid
     ExporterPod = $exporterPod
     ExporterPodUid = $exporterPodUid
     Container = $containerName
@@ -2548,6 +2720,15 @@ if ($IncludeLogs) {
     if ($LASTEXITCODE -ne 0) {
         throw 'Failed to read exporter logs'
     }
+}
+
+$currentNodeJson = & kubectl --context $Context get node $Node -o json
+if ($LASTEXITCODE -ne 0) {
+    throw 'Failed to re-read exact node before final inventory'
+}
+$currentNodeObject = $currentNodeJson | ConvertFrom-Json
+if ([string]$currentNodeObject.metadata.uid -ne $nodeUid) {
+    throw 'Node identity changed; refusing to mix evidence from a reused name'
 }
 
 $allPodsJson = & kubectl --context $Context get pods --all-namespaces `
@@ -2585,7 +2766,7 @@ DaemonSet 正常情况下每个匹配 Node 一个 exporter。找到 0 个：
 
 ---
 
-## 22. 只读实验二：经 Kubernetes API 读取准确 exporter Pod 的 `/metrics`
+## 22. 【生产只读取证】经Kubernetes API读取准确exporter Pod的`/metrics`
 
 这段脚本不创建 port-forward，不暴露新端口；它通过 apiserver Pod proxy 读取已确定 Pod 的 9400 endpoint。需要相应 `pods/proxy` 权限，企业 RBAC 可能禁止。脚本在代理前复核 Pod UID/Node，避免 Pod 名复用；raw metrics 只在内存中解析，默认只输出 metric 名、TYPE 是否存在、样本数和 label **键名**，不打印 UUID/hostname/Pod 等 label 值。
 
@@ -2628,6 +2809,10 @@ $nodeObject = $nodeJson | ConvertFrom-Json
 if ([string]$nodeObject.metadata.name -ne $Node) {
     throw 'Returned node does not match the requested node'
 }
+$nodeUid = [string]$nodeObject.metadata.uid
+if ([string]::IsNullOrWhiteSpace($nodeUid)) {
+    throw 'Exact node has no UID; refusing to continue with name-only identity'
+}
 
 $podsJson = & kubectl --context $Context -n $Namespace get pods `
     --field-selector "spec.nodeName=$Node" -o json
@@ -2652,6 +2837,15 @@ if ([string]$podObject.spec.nodeName -ne $Node) {
     throw 'Selected exporter pod is not on the requested node'
 }
 
+$currentNodeJson = & kubectl --context $Context get node $Node -o json
+if ($LASTEXITCODE -ne 0) {
+    throw 'Failed to re-read exact node before proxy request'
+}
+$currentNodeObject = $currentNodeJson | ConvertFrom-Json
+if ([string]$currentNodeObject.metadata.uid -ne $nodeUid) {
+    throw 'Node identity changed; refusing to proxy by a reused name'
+}
+
 $currentJson = & kubectl --context $Context -n $Namespace get pod $pod -o json
 if ($LASTEXITCODE -ne 0) {
     throw 'Failed to re-read exporter pod before proxy request'
@@ -2670,6 +2864,15 @@ if ($LASTEXITCODE -ne 0) {
 }
 $metricsText = @($metrics) -join "`n"
 $metricLines = @($metricsText -split "`n")
+
+[pscustomobject]@{
+    Context = $Context
+    Namespace = $Namespace
+    Node = $Node
+    NodeUid = $nodeUid
+    ExporterPod = $pod
+    ExporterPodUid = $podUid
+} | Format-List
 
 $requiredNames = @(
     'DCGM_FI_DEV_GPU_TEMP',
@@ -2721,7 +2924,7 @@ if (-not $sampleSeen) { $value = 0 }
 
 ---
 
-## 23. 只读实验三：验证 Pod 归属，不把空 label 当正常
+## 23. 【生产只读取证】验证Pod归属，不把空label当正常
 
 raw series 仍只在内存中分类；脚本输出身份与计数，不打印含 Pod/UUID/hostname label 值的样本。身份摘要本身也是基础设施敏感信息，按 incident 证据管理。
 
@@ -2748,9 +2951,17 @@ if ($values | Where-Object { [string]::IsNullOrWhiteSpace($_) -or $_ -match 'CHA
     throw 'Context, namespace and node must be fixed non-placeholder values'
 }
 
-$nodeName = & kubectl --context $Context get node $Node -o jsonpath='{.metadata.name}'
-if ($LASTEXITCODE -ne 0 -or $nodeName -ne $Node) {
+$nodeJson = & kubectl --context $Context get node $Node -o json
+if ($LASTEXITCODE -ne 0) {
     throw "Exact node validation failed: $Node"
+}
+$nodeObject = $nodeJson | ConvertFrom-Json
+if ([string]$nodeObject.metadata.name -ne $Node) {
+    throw 'Returned node does not match the requested node'
+}
+$nodeUid = [string]$nodeObject.metadata.uid
+if ([string]::IsNullOrWhiteSpace($nodeUid)) {
+    throw 'Exact node has no UID; refusing to continue with name-only identity'
 }
 
 $podsJson = & kubectl --context $Context -n $Namespace get pods `
@@ -2773,6 +2984,15 @@ $pod = [string]$podObject.metadata.name
 $podUid = [string]$podObject.metadata.uid
 if ([string]$podObject.spec.nodeName -ne $Node) {
     throw 'Selected exporter pod is not on the requested node'
+}
+
+$currentNodeJson = & kubectl --context $Context get node $Node -o json
+if ($LASTEXITCODE -ne 0) {
+    throw 'Failed to re-read exact node before proxy request'
+}
+$currentNodeObject = $currentNodeJson | ConvertFrom-Json
+if ([string]$currentNodeObject.metadata.uid -ne $nodeUid) {
+    throw 'Node identity changed; refusing to proxy by a reused name'
 }
 
 $currentJson = & kubectl --context $Context -n $Namespace get pod $pod -o json
@@ -2807,6 +3027,7 @@ $withoutNonEmptyPodLabelSeries = @($metricsText -split "`n" | Where-Object {
     Context = $Context
     Namespace = $Namespace
     Node = $Node
+    NodeUid = $nodeUid
     ExporterPod = $pod
     ExporterPodUid = $podUid
     PodAttributedSeries = $podSeries.Count
@@ -2825,18 +3046,18 @@ $withoutNonEmptyPodLabelSeries = @($metricsText -split "`n" | Where-Object {
 
 ---
 
-## 24. 主动实验：`dcgmi diag` 必须经过审批
+## 24. 【维护窗口主动操作】`dcgmi diag`必须经过审批
 
 ### 24.1 DCGM diagnostics 等级
 
-当前 DCGM 文档按 Hopper 系统给出的基准如下；这些是文档中的上界参考，不是所有 SKU、插件和现场配置的 SLA：
+当前DCGM文档按Hopper（NVIDIA GPU架构代际）系统给出的基准如下；这些是文档中的上界参考，不是所有SKU、插件和现场配置的SLA（服务等级承诺）：
 
 | level | 官方定位与基准时长 | 代表性内容 |
 |---|---|---|
-| r1 Short | `< 2.5s`；readiness | `software` |
-| r2 Medium | 4 GPU `< 2.5m`，8 GPU `< 10.5m`；failure epilogue | r1 + PCIe/NVLink、GPU memory、memory bandwidth |
-| r3 Long | 4 GPU `< 10m`，8 GPU `< 35m`；管理员 post-mortem | r2 + diagnostic、targeted stress/power、nvbandwidth、NCCL tests |
-| r4 Extra Long | 4 GPU `< 45m`，8 GPU `< 2.25h`；管理员 post-mortem | r3 + memtest、pulse |
+| r1 Short | `< 2.5s`；readiness（能否开始工作） | software（软件环境检查） |
+| r2 Medium | 4 GPU `< 2.5m`，8 GPU `< 10.5m`；failure epilogue（失败后追加检查） | r1 + PCIe/NVLink、GPU memory、memory bandwidth |
+| r3 Long | 4 GPU `< 10m`，8 GPU `< 35m`；管理员post-mortem（事后诊断） | r2 + diagnostic、targeted stress/power（定向压力/功耗测试）、nvbandwidth（NVIDIA带宽测试）、NCCL tests |
+| r4 Extra Long | 4 GPU `< 45m`，8 GPU `< 2.25h`；管理员post-mortem | r3 + memtest（显存测试）、pulse（让GPU功耗/电流快速变化，用来暴露供电不稳定） |
 
 高编号原则上包含低编号测试，但插件可能因 SKU、依赖、配置或支持状态被禁用/跳过；不能仅凭“r3 PASS”推断表中每个插件都实际运行。`--run` 也接受具名测试，`--parameters test_name.variable_name=value` 会改变测试行为；任何自定义都要把完整命令和结果中的实际 test 清单固化到变更记录。
 
@@ -2914,10 +3135,10 @@ dcgmi diag --run 3 --entity-id 0 --json
 源码常见：
 
 ```go
-config, err := contextToConfig(c)
+config, err := contextToConfig(c) // 调用函数；把正常结果放进config，把错误放进err。
 ```
 
-等价大白话：
+**大白话总结：** 一行代码同时接住“正常配置”和“失败原因”，不用先手写变量类型。
 
 ```text
 调用contextToConfig
@@ -2931,19 +3152,21 @@ Go 经常用多返回值把结果和错误一起返回。
 ### 25.2 `if err != nil`
 
 ```go
-hostName, err := hostname.GetHostname(config)
-if err != nil {
-    return nil, nil, fmt.Errorf("failed to get hostname: %w", err)
-}
+hostName, err := hostname.GetHostname(config) // 尝试取得主机名，同时接住可能返回的错误。
+if err != nil { // nil表示“没有错误”；不是nil就说明上一步失败了。
+    return nil, nil, fmt.Errorf("failed to get hostname: %w", err) // 停止当前函数，把两个空结果和包装后的错误交给上层。
+} // 错误分支到这里结束。
 ```
 
-Go 不用 Java 式 exception 作为普通错误主线，而是显式检查 `err`。
+**大白话总结：** Go把“有没有出错”作为普通返回值交给调用者检查；这里主机名取不到就停止建registry，把原始原因继续往上交。
+
+Go 不把 Java 式 exception（抛出后沿调用栈寻找捕获者）作为普通错误主线，而是让函数直接返回一个`error`，调用者显式检查`err`。
 
 `%w` 会包装原错误，使上层还能用 `errors.Is/As` 判断错误链。运维阅读时要看：
 
 - 错误是否被返回；
 - 只是 log 后继续；
-- panic；
+- panic（程序遇到无法继续的异常后，开始中止当前调用链；若无人恢复，进程可能退出）；
 - 进程退出；
 - 某个 collector 被跳过。
 
@@ -2954,12 +3177,12 @@ Go 不用 Java 式 exception 作为普通错误主线，而是显式检查 `err`
 当前启动代码有类似：
 
 ```go
-defer sigSource.Cleanup()
-defer nvmlprovider.Client().Cleanup()
-defer serverCleanup()
+defer sigSource.Cleanup() // 当前函数结束前，停止信号监听。
+defer nvmlprovider.Client().Cleanup() // 当前函数结束前，释放NVML客户端。
+defer serverCleanup() // 当前函数结束前，关闭HTTP server等资源。
 ```
 
-大白话：
+**大白话总结：**
 
 > 现在登记清理动作，等当前函数结束时逆序执行。
 
@@ -2968,44 +3191,44 @@ defer serverCleanup()
 当前源码特意用：
 
 ```go
-dcgmCleanup := func() {
-    dcgmprovider.Client().Cleanup()
-}
+dcgmCleanup := func() { // 定义一个暂不执行的匿名函数，并把它保存到dcgmCleanup变量。
+    dcgmprovider.Client().Cleanup() // 真正执行时，再取得“当时最新的”DCGM client并清理。
+} // 匿名函数定义到这里结束。
 ```
 
-原因是 GPU bind/unbind 可能重新初始化 provider。闭包每次执行时取“当前 client”，避免把旧 client 固定进清理逻辑。这是生产热重载代码才会出现的细节。
+**大白话总结：** 这里先保存一段“以后再清理”的动作；真正清理时再拿最新client，避免GPU变化后仍清理旧对象。这个匿名函数又叫closure（闭包），它可以在以后执行，并使用执行那一刻能取得的对象。
 
 ### 25.4 `interface`：只依赖能力，不依赖具体实现
 
 transformation 层可抽象成：
 
 ```go
-type Transform interface {
-    Process(metrics collector.MetricsByCounter, deviceInfo deviceinfo.Provider) error
-    Name() string
-}
+type Transform interface { // 声明一种“必须具备哪些方法”的能力清单。
+    Process(metrics collector.MetricsByCounter, deviceInfo deviceinfo.Provider) error // 必须能处理指标，并返回成功或错误。
+    Name() string // 必须能返回自己的名字。
+} // interface定义到这里结束。
 ```
 
-任何类型只要实现这些方法，就可以作为 `Transform`。
+**大白话总结：** interface只规定“必须会做什么”，不限定“具体是哪种对象”；任何类型只要实现这些方法，就可以作为`Transform`。
 
 运维意义：
 
 - PodMapper 是采样后的 enrichment；
 - collector 本身和 Kubernetes metadata 映射是可分离阶段；
 - Pod mapping 失败不等于 DCGM 完全采不到设备事实；
-- 测试可以注入 fake/mock provider。
+- 测试可以注入fake/mock provider（行为可控的假实现），不用真的连接GPU。
 
 Java 类比：Go interface 更像“只按方法集合匹配的接口”，实现类型不必显式写 `implements`。
 
 ### 25.5 `for _, x := range slice`
 
 ```go
-for _, entityCollector := range factory.NewCollectors() {
-    reg.Register(entityCollector)
-}
+for _, entityCollector := range cf.NewCollectors() { // 逐个取出当前工厂新建的collector；下标用_明确丢弃。
+    reg.Register(entityCollector) // 把当前collector登记到registry。
+} // 所有collector处理完后结束循环。
 ```
 
-解释：
+**大白话总结：** 逐个拿collector并登记；这里只关心元素，不关心它排第几个。
 
 - `range` 遍历 slice；
 - 第一个返回值是 index，这里用 `_` 丢弃；
@@ -3019,14 +3242,14 @@ for _, entityCollector := range factory.NewCollectors() {
 当前 server 启动主线有类似：
 
 ```go
-serverWg.Add(1)
-go func() {
-    defer serverWg.Done()
-    metricsServer.Run(ctx, stop)
-}()
+serverWg.Add(1) // 先登记：即将多出一个需要等待的并发任务。
+go func() { // 启动一个goroutine，异步运行下面的匿名函数。
+    defer serverWg.Done() // 该任务退出时，把“未完成任务数”减一。
+    metricsServer.Run(ctx, stop) // 在这个并发任务里运行HTTP metrics server。
+}() // 末尾()表示“匿名函数定义完立刻调用”。
 ```
 
-这会并发运行 HTTP server，主 goroutine 继续启动 watcher 并等待 signal。
+**大白话总结：** 先登记一个并发任务，再让HTTP server在这个任务里运行，退出时把计数减回去。goroutine可以先理解成“Go运行时管理的轻量任务”；主goroutine因此还能继续启动watcher（持续观察变化的任务）并等待signal（停止或重载信号）。
 
 对应 Java 类比：像提交一个 Runnable 到轻量并发执行单元，但 goroutine 由 Go runtime 调度，不等同于“一 goroutine 一 OS thread”。
 
@@ -3035,12 +3258,12 @@ go func() {
 三步：
 
 ```go
-wg.Add(1)     // 有一个并发任务
-defer wg.Done() // 任务结束时减一
-wg.Wait()     // 等所有任务结束
+wg.Add(1) // 未完成任务数加一。
+defer wg.Done() // 当前任务退出时，未完成任务数减一。
+wg.Wait() // 阻塞在这里，直到未完成任务数变成零。
 ```
 
-Exporter shutdown 时先取消 watcher，再 Wait；再关 server。这关系到：
+**大白话总结：** `WaitGroup`就是“并发任务计数牌”；计数没归零，主流程就继续等。`shutdown`就是进程按顺序停止，Exporter停止时先取消watcher，再`Wait`，再关server。这关系到：
 
 - Pod 滚动更新是否干净退出；
 - scrape 是否被突然截断；
@@ -3049,22 +3272,22 @@ Exporter shutdown 时先取消 watcher，再 Wait；再关 server。这关系到
 ### 25.8 Channel
 
 ```go
-stop := make(chan interface{})
-close(stop)
+stop := make(chan interface{}) // 创建一条进程内通知通道，并把它命名为stop。
+close(stop) // 关闭通道；等待这条通道的goroutine都会收到“该停止了”的信号。
 ```
 
-Channel 可以传值，也可以用“关闭”广播停止。这里 `close(stop)` 是通知 server 停止的一种方式。
+**大白话总结：** Channel可以理解成goroutine之间的进程内通知管道；这里不传业务数据，只用`close(stop)`向等待者广播“该停了”。
 
 不要把 channel 想成 Kafka；它是进程内 goroutine 通信原语。
 
 ### 25.9 `context.Context`
 
 ```go
-watcherCtx, watcherCancel := context.WithCancel(context.Background())
-defer watcherCancel()
+watcherCtx, watcherCancel := context.WithCancel(context.Background()) // 创建一个可取消的上下文，并得到对应取消函数。
+defer watcherCancel() // 当前函数退出时广播取消，避免watcher继续泄漏运行。
 ```
 
-`Context` 传播取消、deadline 和请求范围值。这里取消 watcher context，意味着所有尊重该 context 的 watcher 应停止。
+**大白话总结：** `Context`可以理解成沿调用链传递的“终止通知单”；调用`watcherCancel()`后，所有主动检查它的watcher都应该停。它还能携带deadline（最晚必须结束的时刻）和少量请求范围信息。
 
 排障要问：
 
@@ -3082,26 +3305,26 @@ defer watcherCancel()
 - pending GPU topology change。
 
 ```go
-reloadID := hotReloadCounter.Add(1)
-pendingGPUTopologyChange.Store(true)
-if pendingGPUTopologyChange.Load() { /* ... */ }
+reloadID := hotReloadCounter.Add(1) // 以并发安全方式把重载序号加一，并取得新序号。
+pendingGPUTopologyChange.Store(true) // 以并发安全方式写入“GPU拓扑待处理”状态。
+if pendingGPUTopologyChange.Load() { /* 满足条件后进入处理分支 */ } // 以并发安全方式读状态；为true时进入处理逻辑。
 ```
 
-Atomic 让多个 goroutine 读写简单状态时避免 data race，但它不自动让一整组复合操作成为事务。
+**大白话总结：** atomic（原子操作）可以先理解成“这一次简单读或写不会被另一个并发任务从中间拆开”。它能避免data race（多个任务同时读写同一内存，导致结果不可预测），但不能自动保证一串操作要么全部成功、要么全部失败；后者才接近事务。
 
 ### 25.11 `defer` + `recover`
 
 启动和 hot reload 路径对 panic 做了恢复：
 
 ```go
-defer func() {
-    if r := recover(); r != nil {
-        // 记录stack并把panic转成error
-    }
-}()
+defer func() { // 登记一个当前函数退出前执行的保护函数。
+    if r := recover(); r != nil { // recover尝试接住panic；接到后r保存panic内容。
+        // 这里记录stack（函数一路调用到出错点的路径），并把panic转成可返回的error。
+    } // panic处理分支结束。
+}() // 匿名保护函数定义完成；因为前面有defer，所以会在当前函数退出前运行。
 ```
 
-这相当于最后一道进程保护，但不是“错误已经解决”。看到日志中的 `PANIC RECOVERED` 仍应视为代码/输入异常，并检查重载后 registry 是否恢复。
+**大白话总结：** `recover`像接住程序即将摔出去的异常，让进程有机会记录调用路径并返回错误；它不是修复。看到日志中的`PANIC RECOVERED`仍应视为代码/输入异常，并检查重载后registry是否恢复。
 
 ### 25.12 Generic `atomic.Uint64` 不是业务计数器
 
@@ -3163,6 +3386,8 @@ server已经渲染样本
 ---
 
 ## 27. 故障树：从现象快速决定读哪一层
+
+下面每棵树都**从上往下读**：顶行是你看到的现象，分支是互相并列的候选原因，不是依次执行的函数调用。先用只读证据排除分支，不要看到第一项就直接改生产。
 
 ```text
 Exporter CrashLoopBackOff
@@ -3369,115 +3594,77 @@ P3：容量/效率优化建议
 
 ---
 
-## 31. 自测题
+## 31. 分两遍验收：先会值班，再学扩展能力
 
-### 31.1 判断题
+### 31.1 首遍验收
 
-1. Prometheus target `up=1`，所以 Node 上所有 GPU 都健康。
-2. `DCGM_FI_DEV_XID_ERRORS` 是 gauge，不应直接使用 `rate()`。
-3. PodResources GetAllocatable 返回当前未被 Pod 使用的 GPU。
-4. Device Plugin Healthy 与 DCGM health 告警可以短时或长期不一致。
-5. 缺失 ECC series 可以用 `or vector(0)` 证明 ECC 为 0。
-6. time-slicing 下 device total 不能无条件复制后按 Pod 求和。
-7. Xid 79 出现后，重启业务 Pod 总能修复。
-8. `dcgmi diag -r 3` 可以在承载业务的 Node 上作为告警自动动作。
-9. 开启所有 Pod labels 可能造成 Prometheus cardinality 爆炸。
-10. 当前 release 的 pprof 默认需要显式开启。
+先合上答案，用自己的话回答。首遍不考所有Xid编号，也不考Go并发细节。
 
-### 31.2 简答题
+1. `/metrics`返回HTTP 200到底证明了什么？至少还有哪三层健康没有被证明？
+2. Driver/DCGM、hostengine、exporter、Prometheus、Device Plugin各自只负责什么？
+3. 第1节源码里，`GetRegistry()`为何可能返回空registry？为什么空结果仍可能得到HTTP 200？
+4. 指标值为0、series缺失、blank/sentinel、unsupported四种情况有什么不同？
+5. gauge与counter该怎样读？为什么“最近一次Xid编号”是gauge，不能直接`rate()`？
+6. 为什么DCGM已经告警时，Device Plugin仍可能报告`Healthy`？
+7. Xid和ECC分别提供什么证据？为什么单个Xid编号或历史ECC非零都不能直接等于RMA？
+8. 生产事故第一阶段为什么必须只读取证？至少说出Node UID、GPU UUID/PCI BDF、Pod UID、时间窗四类身份信息。
 
-1. 画出 GPU 到 Prometheus series 的组件链。
-2. 为什么 `/metrics` 返回 200 仍可能没有 GPU samples？
-3. gauge 与 counter 的 PromQL 核心区别是什么？
-4. Pod 标签为空有哪些至少六种原因？
-5. 为什么 GetAllocatable 不等于 free？
-6. MIG + time-slicing 下当前 per-process 能力有哪些边界？
-7. Xid 告警后为什么要回到 kernel log？
-8. Xid 48 后伴随 63/64 时，安全顺序是什么？
-9. Device Plugin Health 与 DCGM 告警为何不会自动联动？
-10. 为什么诊断前要先保留证据再 reset/reboot？
-11. 9400 endpoint 有哪些信息泄露面？
-12. 如何证明一条 ECC 告警真的可用？
+### 31.2 二遍验收
 
-### 31.3 场景题
+1. 为什么现场必须同时保存image digest、exporter/DCGM版本、固定源码commit和CSV校验值？
+2. custom CSV与hot reload怎样造成“接口还活着，但目标field短暂或长期缺失”？
+3. PodResources、MIG、time-slicing和per-process分别解决哪一段归属问题？为什么device total不能按Pod直接相加？
+4. 启用扩展health field前，为什么要核对支持范围、实际值变化、`# TYPE`和告警函数？
+5. DCGM采样周期、Prometheus抓取周期和label cardinality分别影响新鲜度、重复样本与存储成本的哪一部分？
+6. `:9400`暴露和`dcgmi diag`主动诊断各有哪些边界？哪些可以只读，哪些必须进入维护窗口？
 
-#### 场景一
+### 31.3 现场题
 
-Grafana 中某 Node 的所有 GPU utilization 突然变成 0，但 `up=1`。你先查什么？
-
-#### 场景二
-
-time-slicing 下四个 Pod 的 GPU utilization 都是 98%，namespace 面板显示 392%。哪里错了？
-
-#### 场景三
-
-某卡 Xid 74，训练出现 NCCL timeout。你需要哪些跨层证据？
-
-#### 场景四
-
-DBE aggregate 长期为 1，每分钟都触发 critical。规则哪里错了？
-
-#### 场景五
-
-Exporter Pod 的 Pod 标签 enrichment 开启后，Prometheus head series 翻了 20 倍。如何止损？
+1. Grafana显示某Node全部GPU利用率为0，但`up=1`。你怎样先证明它是真0，而不是缺失被面板补0？
+2. time-slicing下四个Pod都显示GPU利用率98%，namespace面板变成392%。这张图错在哪里？
+3. 某卡出现Xid 79，DBE最近有增量，但Device Plugin仍为`Healthy`。你先保存哪些证据、怎样停止扩大影响，又为什么不能只重启Pod或立刻判RMA？
 
 ---
 
-## 32. 自测答案
+## 32. 自测答案与通过标准
 
-### 32.1 判断题答案
+### 32.1 首遍答案
 
-1. 错。只证明 scrape 成功。
-2. 对。它表示最近 Xid 值，不是累计次数。
-3. 错。它是健康可分配集合，不减已分配设备。
-4. 对。两条链没有标准自动联动。
-5. 错。缺失是未知/采集缺失，不是 0。
-6. 对。否则重复统计同一物理 GPU。
-7. 错。设备可能已离开 PCIe bus，重启 Pod 不能修复硬件链路。
-8. 错。长诊断具有侵入性，必须排空和审批。
-9. 对。每种 label 组合会放大 series。
-10. 对。当前 release 将 pprof 设为 opt-in。
+1. HTTP 200只证明exporter成功回应请求；采集链、GPU设备、业务SLO仍需各自证据。
+2. Driver/DCGM读取设备事实；hostengine承载DCGM服务；exporter把结果变成Prometheus文本；Prometheus抓取、存储和算规则；Device Plugin独立向kubelet报告可分配设备及健康。
+3. 热重载或GPU重新绑定时，旧registry已清、新registry未装，`GetRegistry()`会给一个空registry；`Gather/render/Write`都没报错时，空响应照样可以成功。
+4. 0是采到的有效数值；缺失是没有这条series；blank/sentinel是“此值不可按普通数字解释”的占位；unsupported是当前设备/版本不支持该field。
+5. gauge看当前值或窗口最大/平均；counter看`increase/rate`并考虑重置。Xid gauge保存的是错误编号，不是只增不减的事件总数。
+6. 两者是独立异步链：DCGM/exporter/Prometheus不会按Kubernetes标准自动调用Device Plugin改Health。
+7. Xid是驱动给出的错误路线提示，ECC是显存纠错状态/计数；都要结合时间、增量、伴随日志、设备身份、恢复建议和复发情况，不能单证据判返修。
+8. reset、reboot、删Pod会改变甚至抹掉现场。先固定cluster/context、Node name/UID、GPU UUID/PCI BDF、exporter与业务Pod UID、时间窗，再保存raw metrics、日志、对象和版本。
 
-### 32.2 简答题要点
+### 32.2 二遍答案
 
-1. Driver/NVML → DCGM/hostengine → exporter collectors/transform → HTTP → Prometheus → Alertmanager/Grafana。
-2. hot reload 空窗、无 collector、CSV 未启用、unsupported/blank、watch list 空等。
-3. Gauge 看当前/窗口聚合；counter 看增量/速率并处理 reset。
-4. 无 workload、Kubernetes mode 关、socket/path/permission、ID strategy、MIG 格式、informer/RBAC/cache、重启窗口、DRA 配置。
-5. 已分配的健康设备仍属于 allocatable 集合。
-6. 需显式开关与权限；整卡可分 per-process util/FB，MIG 主要能分 per-process FB，SM util 有 NVML 限制；device total 仍存在。
-7. Metric 可能只保留最近值，kernel log 有首个事件、PCI BDF、UUID、payload 和事件顺序。
-8. 保存证据 → 阻止新调度 → 安全排空 → 按支持条件 reset/维护 → diag/smoke → 观察复发。
-9. 一个来自 plugin ListAndWatch/kubelet，一个来自 DCGM/exporter/Prometheus。
-10. reset/reboot 会清理或改变 volatile counter、kernel 状态和复现场景。
-11. Node/GPU UUID、Pod/namespace/labels、型号/driver、使用模式和错误状态。
-12. 确认 CSV 启用、field 支持、raw series、Prometheus ingestion、counter 语义、回放/安全触发、缺失告警和 runbook。
+1. 这些信息共同回答“现场究竟运行哪份代码和采集契约”；只记tag或Pod名无法稳定复现。
+2. CSV可能未启用或写错field/type；重载窗口可能暂时换成空registry。两者都不要求HTTP接口一定失败。
+3. PodResources提供Kubernetes分配关系，MIG表示硬件切片，time-slicing表示轮流共享，per-process尝试把宿主机进程用量归到Pod；父卡device total复制给多个Pod后相加会重复计算。
+4. 配置里有名字不代表硬件支持；CSV声明的类型也可能与实现行为不符。必须用固定版本源码、raw输出和值变化证明该规则真能工作。
+5. DCGM周期决定底层多久产生一次新样本；Prometheus周期决定多久来抄一次；抓得更快不能制造新底层事实。label组合越多，series和存储成本越高。
+6. `:9400`只应让授权采集方访问，并保护Pod/设备信息；`21～23`是只读取证。`dcgmi diag`会占用或扰动GPU，必须确认身份、排空业务、审批并在维护窗口执行。
 
-### 32.3 场景题答案
+### 32.3 现场题答案
 
-#### 场景一
+1. 先查raw `/metrics`中目标UUID的series、值和样本新鲜度；再查面板是否用`or vector(0)`补零。若series缺失，继续查CSV、watch list、collector、重载、relabel与Prometheus接收链，不能用`up=1`结案。
+2. 四条很可能是同一物理GPU的device total被复制给四个Pod，求和后重复四次。应按GPU UUID去重；只有经验证的per-process指标才能用于Pod级归属。
+3. 固定Node UID、GPU UUID/PCI BDF、Pod UID和时间窗，保存kernel Xid/AER、raw metrics、ECC增量、Device Plugin/driver/exporter日志与业务错误；经审批阻止新调度并工作负载感知地排空。Xid 79可能是PCIe链路失联，重启Pod修不好链路；Xid与DBE仍要结合官方恢复建议、复发和诊断结果，不能直接判RMA。
 
-先看 raw series 是否真的为 0，还是面板用缺失补 0；再查 hot reload、timestamp/样本新鲜度、collector/watch list、PromQL/relabel。`up=1` 不能结案。
+### 32.4 分级通过标准
 
-#### 场景二
-
-同一个 device total 被复制给四个 Pod 并求和。应区分 device total/per-process series，按 UUID 去重；启用并验证当前 virtual GPU per-process 路径后才能做 Pod 级成本归属。
-
-#### 场景三
-
-Xid kernel log 全上下文、两端 GPU UUID/PCI BDF、NVLink counters、拓扑、Fabric Manager/NVSwitch/SXid、NCCL 日志、driver/DCGM 版本、同 Node 其他 GPU 情况和物理维护史。
-
-#### 场景四
-
-规则盯了历史 counter 绝对值。应告警新 `increase()`、复发/row remap 状态，并避免历史值每轮重复告警。
-
-#### 场景五
-
-先关闭或收窄 Pod labels，使用 allowlist，移除高变标签，评估旧 series retention/remote write；再按 owner/team/workload 的最小稳定维度恢复。同步审计 RBAC。
+- **首遍通过：** 不看答案，能把31.1的8题都用自己的话讲清，并能在场景1中先区分“0”和“缺失”。若第1～4题说不清，回到第0～8节；若第5～8题说不清，回到第11、14～17和20～23节。
+- **二遍通过：** 能答清31.2的6题，并能解释三个只读脚本为什么要反复校验Node UID和Pod UID；不要求背全部field、Xid或命令参数。
+- **还不算通过：** 只会说“exporter是UP的”“面板是0”“Xid等于坏卡”，却说不出证据在哪一层、身份如何固定、下一步是否会改变现场。
 
 ---
 
 ## 33. 值班一页纸
+
+下面从“一”读到“十”，是一次事故的推荐推进顺序；斜杠分隔的是同一步要一起核对的证据，不是网络调用关系。
 
 ```text
 一、先判断是不是观测链坏了
@@ -3518,10 +3705,11 @@ Xid kernel log 全上下文、两端 GPU UUID/PCI BDF、NVLink counters、拓扑
 ### 34.1 固定源码与 release
 
 - [DCGM Exporter `4.5.3-4.8.2` release](https://github.com/NVIDIA/dcgm-exporter/releases/tag/4.5.3-4.8.2)
-- [DCGM Exporter `4.5.3-4.8.2` source tree](https://github.com/NVIDIA/dcgm-exporter/tree/4.5.3-4.8.2)
-- [`pkg/cmd/app.go`](https://github.com/NVIDIA/dcgm-exporter/blob/4.5.3-4.8.2/pkg/cmd/app.go)
-- [`etc/default-counters.csv`](https://github.com/NVIDIA/dcgm-exporter/blob/4.5.3-4.8.2/etc/default-counters.csv)
-- [`deployment/values.yaml`](https://github.com/NVIDIA/dcgm-exporter/blob/4.5.3-4.8.2/deployment/values.yaml)
+- [DCGM Exporter固定commit源码树](https://github.com/NVIDIA/dcgm-exporter/tree/691c92762eb551313c825f6efe4ceeee20982801)
+- [`internal/pkg/server/server.go`](https://github.com/NVIDIA/dcgm-exporter/blob/691c92762eb551313c825f6efe4ceeee20982801/internal/pkg/server/server.go)
+- [`pkg/cmd/app.go`](https://github.com/NVIDIA/dcgm-exporter/blob/691c92762eb551313c825f6efe4ceeee20982801/pkg/cmd/app.go)
+- [`etc/default-counters.csv`](https://github.com/NVIDIA/dcgm-exporter/blob/691c92762eb551313c825f6efe4ceeee20982801/etc/default-counters.csv)
+- [`deployment/values.yaml`](https://github.com/NVIDIA/dcgm-exporter/blob/691c92762eb551313c825f6efe4ceeee20982801/deployment/values.yaml)
 - [Per-process time-sharing/MIG implementation PR](https://github.com/NVIDIA/dcgm-exporter/pull/594)
 - [PodMapper informer cache PR](https://github.com/NVIDIA/dcgm-exporter/pull/626)
 

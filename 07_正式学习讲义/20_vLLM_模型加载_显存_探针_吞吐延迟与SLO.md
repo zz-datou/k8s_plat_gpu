@@ -1,92 +1,162 @@
-# 第 20 课：vLLM 在线推理——模型加载、显存、探针、吞吐/延迟与 SLO
+# 第 20 课：vLLM 在线推理——Pod 都 Ready 了，为什么还是不能交付
 
-> 主案例：一个固定模型版本的 vLLM OpenAI-compatible 服务部署到 Kubernetes 后，Pod 长时间 `Running` 但不 `Ready`；调大探针后终于接流量，却出现排队、TTFT 尾延迟、CUDA OOM 和发布时 GPU 不够用  
-> 主线源码：vLLM `v0.25.0` 的 `vllm/entrypoints/openai/api_server.py`、`vllm/v1/engine/async_llm.py`、`vllm/v1/engine/core.py`、`vllm/v1/core/sched/scheduler.py`、`vllm/v1/worker/gpu_worker.py`、`vllm/v1/worker/gpu/model_runner.py`、`vllm/v1/metrics/loggers.py`  
-> 版本基线：vLLM `v0.25.0`，GitHub release 于 `2026-07-11` 发布，tag 指向提交 `702f481`；事实核对日期 `2026-07-14`  
-> 本课深度：S1。必须能把请求、队列、调度、KV cache、GPU worker、探针、指标和发布连成一条生产证据链；不要求逐个读懂 CUDA kernel 或注意力后端  
-> 前置断点：第 13 课已经完成 kubelet probe、statusManager、PLEG 和重启链；第 14～19 课已经完成 GPU 节点软件栈、Device Plugin、DeviceManager、恢复账本、GPU Operator、DCGM/Xid/ECC。本课只在需要处回链，不重复整章源码
+> 主案例：Pod 是 `Running`，就绪状态是 `Ready`，`/health` 也返回 `200`，可是用户第一句话迟迟出不来。  
+> Kubernetes 源码基线：本地仓库提交 `301946d15e67a4a2e8a5fb8292eb836acd366d78`。  
+> vLLM 源码基线：项目 `vllm-project/vllm`，版本 `v0.25.0`，完整提交 `702f4814fe54fabff350d43cb753ae3e47c0c276`，主要语言是 Python。  
+> 学习边界：先学会用 Kubernetes 状态、vLLM 队列、GPU 显存和用户延迟判断故障在哪一层；暂时不钻 CUDA kernel、注意力算子和复杂分布式实现。  
+> 前置内容：第 13 课讲过 kubelet 探针；第 14～19 课讲过 GPU 节点、Device Plugin、GPU Operator 和 DCGM（NVIDIA GPU 监控与健康检查组件）。本课把这些知识接到一个真实的在线推理服务上。
 
 ---
 
+## 0. 先看事故：三个绿灯都亮了，用户为什么还在等
 
-## 0. 生产现场：`Running`、`Ready`、`/health 200` 为什么仍可能无法交付
-
-先看一个在线推理服务常见的时间线：
-
-```text
-10:00:00  Pod 被调度到 GPU Node
-10:00:08  容器进程启动，Pod phase=Running
-10:00:12  开始读取 tokenizer 和模型配置
-10:01:10  从模型仓库或 PVC 读取权重
-10:04:20  权重装入 GPU
-10:04:55  profile 可用显存，规划 KV cache
-10:05:25  分配 KV cache
-10:06:40  编译、warm-up、CUDA Graph capture
-10:06:47  API server 开始响应 /health
-10:06:48  readinessProbe 成功，Service 开始送流量
-10:07:20  并发快速上升，waiting queue 增长
-10:07:35  /health 仍是 200，但业务 TTFT p99 已经超出 SLO
-10:08:02  一个超长 prompt 触发 preemption；尾延迟继续变坏
-10:08:44  新发布副本 Pending，因为滚动发布没有额外 GPU
-```
-
-这个时间线至少有四种不同的“健康”：
-
-| 层次 | 要回答的问题 | 典型证据 | 不能证明什么 |
-|---|---|---|---|
-| 进程存活 | 进程是否还活着 | 容器状态、退出码、liveness | 模型已经可服务 |
-| 引擎就绪 | 引擎是否初始化完成且未进入已知错误状态 | startup/readiness、启动日志、`/health` | 当前负载下能满足 TTFT/ITL |
-| 流量可用 | 网关能否把合格请求交给至少一个 Ready endpoint | EndpointSlice、网关成功率 | 单个请求的生成质量或尾延迟 |
-| 产品 SLO | 指定模型、请求分布和租户等级能否满足可用性与延迟目标 | 客户端观测、服务端直方图、请求分桶 | 下一个版本或不同流量分布也会满足 |
-
-因此，本课的第一条纪律是：
+先不要急着看参数。把自己放到值班现场：
 
 ```text
-Pod Running
-  != 模型加载完成
-  != 引擎可接流量
-  != /health 200
-  != 推理请求成功
-  != TTFT、ITL、E2E满足SLO
+10:00:08  容器进程启动，Pod 进入 Running
+10:06:47  /health 开始返回 200
+10:06:48  readinessProbe 成功，Pod 进入 Ready，Service 开始送请求
+10:07:20  新请求越来越多，vLLM 的等待队列开始增长
+10:07:35  /health 仍然是 200，但用户等第一段文字已经明显变慢
+10:08:02  长 prompt 抢占了大量计算和 KV cache，尾部请求更慢
 ```
 
-Java 经验可以帮助建立类比，但不能替换 GPU 推理事实：
+最先要明白的一句话是：
 
-| Java 平台经验 | vLLM 可借用的部分 | 不能直接照搬的部分 |
+> `Running` 只说明容器里的进程已经启动；`Ready` 只说明 Kubernetes 的就绪探针成功；`/health 200` 只说明这个 HTTP 健康检查成功。三者都不等于“当前流量下，用户能按承诺速度拿到正确答案”。
+
+### 0.1 这一课会反复出现的词，先翻成大白话
+
+| 词 | 大白话 | 它在生产里回答什么问题 |
 |---|---|---|
-| JVM 启动、类加载、JIT/warm-up | 启动有多个阶段；探针窗口应来自实测分位数 | 权重、KV cache、CUDA Graph 和 GPU collective 有独立显存与拓扑约束 |
-| 线程池 active/queue/reject | running/waiting、排队、饱和、背压 | vLLM 每一步动态重组批次，不是固定线程拿一个请求跑到底 |
-| Deployment 滚动发布 | readiness、maxSurge、maxUnavailable、回滚证据 | 每个副本需要稀缺 GPU；新旧版本可能无法同时放置 |
-| HTTP p95/p99 SLO | 可用性、错误率、端到端延迟、分桶 | 生成请求还必须拆 TTFT、ITL/TPOT、输出长度和 token 吞吐 |
+| vLLM | 一个把大模型变成在线接口的推理服务程序；它不是模型本身。它可提供 OpenAI-compatible 接口，也就是沿用常见的 OpenAI 请求/响应格式 | 请求怎样排队、怎样使用 GPU、怎样把 token 流式返回 |
+| token | 模型处理文字时切出来的小单位，不一定等于一个汉字或单词 | 输入、输出和显存成本通常都按 token 计算 |
+| prompt | 用户交给模型的输入内容，包括问题和系统提示词 | 输入越长，第一次计算通常越重 |
+| 模型权重 | 模型训练后留下的大量数字参数；在线服务启动时要把它们读出来并放到 GPU | 模型能不能装下、冷启动要多久 |
+| prefill | 模型第一次把整段 prompt 读进去，并为后续生成准备上下文 | 主要影响多久能看到第一个 token |
+| decode | 模型在已有上下文上一个接一个地产生新 token | 主要影响后续文字出来得是否流畅 |
+| continuous batching | 每跑一步都重新拼一批可以一起算的请求；有人完成就退出，新人可加入 | 为什么队列、长短请求和吞吐会互相影响 |
+| KV cache | GPU 显存里保存的“上下文计算笔记”，避免每生成一个 token 都从头重算 | 能同时服务多少请求、能接多长上下文 |
+| waiting queue | 请求已经进了 vLLM，但还在等本轮计算机会的队列 | 是否开始供不应求 |
+| warm-up | 正式接流量前先跑几轮，把编译、缓存和执行路径准备好 | 为什么进程起来后还要等一段时间 |
+| TTFT | 从请求到达，到用户收到第一个 token 的时间 | 用户是否“等半天还没看到开头” |
+| ITL | 相邻两个输出 token 之间的间隔 | 文字流出来时是否一卡一卡 |
+| TPOT | 第一个 token 以后，平均生成一个输出 token 花多久 | 单个请求的持续生成速度 |
+| SLO | 团队对用户承诺的服务目标，例如“99% 请求 2 秒内出首字” | 到底什么才算真正可交付 |
+
+`p99` 也顺便解释一下：把 100 个请求从快到慢排好，第 99 个附近的耗时就是 p99。它关注最慢的那一小批用户，而不是平均值。
+
+### 0.2 五道门：前一扇打开，不代表后一扇也打开
+
+读图规则：实线箭头表示正常情况下继续向右走；虚线箭头表示“前面的绿灯不能证明后面也绿”。
+
+```mermaid
+flowchart LR
+    A["1. 进程活着<br/>Pod Running"] --> B["2. HTTP 探针成功<br/>/health 200"]
+    B --> C["3. 模型已经装好<br/>权重、KV cache、预热完成"]
+    C --> D["4. 可以接新请求<br/>Pod Ready 且进入 Service"]
+    D --> E["5. 用户体验达标<br/>TTFT、ITL、成功率满足 SLO"]
+    A -. "不能证明" .-> C
+    B -. "不能证明" .-> E
+    D -. "负载一高仍可能失守" .-> E
+```
+
+这里故意把“HTTP 探针成功”和“模型已经装好”拆开。某些 vLLM 版本和启动方式会在模型初始化后才开放 `/health`，因此两者在你的现场可能紧挨着；但它们仍不是同一个判断。`/health` 没有替用户完成一次真实推理，也没有检查排队后的 p99。
+
+Java 平台经验只能当辅助类比：Spring Boot 的 `/actuator/health` 返回 `UP`，也不等于线程池没排队、数据库没变慢、接口 p99 一定达标。vLLM 只是把线程池、堆内存等问题，换成了请求调度、KV cache 和 GPU 显存等新对象。
 
 ---
 
-## 1. 本课先钉死二十四个结论
+## 1. 第一遍只走六站，先把故障放对地方
 
-1. vLLM `v0.25.0` 是本课的冻结版本；不同 tag 的默认 runner、指标、参数和安全边界不得混讲。
-2. `v0.25.0` 对所有 dense models 默认使用 Model Runner V2；旧文章让读者直接追“PagedAttention 实现类”的源码路线已经不适合作为当前入口。
-3. “paged KV cache”作为块化管理概念仍然存在；release 中删除的是旧 PagedAttention 实现，不能误讲成 KV cache 不再分页管理。
-4. API server 负责 HTTP/OpenAI-compatible 协议、输入处理、tokenization、流式输出等；真正的调度与执行主循环在 Engine Core。
-5. 一个请求进入 Engine Core 后先成为等待态；`Scheduler.schedule()` 每个 engine step 重新决定本步运行哪些请求和多少 token。
-6. 当前 scheduler 源码明确不把内部调度简单分成两个互斥的“prefill 阶段”和“decode 阶段”；它按已计算 token 与目标 token 的差额推进。运维上仍需要区分 prompt prefill 与自回归 decode 的成本。
-7. continuous batching 是“每个 step 动态重组工作集合”，不是启动时固定一个 batch，直到所有请求同时结束。
-8. `gpu_memory_utilization` 默认值在 `v0.25.0` 为 `0.92`；它是单个 vLLM 实例的目标显存预算比例，不是 KV cache 比例、不是硬隔离，也不会协调同卡上的另一个实例。
-9. 显式设置 `kv_cache_memory_bytes` 时，KV cache 大小不再由 `gpu_memory_utilization` 推导；二者不能当成两个同时生效的上限。
-10. `max_model_len=-1` 或 `auto` 可以走自动适配；生产首发仍应把允许的上下文、请求大小和压测分布明确化，不能把自动适配当容量规划。
-11. 模型权重只是显存的一部分；activation/workspace、KV cache、CUDA Graph、NCCL buffer、allocator reserve/fragmentation 和安全余量都要入账。
-12. CUDA OOM 通常是 GPU allocator/driver 路径中的错误；它可能让进程异常退出，但不等于 Kubernetes `OOMKilled`。后者首先指向容器 cgroup/宿主内存被内核 OOM killer 终止。
-13. startup probe 的职责是给冷启动足够但有限的时间；readiness 决定是否接流量；liveness 只应用于确实需要重启才能恢复的失活。
-14. `/health` 当前主要检查 Engine Client 是否进入已知死亡/错误状态，不执行合成推理，也不验证 queue、TTFT、模型输出质量或下游依赖。
-15. `failureThreshold × periodSeconds` 只是探针失败窗口的粗略下界；还要考虑 initial delay、timeout、探测调度、进程退出和 kubelet 同步时序。
-16. 启动预算必须按模型 revision、缓存命中/未命中、GPU/节点类别、并行模式分别测 p99 或更高分位；不能从一次热缓存启动拍脑袋。
-17. `vllm:num_requests_waiting`、`vllm:num_requests_running` 和 `vllm:kv_cache_usage_perc` 是容量线索，不是单独的 SLO。
-18. Counter 必须用 `rate()` 或 `increase()` 看区间变化；Histogram 分位数必须对 `_bucket` 做 `rate()` 后再 `histogram_quantile()`。
-19. vLLM 文档中的 Counter 基名与 Python Prometheus client 的 exposition 名可能不同；例如文档写 `vllm:num_preemptions`，实际抓取通常带 `_total`。查询前必须看本实例 `/metrics`。
-20. “没有时间序列”不等于数值为零；先排 scrape、RBAC、标签、版本和 metric rename，再谈告警正常。
-21. server aggregate metrics 与 opt-in per-request metrics 的边界不同；后者会增加 CPU 成本，`n>1` 等场景还可能返回 `metrics: null`。
-22. 吞吐、TTFT、ITL、TPOT 和 E2E 有天然权衡；只提高总 token/s 可能牺牲单请求尾延迟。
-23. 单 GPU 能放下模型时先用单 GPU；TP、PP、DP 分别解决不同问题。跨 Pod 的普通 Deployment 不会自动组成 vLLM 分布式集群。
-24. 生产发布、扩缩容和压测都必须先算 GPU 放置、冷启动和容量余量；任何对生产有负载或状态影响的命令都要显式审批。
+这一遍不求你背参数，只求你以后看到“Ready 但慢”时，能按固定顺序排查。
+
+读图规则：从左往右是一个请求真正经过的方向；每个方框是一站；红色回箭头表示用户现象可能迫使我们回到前面找根因。
+
+```mermaid
+flowchart LR
+    S1["第 1 站<br/>Kubernetes 把 Pod 放到哪张 GPU"]
+    S2["第 2 站<br/>进程、模型和缓存是否启动完成"]
+    S3["第 3 站<br/>探针是否让 Service 送流量"]
+    S4["第 4 站<br/>请求如何排队、prefill、decode"]
+    S5["第 5 站<br/>显存和 GPU 算力是否够用"]
+    S6["第 6 站<br/>用户看到的 TTFT、ITL 是否达标"]
+    S1 --> S2
+    S2 --> S3
+    S3 --> S4
+    S4 --> S5
+    S5 --> S6
+    S6 -. "慢或失败时带证据回查" .-> S2
+```
+
+| 站点 | 先问一句话 | 本课深入位置 |
+|---|---|---|
+| 1. GPU 放置 | Pod 真拿到 GPU 了吗，发布时还有空卡吗？ | [第 4 节](#4-kubernetes-如何把一个-gpu-交给-vllm)、[第 11 节](#11-扩缩容与发布gpu-稀缺资源下不能照搬普通-deployment) |
+| 2. 启动 | 权重、KV cache 和预热走到哪一步？ | [第 5 节](#5-模型启动从进程创建到真正-ready) |
+| 3. 接流量 | Kubernetes 为什么认为它 Ready？ | 本节源码、[第 5 节](#53-health-的真实边界) |
+| 4. 排队与生成 | 请求是在等，还是已经在 GPU 上算？ | [第 3 节](#3-从-http-请求到-gpu-token一条完整生产链) |
+| 5. GPU 容量 | 权重、KV cache 和临时计算分别吃了多少显存？ | [第 6 节](#6-显存账本权重只是第一行)、[第 7 节](#7-oom-故障树先分-gpu主机内存与硬件故障) |
+| 6. 用户结果 | 首 token、后续 token、成功率是否满足承诺？ | [第 10 节](#101-五个时间边界不能混) |
+
+### 1.1 先读第一段 Kubernetes Go 源码：`200` 到底被判成了什么
+
+下面是本地 Kubernetes 固定提交 `301946d15e67a4a2e8a5fb8292eb836acd366d78` 中的连续源码，文件是 `pkg/probe/http/http.go`，第 111～117 行。这里属于 **Kubernetes 项目的 Go 代码**，不是 vLLM 的 Python 代码。
+
+```go
+if res.StatusCode >= http.StatusOK && res.StatusCode < http.StatusBadRequest { // 如果状态码在 200 到 399 之间，就进入“探针可接受”的分支。
+	if res.StatusCode >= http.StatusMultipleChoices { // 如果是 300～399，也就是重定向，不把它当普通成功，而是给出 Warning。
+		klog.V(4).Infof("Probe terminated redirects for %s, Response: %v", url.String(), *res) // 记录一条较详细的调试日志。
+		return probe.Warning, fmt.Sprintf("Probe terminated redirects, Response body: %v", body), nil // 返回 Warning；最后的 nil 表示执行 HTTP 请求本身没有报 Go 错误。
+	}
+	klog.V(4).Infof("Probe succeeded for %s, Response: %v", url.String(), *res) // 走到这里说明状态码是 200～299，记录“探针成功”。
+	return probe.Success, body, nil // 把结果交回 kubelet：探针成功，同时返回响应体，没有额外错误。
+}
+```
+
+大白话总结：kubelet 在这里看到 `200`，只会得出“我访问的这个地址返回了成功状态码”。这段代码没有读取 vLLM 的等待队列，没有发一条真实模型请求，也没有计算 TTFT、ITL 或 SLO。所以 `/health 200` 和“用户体验达标”本来就是两个问题。
+
+再补最后一跳。`pkg/kubelet/prober/prober.go` 第 111～119 行把底层探测结果交给上层：
+
+```go
+switch result { // 根据刚才得到的探测结果，选择接下来返回什么。
+case probe.Success: // 如果底层结果是 Success。
+	logger.V(3).Info("Probe succeeded", "probeType", probeType, "pod", klog.KObj(pod), "podUID", pod.UID, "containerName", container.Name) // 记录“探针成功”日志和 Pod、容器信息。
+	return results.Success, nil // 告诉 kubelet 上层：本次探测成功，没有错误。
+
+case probe.Warning: // 如果是重定向一类的 Warning。
+	pb.recordContainerEvent(ctx, pod, &container, v1.EventTypeWarning, events.ContainerProbeWarning, "%s probe warning: %s", probeType, output) // 给 Pod 记录一条 Warning 事件。
+	logger.V(3).Info("Probe succeeded with a warning", "probeType", probeType, "pod", klog.KObj(pod), "podUID", pod.UID, "containerName", container.Name, "output", output) // 日志说明：有警告，但探测仍算成功。
+	return results.Success, nil // 上层仍收到 Success。
+}
+```
+
+大白话总结：readinessProbe 使用 HTTP 探测时，这条链判断的是“这一次探测成功没有”。它不懂你的业务承诺。真正决定 Pod 是否加入 Service 流量的后续状态链，第 13 课已经讲过；本课只抓住和事故直接相关的判断边界。
+
+### 1.2 不熟 Go：只补这段源码真正用到的 Go 语法
+
+| 写法 | 大白话 |
+|---|---|
+| `if 条件 { ... }` | 条件成立才执行大括号里的代码；Go 不要求给条件加小括号 |
+| `&&` | “而且”。状态码既要大于等于 200，又要小于 400 |
+| `switch result` / `case` | 根据 `result` 的不同值走不同分支，类似 Java 的 `switch` |
+| `:=` | 第一次创建局部变量并自动推断类型；本段截取里没有出现，但读前后文会看到 |
+| `return a, b, c` | Go 函数可以一次返回多个值；这里依次是探测结论、响应内容、错误 |
+| `nil` | “没有对象/没有错误”的空值；这里的 `nil` 表示没有额外 Go 错误，不代表业务一定健康 |
+
+### 1.3 第一遍学完，只先记住六个判断
+
+1. `Running` 不是“模型可用”，它只说明容器进程已经起来。
+2. `Ready` 不是“性能达标”，它只说明你配置的 readiness 条件通过。
+3. `/health 200` 不是一次真实推理成功，更不是 p99 达标。
+4. 请求慢时，要分清它在等待队列、prefill，还是 decode。
+5. 显存不能只看模型权重，KV cache 和临时计算也会占显存。
+6. 真正的交付标准在第 6 站：用户看到的成功率、TTFT、ITL 和输出是否达到 SLO。
+
+### 1.4 这章很长，正确读法是两遍
+
+- 第一遍只读第 0～7 节中的主线、图和“大白话总结”，然后做第 20.1 节。目标是能讲清六站，不背参数和命令。
+- 第二遍再读第 8～18 节的配置、指标、发布、安全和取证，然后做第 20.3 节。目标才是独立值班。
+- 某个英文词忘了，先回看它第一次出现处的翻译；不要为了一个词跳进 CUDA 或调度算法深处。
 
 ---
 
@@ -94,21 +164,23 @@ Java 经验可以帮助建立类比，但不能替换 GPU 推理事实：
 
 ### 2.1 本课版本账本
 
+为什么先记版本？因为你在博客里看到的函数名、默认参数和指标，换一个 vLLM 版本就可能变。`tag` 是人容易读的发布标签，例如 `v0.25.0`；`commit` 是唯一指向一份源码快照的完整编号；镜像 `digest` 是容器镜像内容的指纹；模型 `revision` 是模型仓库里的固定版本。排障时同时固定这四类身份，才不会把不同工件混成一个问题。
+
 | 项目 | 冻结值 | 运维意义 |
 |---|---|---|
 | vLLM release | `v0.25.0` | 参数、指标、源码函数以该 tag 为准 |
 | 发布时间 | `2026-07-11` | 本课核对日只晚三天，仍不得把 main 分支混入 |
-| tag commit | `702f481` | 源码链接优先用 tag；审计时记录 commit |
+| tag commit | `702f4814fe54fabff350d43cb753ae3e47c0c276` | 人读版本认 tag，源码链接固定完整 commit，避免 tag 漂移或短号撞车 |
 | 核对日期 | `2026-07-14` | 后续读者必须主动检查是否已有行为变化 |
 | dense 默认 runner | Model Runner V2 | 源码入口是 `vllm/v1/worker/gpu/model_runner.py` |
 | `gpu_memory_utilization` 默认 | `0.92` | 只是默认，不是所有生产模型的推荐值 |
-| 示例服务镜像 | `vllm/vllm-openai:v0.25.0` 的 amd64 manifest digest | 固定示例工件；落地前仍验证架构、driver、CUDA 和 SBOM |
+| 示例服务镜像 | `vllm/vllm-openai@sha256:e1c1ff1af9a15921bfa11d1d95047258c1797392cdbfa296e7639da446b23f97`（amd64） | 固定示例工件；落地前仍验证架构、driver、CUDA 和 SBOM |
 | 示例模型 | `Qwen/Qwen3-0.6B`，revision `9d4bfd9a94aa5f2ab18d77fa457c306da0b8e439` | 用于讲部署结构，不代表生产容量或质量基线 |
 
 release 入口：
 
 - [vLLM v0.25.0 release](https://github.com/vllm-project/vllm/releases/tag/v0.25.0)
-- [vLLM v0.25.0 固定 tag 源码树](https://github.com/vllm-project/vllm/tree/v0.25.0)
+- [vLLM v0.25.0 固定提交源码树](https://github.com/vllm-project/vllm/tree/702f4814fe54fabff350d43cb753ae3e47c0c276)
 
 ### 2.2 证据优先级
 
@@ -143,6 +215,10 @@ GPU产品与driver
 - Model Runner V2 成为所有 dense model 的默认 runner。
 - legacy PagedAttention 实现已移除。
 
+这里先翻译三个词：`dense model` 是每次计算基本都会经过整套主要参数的稠密模型，与只挑部分专家参与的 MoE 模型相对；`Model Runner` 是 Worker 内真正准备输入并执行模型的一层；`legacy` 是为了旧版本兼容而保留的老实现。
+
+`PagedAttention` 是某一套历史注意力实现的名字；`paged KV cache` 则是把 KV cache 分成一块一块来管理的思路。**删掉旧实现，不等于“分块管理 KV cache”这个思路消失。** 可以类比：换掉旧版文件系统驱动，不等于磁盘不再分块管理。
+
 这两句话要精确理解：
 
 | 正确说法 | 错误说法 |
@@ -163,57 +239,42 @@ GPU产品与driver
 
 ### 3.1 组件分层
 
-官方架构文档把在线服务拆成 API server 与 Engine Core。结合 `v0.25.0` 源码，可以画成：
+先消除一个容易混淆的名字：本节的 **API server 是 vLLM 接收 HTTP 请求的入口**，不是 Kubernetes API Server。
 
-```text
-Client / Gateway
-  |
-  | HTTP, auth, request validation, streaming
-  v
-OpenAI-compatible API server
-  |
-  | renderer / tokenizer / input processor
-  | AsyncLLM.add_request()
-  v
-Engine Core client / ZMQ transport
-  |
-  v
-EngineCore.add_request()
-  |
-  v
-Scheduler waiting queue
-  |
-  | 每个step: schedule()
-  v
-Executor -> one or more GPU Workers
-  |
-  v
-MRv2 GPUModelRunner.execute_model()
-  |
-  | logits / sampled tokens
-  v
-Scheduler.update_from_output()
-  |
-  v
-Async output processor / detokenizer / stream
-  |
-  v
-Client receives first token ... final token
+读图规则：从左往右是请求进入系统的方向；从右往左是生成结果返回用户的方向；“等待队列”是还没拿到本轮 GPU 计算机会的请求集合。
+
+```mermaid
+flowchart LR
+    C["用户或 Java 业务"] -->|"HTTP 请求"| G["网关 / Ingress<br/>认证、限流、转发"]
+    G -->|"OpenAI 格式请求"| A["vLLM API server<br/>校验、切 token、流式连接"]
+    A -->|"加入请求"| Q["Engine Core 等待队列"]
+    Q -->|"Scheduler 每一步重新挑选"| W["Worker / Model Runner"]
+    W -->|"在 GPU 上计算"| GPU["GPU"]
+    GPU -->|"本步生成结果"| W
+    W -->|"更新请求进度"| Q
+    Q -->|"输出 token"| A
+    A -->|"流式返回"| C
 ```
+
+整条链可以先记成：**HTTP 入口收件 → Engine Core 排队和派活 → Worker 使用 GPU 计算 → 结果再流回用户**。
 
 责任边界：
 
 | 层 | 主要职责 | 常见瓶颈/故障 |
 |---|---|---|
-| Gateway/Ingress | TLS、租户认证、配额、限流、请求大小、客户端连接 | 5xx、限流、连接排队、流式缓冲 |
-| API server | 协议、参数校验、模板、tokenization、多模态预处理、stream | CPU 饥饿、事件循环阻塞、模板错误 |
-| AsyncLLM/transport | 请求生命周期、异步输出、Engine Core 通信 | core death、队列/IPC、输出消费者慢 |
-| Scheduler/KV manager | admission、token budget、KV block、preemption | waiting 增长、capacity/deferred、KV 压力 |
-| Executor/Worker | 分布式执行、设备初始化、模型加载、KV 分配 | CUDA/NCCL、设备映射、worker crash |
-| MRv2 model runner | forward、sampling、compile/warm-up/graph | kernel、activation 峰值、graph capture |
-| GPU/driver/fabric | 计算、HBM、PCIe/NVLink、collective | Xid/ECC、带宽、拓扑、reset |
+| 网关 / Ingress | 做认证、限流和转发；可以把它看成服务门口 | 5xx、被限流、连接在门口排队 |
+| vLLM API server | 校验参数，把文字切成 token，并保持流式连接 | CPU 忙、模板错误、返回流被堵住 |
+| Engine Core | 维护请求的一生，协调调度和执行 | 核心进程死亡、内部通信中断 |
+| Scheduler / KV manager | Scheduler 是“派活的人”；KV manager 是“上下文显存账本管理员” | 等待队列增长、KV cache 不够、请求被暂停让路 |
+| Executor / Worker | Executor 组织一个或多个 Worker；Worker 是真正使用 GPU 的工作进程 | CUDA、跨卡通信或 Worker 崩溃 |
+| Model Runner | 在 Worker 内准备输入、执行模型、选出下一个 token | 临时显存峰值、编译或计算异常 |
+| GPU / driver / fabric | GPU 负责算，driver 负责让程序使用设备，fabric 是卡间连接 | Xid/ECC 硬件错误、带宽或拓扑问题 |
+
+上表中的 `CUDA` 是程序使用 NVIDIA GPU 的计算平台；`NCCL` 是多张 GPU 之间传数据常用的通信库；`HBM` 就是 GPU 上的高速显存。它们先认识作用即可，本课不要求读实现。
 
 ### 3.2 关键源码入口
+
+读函数名前先认对象：`AsyncLLM` 是 API 进程里的异步外壳，负责提交请求和接收流式结果；`EngineCore` 是不断调度和执行的核心循环；`Scheduler` 是派活者；`Executor` 是协调 Worker 的执行层；`GPUModelRunner` 是 Worker 里真正准备并执行模型的部分。`renderer/tokenizer/input processor` 则负责把用户输入模板化、切成 token，并整理成引擎能接收的结构。
 
 | 调用点 | 固定源码 | 阅读时要回答的问题 |
 |---|---|---|
@@ -232,35 +293,55 @@ Client receives first token ... final token
 
 固定源码：
 
-- [api_server.py @ v0.25.0](https://github.com/vllm-project/vllm/blob/v0.25.0/vllm/entrypoints/openai/api_server.py)
-- [async_llm.py @ v0.25.0](https://github.com/vllm-project/vllm/blob/v0.25.0/vllm/v1/engine/async_llm.py)
-- [core.py @ v0.25.0](https://github.com/vllm-project/vllm/blob/v0.25.0/vllm/v1/engine/core.py)
-- [scheduler.py @ v0.25.0](https://github.com/vllm-project/vllm/blob/v0.25.0/vllm/v1/core/sched/scheduler.py)
-- [gpu_worker.py @ v0.25.0](https://github.com/vllm-project/vllm/blob/v0.25.0/vllm/v1/worker/gpu_worker.py)
-- [MRv2 gpu/model_runner.py @ v0.25.0](https://github.com/vllm-project/vllm/blob/v0.25.0/vllm/v1/worker/gpu/model_runner.py)
+- [api_server.py @ 固定提交](https://github.com/vllm-project/vllm/blob/702f4814fe54fabff350d43cb753ae3e47c0c276/vllm/entrypoints/openai/api_server.py)
+- [async_llm.py @ 固定提交](https://github.com/vllm-project/vllm/blob/702f4814fe54fabff350d43cb753ae3e47c0c276/vllm/v1/engine/async_llm.py)
+- [core.py @ 固定提交](https://github.com/vllm-project/vllm/blob/702f4814fe54fabff350d43cb753ae3e47c0c276/vllm/v1/engine/core.py)
+- [scheduler.py @ 固定提交](https://github.com/vllm-project/vllm/blob/702f4814fe54fabff350d43cb753ae3e47c0c276/vllm/v1/core/sched/scheduler.py)
+- [gpu_worker.py @ 固定提交](https://github.com/vllm-project/vllm/blob/702f4814fe54fabff350d43cb753ae3e47c0c276/vllm/v1/worker/gpu_worker.py)
+- [MRv2 gpu/model_runner.py @ 固定提交](https://github.com/vllm-project/vllm/blob/702f4814fe54fabff350d43cb753ae3e47c0c276/vllm/v1/worker/gpu/model_runner.py)
 
-### 3.3 源码主循环：运维上最值得记住的五行
+### 3.3 第一段 vLLM Python 源码：一次 `step` 到底做什么
 
-把 `EngineCore.step()` 压缩成伪代码：
+从这里开始切换项目：下面不是 Kubernetes Go，而是 **`vllm-project/vllm` 项目的 Python 源码**。固定版本为 `v0.25.0`，完整提交为 `702f4814fe54fabff350d43cb753ae3e47c0c276`，文件为 `vllm/v1/engine/core.py` 第 486～508 行。摘录保持连续，只增加逐行中文注释。
 
 ```python
-def step():
-    scheduler_output = scheduler.schedule()
-    future = model_executor.execute_model(scheduler_output, non_block=True)
-    model_output = future.result()
-    engine_core_outputs = scheduler.update_from_output(
-        scheduler_output, model_output
-    )
-    return engine_core_outputs
+# Check for any requests remaining in the scheduler - unfinished,  # 先看调度器里是否还有没结束的请求，
+# or finished and not yet removed from the batch.  # 也包括已经结束但尚未从当前批次移走的请求。
+if not self.scheduler.has_requests():  # 如果一个请求都没有，GPU 本轮不需要工作。
+    return {}, False  # 返回空结果；False 表示本轮没有执行模型。
+scheduler_output = self.scheduler.schedule(self._should_throttle_prefills())  # 调度器决定本轮让哪些请求算多少 token。
+future = self.model_executor.execute_model(scheduler_output, non_block=True)  # 把本轮任务交给模型执行器；先拿到一个“稍后给结果”的 Future。
+grammar_output = self.scheduler.get_grammar_bitmask(scheduler_output)  # 准备结构化输出可能需要的约束；普通请求也会经过这个接口。
+with (  # 进入两个保护范围：出错时留细节，同时记录本轮耗时和请求数量。
+    self.log_error_detail(scheduler_output),  # 第一个保护范围负责补充错误证据。
+    self.log_iteration_details(scheduler_output),  # 第二个保护范围负责记录本轮执行详情。
+):  # 两个保护范围从这里开始生效。
+    model_output = future.result()  # 等 Worker/GPU 把本轮模型计算结果交回来。
+    if model_output is None:  # 某些执行方式先完成模型计算，但还没有完成选 token。
+        model_output = self.model_executor.sample_tokens(grammar_output)  # 再根据模型分数和输出约束选出 token。
+# Before processing the model output, process any aborts that happened  # 处理模型结果前，先处理计算期间发生的请求取消，
+# during the model execution.  # 避免把已经取消的请求继续当作活跃请求。
+self._process_aborts_queue()  # 从取消队列中取出并终止这些请求。
+engine_core_outputs = self.scheduler.update_from_output(  # 用本轮输出更新每个请求的进度、状态和下一轮资格。
+    scheduler_output, model_output  # 同时交给它“本轮安排”和“本轮实际结果”。
+)  # 更新完成。
+return engine_core_outputs, scheduler_output.total_num_scheduled_tokens > 0  # 返回可向上游发送的结果，并说明本轮是否真的安排了 token。
 ```
 
-这段伪代码解释了几个现象：
+大白话总结：Engine Core 不是让一个 HTTP 请求独占 GPU 一直跑到结束。它不断重复四件事：**挑本轮工作 → 交给 GPU → 收回本轮结果 → 更新队列**。因此，请求可以在到达 GPU 前排队；而且 GPU 很忙也不代表每个用户都很快。
 
-- queue 增长可能发生在 GPU forward 之前。
-- 一次 `execute_model` 不是“一个 HTTP 请求从头跑到尾”。
-- scheduler 的选择会影响 TTFT 与 decode 流畅度。
-- GPU utilization 只是 execute 部分的观测，不能覆盖 tokenizer、queue、transport 和输出消费。
-- worker 或 collective 失效会向上破坏 Engine Core，但 `/health` 是否及时反映取决于错误是否已被 client/core 识别。
+这一段只补会用到的 Python 语法：
+
+| 写法 | 大白话 |
+|---|---|
+| `self.xxx` | 当前这个 `EngineCore` 对象里保存的成员，类似 Java 的 `this.xxx` |
+| `if not ...` | 如果后面的条件不成立 |
+| `a, b = ...` 或一次 `return a, b` | Python 可以一次接收或返回多个值 |
+| `Future` | 先给你一张“结果稍后回来”的取件单；`future.result()` 才真正取结果 |
+| `with (...)` | 临时进入一个受管理的范围，结束时自动做收尾；这里用于错误和耗时记录 |
+| `None` | 没有值，作用接近 Java 的 `null`，但要结合该函数约定理解 |
+
+`sample_tokens` 的意思是“从模型给出的候选分数里选出接下来输出的 token”。`grammar bitmask` 是结构化输出限制用的一张允许/禁止表；它不是本课主线，知道作用即可。
 
 ### 3.4 prefill、decode 与 continuous batching
 
@@ -268,10 +349,23 @@ def step():
 
 | 工作 | 输入 | 主要产出 | 常见敏感项 |
 |---|---|---|---|
-| prefill | 整段 prompt tokens | 首次可用于生成的上下文/KV | prompt 长度、attention 计算、TTFT |
+| prefill | 整段 prompt tokens | 首次可用于生成的上下文/KV | prompt 长度、注意力计算、TTFT |
 | decode | 已有上下文 + 新生成 token | 下一 token | 并发序列、KV 访问、ITL/TPOT |
 
-但当前 scheduler 内部不是两个互斥大阶段。源码注释的核心含义是：
+这里的“注意力计算”，可以先理解为模型把当前 token 和前文关系算一遍；它不是“监控告警”的注意力。
+
+但当前 Scheduler 内部不是“先把所有人的 prefill 都做完，再统一 decode”这两个互斥大阶段。它每一步都会重新看请求进度。读图规则：从上到下是时间推进；实线箭头表示同一个请求进入下一步；虚线箭头表示新请求中途加入。
+
+```mermaid
+flowchart TB
+    Q["等待队列：A、B、C"] --> N["Step N<br/>A prefill；B decode；C 等待"]
+    N --> N1["Step N+1<br/>A decode；B decode；C prefill"]
+    D["新请求 D 到达"] -. "中途加入" .-> N1
+    N1 --> N2["Step N+2<br/>B 完成退出；A/C decode；D prefill"]
+    N2 --> N3["Step N+3<br/>调度器再次按 token 预算和 KV 空间重组"]
+```
+
+源码注释的核心含义是：
 
 ```text
 每个请求记录num_computed_tokens
@@ -280,6 +374,8 @@ def step():
 调度器在本步预算内分配token
 因此同一步可以包含多个请求、不同工作形态和chunked prefill
 ```
+
+`token budget` 是“本轮最多允许计算多少 token”的额度；`chunked prefill` 是把很长的 prompt 拆成几轮处理，避免一个长请求一次吃掉整轮预算。
 
 continuous batching 不是：
 
@@ -310,16 +406,29 @@ step N+2:
 
 ### 4.1 从 Pod 资源声明到进程可见设备
 
-最简链路：
+这一节是在把第 14～16 课的 GPU 分配链接到 vLLM，不重新深挖那些源码。读图规则：从左往右是 Pod 从“声明要卡”到“进程能用卡”的顺序；每条箭头表示前一步把结果交给下一步，并不是组件之间都直接互相调用。
 
-```text
-Pod limits: nvidia.com/gpu: 1
-  -> scheduler只选有可分配扩展资源的Node
-  -> kubelet DeviceManager调用Device Plugin Allocate
-  -> runtime/CDI注入设备、库和环境
-  -> 容器内vLLM看到一个逻辑CUDA设备
-  -> Worker.init_device()选择该可见设备
+```mermaid
+flowchart LR
+    P["Pod 声明<br/>limits: nvidia.com/gpu: 1"] --> S["scheduler<br/>挑一台还有 GPU 名额的 Node"]
+    S --> K["该 Node 的 kubelet<br/>开始创建 Pod"]
+    K --> D["DeviceManager 调 Device Plugin Allocate<br/>询问应注入哪张卡"]
+    D --> R["容器运行时 / CDI<br/>把设备、驱动库和环境交给容器"]
+    R --> V["vLLM Worker<br/>看到一个可用的逻辑 CUDA 设备"]
 ```
+
+这几个名字只要先记作用：
+
+| 名字 | 大白话 |
+|---|---|
+| `nvidia.com/gpu` | NVIDIA Device Plugin 向 Kubernetes 登记的一种“GPU 名额” |
+| 扩展资源 | 不属于内置 CPU、内存，由设备插件额外登记的资源名 |
+| DeviceManager | kubelet 里面管设备分配的模块 |
+| Device Plugin | 厂商在节点上运行的设备管家，报告可用设备并回答如何分配 |
+| `Allocate` | Device Plugin 的“请告诉我怎样把已选设备交给容器”接口 |
+| 容器运行时 | 真正创建容器的程序，例如 containerd |
+| CDI | 一种标准设备描述方式，让运行时知道要加入哪些设备节点、库或环境 |
+| 逻辑 CUDA 设备 | 容器自己能看到的 GPU 编号集合，不等于宿主机原始编号 |
 
 关键边界：
 
@@ -331,16 +440,16 @@ Pod limits: nvidia.com/gpu: 1
 
 ### 4.2 Pod、进程、GPU 与 parallel rank
 
-官方架构对默认进程拓扑给出一个重要关系：每个 Engine Core 的 worker 数通常与 `TP × PP` 对应，DP 则有多个 Engine Core/rank。
+`parallel` 是“并行”，也就是多张 GPU 一起工作；`rank` 是每个参与进程在这个团队里的编号，类似“1 号工位、2 号工位”。官方架构对默认进程拓扑给出一个重要关系：每个 Engine Core 的 Worker 数通常与 `TP × PP` 对应，DP 则有多个 Engine Core/rank。
 
 生产上可用下面的近似映射理解：
 
 | 模式 | 主要目标 | GPU/进程关系 | Kubernetes 常见承载 |
 |---|---|---|---|
 | 单 GPU | 最简单、模型能放下 | 1 worker / 1 GPU | 1 Pod 请求 1 GPU |
-| TP | 一层张量切到多卡，解决单卡放不下或提速 | 同一请求频繁 collective | 常见为 1 Pod 请求同节点多 GPU |
-| PP | 模型层分到多个 stage | stage 间传 activation | 可跨节点，但启动、网络和调度更复杂 |
-| DP | 多个模型副本处理不同请求 | 每 rank 有自己的 Engine Core/副本语义 | 多 Pod 或受控分布式拓扑 |
+| TP（张量并行） | 把同一层的大计算切给多张卡，常用来解决单卡放不下 | 同一个请求需要多卡频繁一起通信 | 常见为 1 Pod 请求同节点多 GPU |
+| PP（流水线并行） | 把模型的不同层放到不同卡，像流水线工位 | 上一段要把中间结果传给下一段 | 可以跨节点，但启动、网络和调度更复杂 |
+| DP（数据并行） | 放多份模型副本，让不同副本处理不同请求 | 每份副本有自己的 Engine Core | 多 Pod 或受控的分布式拓扑 |
 
 普通 `Deployment replicas: 4` 只会产生四个独立 Pod。它不会自动：
 
@@ -352,6 +461,8 @@ Pod limits: nvidia.com/gpu: 1
 - 建立安全的跨节点内部通信。
 
 跨节点 vLLM 必须显式设计 launcher/cluster runtime、head/worker 生命周期、服务发现、端口、RBAC、NetworkPolicy、failure domain 和整体回滚。本课部署模板故意采用独立单 GPU 副本。
+
+上面这一句里的高级词先翻译，不要求现在实现：`launcher/cluster runtime` 是负责拉起和协调多机进程的总管；`head` 是协调者，`worker` 是执行者；`process group` 是需要一起通信的一组 GPU 进程；`gang scheduling` 是“所需成员要么一起拿到资源，要么先都别启动”；`failure domain` 是可能一起故障的范围，例如同一节点或同一机架。`RBAC` 控制谁能调用 Kubernetes API，`NetworkPolicy` 控制 Pod 之间哪些网络连接被允许。
 
 ### 4.3 GPU 之外的资源也能卡死在线推理
 
@@ -367,13 +478,15 @@ Pod limits: nvidia.com/gpu: 1
 
 `emptyDir.medium: Memory` 提供的 `/dev/shm` 会计入 Pod/容器的内存使用，不能把它当免费 GPU 显存。
 
+读这张表需要的翻译：CPU `throttling` 是容器用完 CPU 配额后被迫放慢；`run queue` 是等 CPU 的任务队列；`pinned memory` 是为 GPU 传输固定住的主机内存；`cgroup OOM` 是容器越过主机内存限制后被内核杀掉；`ephemeral storage` 是 Pod 的临时磁盘；`inode` 是文件系统记录文件的名额；PVC 是挂给 Pod 的持久卷；`/dev/shm` 是进程间共享内存区；`IPC` 是进程间通信；GPU `fabric/topology` 是多卡之间通过 PCIe、NVLink 等怎样连接；`retransmit` 是网络丢包后重传。
+
 ---
 
 ## 5. 模型启动：从进程创建到真正 Ready
 
 ### 5.1 启动阶段账本
 
-一个可用于探针与故障定位的阶段表：
+一个可用于探针与故障定位的阶段表。表格从上往下读：上一步完成后才进入下一步；最早失败在哪一行，排查就先停在哪一行。
 
 | 阶段 | 主要动作 | 典型资源 | 常见失败 |
 |---|---|---|---|
@@ -387,6 +500,8 @@ Pod limits: nvidia.com/gpu: 1
 | S7 compile/warm-up | 编译、kernel warm-up、graph capture | GPU、CPU、cache | compile 慢、graph OOM、cache 权限 |
 | S8 server ready | Engine Core handshake 完成，路由可响应 | IPC/ZMQ、HTTP | core dead、port/bind |
 | S9 首个真实请求 | tokenization、schedule、prefill、decode | 全链路 | SLO/模型模板/输出异常 |
+
+表里第一次出现的词，先翻译：`image pull` 是拉容器镜像，`volume mount` 是挂载存储，`registry` 是镜像仓库；`CLI/config` 是启动命令和配置；`revision` 是固定的模型版本号；`shard` 是权重分片；`compile` 是把某些计算准备成机器更容易执行的形式；`warm-up` 是正式接流量前先跑几次，把懒加载和准备动作做完；`handshake` 是两个进程先互相确认“我已就绪”；`ZMQ` 是 vLLM 进程之间使用的一种消息通信工具；`bind` 是程序占用并监听端口。
 
 源码中的 `EngineCore.__init__()` 先构造 executor，再通过 `_initialize_kv_caches()`：
 
@@ -444,6 +559,36 @@ startup budget
 
 固定版本的 health handler 调用 engine client 的 `check_health()`。`AsyncLLM.check_health()` 的核心语义是：如果 engine 已进入 errored 状态则抛错，否则返回。
 
+直接看证据。下面仍是 **`vllm-project/vllm` 项目的 Python 源码**，版本 `v0.25.0`，完整提交 `702f4814fe54fabff350d43cb753ae3e47c0c276`。第一段来自 `vllm/entrypoints/serve/instrumentator/health.py` 第 22～33 行，保持连续并逐行加中文注释：
+
+```python
+@router.get("/health", response_class=Response)  # 把下面这个函数注册成 HTTP GET /health 接口。
+async def health(raw_request: Request) -> Response:  # 定义异步健康检查函数，输入是 HTTP 请求，输出是 HTTP 响应。
+    """Health check."""  # 原源码说明：这是健康检查。
+    client = engine_client(raw_request)  # 从 Web 应用状态里取出 Engine Client。
+    if client is None:  # 如果这是只有渲染功能、没有推理引擎的特殊服务。
+        # Render-only servers have no engine; they are always healthy.  # 原源码说明：这类服务没有引擎，直接视为健康。
+        return Response(status_code=200)  # 直接返回 HTTP 200。
+    try:  # 尝试检查引擎健康；若抛出指定异常，就走下面的 except。
+        await client.check_health()  # 等待 Engine Client 完成它定义的健康检查。
+        return Response(status_code=200)  # 没抛出 EngineDeadError，就返回 200。
+    except EngineDeadError:  # 只有捕获到“引擎已死”这类异常时进入这里。
+        return Response(status_code=503)  # 返回 503，表示服务当前不可用。
+```
+
+`check_health()` 本身更短，来自 `vllm/v1/engine/async_llm.py` 第 900～903 行：
+
+```python
+async def check_health(self) -> None:  # 定义异步健康检查；正常结束时不返回业务数据。
+    logger.debug("Called check_health.")  # 只记录一次调用日志。
+    if self.errored:  # 如果 AsyncLLM 已经记录为错误/死亡状态。
+        raise self.dead_error  # 抛出死亡异常，让上面的 /health 返回 503。
+```
+
+大白话总结：这两段源码只问“vLLM 已经知道引擎死了吗”。它没有构造 prompt，没有进入 Scheduler，没有占用 KV cache，也没有等首 token。因此它不可能单独证明“模型答案正确”“现在还能接多少请求”或“TTFT 达标”。
+
+这里的 `@router.get(...)` 是装饰器，可以先理解成“给函数贴上 `/health` 路由标签”；`async def` 表示异步函数；`await` 表示等一个异步结果回来；`try/except` 类似 Java 的 `try/catch`。完整 Python 补课在第 16 节。
+
 所以 `/health 200` 可以支持：
 
 - server 路由能响应；
@@ -462,16 +607,16 @@ startup budget
 
 固定源码：
 
-- [health.py @ v0.25.0](https://github.com/vllm-project/vllm/blob/v0.25.0/vllm/entrypoints/serve/instrumentator/health.py)
-- [AsyncLLM.check_health() @ v0.25.0](https://github.com/vllm-project/vllm/blob/v0.25.0/vllm/v1/engine/async_llm.py)
+- [health.py @ 固定提交](https://github.com/vllm-project/vllm/blob/702f4814fe54fabff350d43cb753ae3e47c0c276/vllm/entrypoints/serve/instrumentator/health.py)
+- [AsyncLLM.check_health() @ 固定提交](https://github.com/vllm-project/vllm/blob/702f4814fe54fabff350d43cb753ae3e47c0c276/vllm/v1/engine/async_llm.py)
 
 ### 5.4 startup、readiness、liveness 的正确分工
 
 | Probe | 失败动作 | 本课建议语义 | 错用后果 |
 |---|---|---|---|
-| startup | 达阈值后重启容器 | 冷启动是否在预算内完成 | 下载/编译未完成就循环重启 |
-| readiness | 从 Service endpoint 摘流量 | 当前实例是否允许接新请求 | 把容量问题变成流量抖动或雪崩 |
-| liveness | 达阈值后重启容器 | 引擎失活且重启有恢复价值 | 队列高时杀进程，放大失败 |
+| startup（启动探针） | 达阈值后重启容器 | 冷启动是否在预算内完成 | 下载/编译未完成就循环重启 |
+| readiness（就绪探针） | 从 Service endpoint 摘流量 | 当前实例是否允许接新请求 | 把容量问题变成流量抖动或雪崩 |
+| liveness（存活探针） | 达阈值后重启容器 | 引擎失活且重启有恢复价值 | 队列高时杀进程，放大失败 |
 
 startup probe 成功前，Kubernetes 会抑制 liveness/readiness；因此它适合保护长启动。
 
@@ -511,6 +656,8 @@ prober worker产生结果
 
 不要误讲成“probe worker 直接调用 CRI kill”。
 
+这里的 `endpoint` 是 Service 可以转发到的 Pod 地址；“摘流量”就是暂时从这个地址列表中移除。`threshold` 是连续成功/失败次数门槛；`termination grace` 是给进程优雅退出的宽限时间；CRI 是 kubelet 调用容器运行时的接口。
+
 ### 5.5 readiness 不是容量自动控制器
 
 以下条件不应默认让 readiness 失败：
@@ -543,11 +690,30 @@ readiness 更适合表达“实例不能安全接新流量”的离散状态，�
 
 ---
 
-## 6. 显存账本：`gpu_memory_utilization` 绝不是“KV cache 百分比”
+## 6. 显存账本：权重只是第一行
 
 ### 6.1 一张卡上的主要显存科目
 
-先用预算式建立边界：
+先别算公式，把一张 GPU 显存想成一个固定大小的仓库。模型权重只是仓库里最大的一批固定货物，运行时还要留出工作台、上下文笔记和安全通道。
+
+读图规则：上半部分的箭头表示“总显存被分给哪些用途”；下半部分的箭头表示“请求变长或变多后，KV cache 如何挤掉安全余量”。
+
+```mermaid
+flowchart TB
+    T["GPU 总显存 / HBM"] --> D["驱动和 CUDA 上下文<br/>程序使用 GPU 的基础开销"]
+    T --> W["模型权重<br/>模型的固定参数"]
+    T --> A["activation / workspace<br/>本轮计算的中间结果和临时工作区"]
+    T --> K["KV cache<br/>活跃请求的上下文笔记"]
+    T --> G["CUDA Graph / 通信缓冲<br/>加速和多卡通信占用"]
+    T --> H["安全余量<br/>应对峰值和碎片"]
+
+    R["请求更多或 prompt 更长"] --> L["活跃 token 增多"]
+    L -->|"需要更多上下文笔记"| K
+    K -->|"同一张卡上此消彼长"| H
+    H -->|"余量接近 0"| O["下一次显存申请可能 CUDA OOM"]
+```
+
+再用预算式建立边界：
 
 ```text
 M_GPU_total
@@ -563,19 +729,21 @@ M_GPU_total
   + M_safety_headroom
 ```
 
-这不是 vLLM 内部的一个精确等式，而是运维容量账本。每项的意义：
+这不是 vLLM 内部真的执行的一条公式，而是运维人员用来防漏项的容量账本。每项的意义：
 
-| 科目 | 受什么影响 | 为什么常被漏掉 |
+| 科目 | 大白话作用 | 为什么常被漏掉 |
 |---|---|---|
-| driver/context | CUDA context、库、进程数 | 不在模型参数量里 |
-| weight shard | 参数量、dtype、quant、TP/PP | “参数量 × 2 bytes”只是粗估 |
-| activation/workspace | batch/token budget、kernel、模型结构 | profile 或首个大请求才出现峰值 |
-| KV cache | 活跃 cached tokens、层数、KV heads、head dim、KV dtype、sharding | 随并发和上下文增长 |
-| CUDA Graph | capture shape、runner/config | warm-up 时才分配 |
-| collective buffer | TP/PP/DP、NCCL | 单卡实验里没有 |
-| allocator reserve/fragmentation | 分配历史、size class、并发 | `reserved != allocated` |
-| multimodal/feature cache | 输入类型、encoder、LoRA 等 | 纯文本基线无法覆盖 |
-| safety headroom | 驱动抖动、版本、异常输入 | 被“榨满显存”目标吃掉 |
+| driver / context | 驱动和 CUDA 为这个进程准备的基础环境 | 它不属于模型参数，却照样占显存 |
+| weight shard | 当前 GPU 保存的那一份模型权重；`shard` 就是“分片” | 只用“参数量 × 每个参数字节数”会漏掉额外数据和未切分部分 |
+| activation / workspace | 本轮计算产生的中间结果和临时工作台 | 通常到 profile 或大请求时才出现峰值 |
+| KV cache | 为活跃请求保存的上下文计算笔记 | 请求越多、上下文越长，通常占得越多 |
+| CUDA Graph | 把常用 GPU 执行路径预先录下来，后面少做重复准备 | 多在 warm-up 时申请，所以只看权重加载日志会漏掉 |
+| collective buffer | 多 GPU 交换数据时使用的缓冲区；`collective` 是多卡一起参加的一类通信 | 单卡测试里没有，多卡上线后才出现 |
+| allocator reserve / fragmentation | 显存分配器预留的空间和“有空位却拼不出所需连续形状”的碎片 | 已分配值不等于已预留值，历史分配也会影响结果 |
+| multimodal / feature cache | 图片、语音、LoRA 等额外功能需要的缓存 | 纯文本基线测不到 |
+| safety headroom | 故意不分完的安全余量 | 一味追求“显存吃满”会把它挤掉 |
+
+几个容易卡住的新词：`dtype` 是每个数字用什么数据格式保存，决定大约占几个字节；`quantization`（量化）是用更低精度保存或计算以节省资源；`profile` 是用一次受控运行测出峰值；`kernel` 在这里是 GPU 上执行的一小段计算程序，不是 Linux 内核。
 
 权重的第一阶估算：
 
@@ -588,14 +756,14 @@ M_weights_rough
 
 但这些会让估算偏离：
 
-- quantization scale、zero point 和 metadata；
+- 量化还要保存 scale、zero point 和 metadata，也就是还原数值所需的比例、零点和说明数据；
 - 未被切分或被复制的层；
-- vocabulary、embedding、lm head 的特殊处理；
-- padding、alignment、tied weights；
-- offload 与 host staging；
-- loader 临时峰值；
+- 词表、把 token 变成向量的 embedding、输出层 lm head 的特殊处理；
+- 为方便硬件计算而补齐的 padding、对齐空间，以及多处共用的一份 tied weights；
+- offload（把部分数据放到主机内存）与 host staging（主机侧中转区）；
+- loader（权重加载器）装载时的临时峰值；
 - PP 的不均匀层切分；
-- MoE expert placement。
+- MoE 模型把不同专家层放到哪些 GPU 上。
 
 KV cache 的一阶关系：
 
@@ -610,7 +778,7 @@ M_KV_rough
     ÷ effective_KV_sharding
 ```
 
-它适合回答“什么变量会增大显存”，不适合替代固定模型在固定版本上的 profile 和压测。
+这里的 `KV heads` 和 `head dim` 是模型结构决定的“有多少组上下文信息、每组多宽”，运维不需要推导算法；只需知道它们会影响每个 token 的 KV 成本。这个粗略关系适合回答“什么变量会增大显存”，不适合替代固定模型、固定版本上的 profile 和压测。
 
 ### 6.2 `gpu_memory_utilization` 的准确语义
 
@@ -652,7 +820,7 @@ gpu_memory_utilization: float = Field(default=0.92, gt=0, le=1)
 固定官方 API：
 
 - [CacheConfig @ v0.25.0](https://docs.vllm.ai/en/v0.25.0/api/vllm/config/cache/)
-- [cache.py @ v0.25.0](https://github.com/vllm-project/vllm/blob/v0.25.0/vllm/config/cache.py)
+- [cache.py @ 固定提交](https://github.com/vllm-project/vllm/blob/702f4814fe54fabff350d43cb753ae3e47c0c276/vllm/config/cache.py)
 
 ### 6.3 `kv_cache_memory_bytes` 的覆盖关系
 
@@ -700,8 +868,8 @@ gpu_memory_utilization: float = Field(default=0.92, gt=0, le=1)
 固定源码：
 
 - [ModelConfig @ v0.25.0](https://docs.vllm.ai/en/v0.25.0/api/vllm/config/model/)
-- [model.py @ v0.25.0](https://github.com/vllm-project/vllm/blob/v0.25.0/vllm/config/model.py)
-- [KV cache auto-fit implementation @ v0.25.0](https://github.com/vllm-project/vllm/blob/v0.25.0/vllm/v1/core/kv_cache_utils.py)
+- [model.py @ 固定提交](https://github.com/vllm-project/vllm/blob/702f4814fe54fabff350d43cb753ae3e47c0c276/vllm/config/model.py)
+- [KV cache auto-fit implementation @ 固定提交](https://github.com/vllm-project/vllm/blob/702f4814fe54fabff350d43cb753ae3e47c0c276/vllm/v1/core/kv_cache_utils.py)
 
 ### 6.5 为什么两实例各 `0.5` 仍不是隔离方案
 
@@ -729,6 +897,8 @@ gpu_memory_utilization: float = Field(default=0.92, gt=0, le=1)
 - Device Plugin 暴露的是整卡、MIG profile 还是共享 replica；
 - vLLM 参数是否按逻辑切片容量重测。
 
+`time-slicing` 是让多个任务轮流使用同一张卡；`MPS` 是 NVIDIA 提供的多进程并发共享机制；`MIG` 是把支持的 GPU 划成带独立资源边界的硬件切片。三者隔离能力不同，本课只提醒不能把它们混成“共享 GPU”，下一课再深入。
+
 不要把一个 vLLM 参数当作硬件多租户隔离。
 
 ---
@@ -737,24 +907,19 @@ gpu_memory_utilization: float = Field(default=0.92, gt=0, le=1)
 
 ### 7.1 第一刀：容器为什么结束
 
-```text
-Pod重启或请求失败
-  |
-  +-- container lastState.reason=OOMKilled ?
-  |     |
-  |     +-- 是 -> 主机/容器cgroup内存方向
-  |
-  +-- 日志有torch.cuda.OutOfMemoryError / CUDA out of memory ?
-  |     |
-  |     +-- 是 -> GPU HBM预算/峰值/碎片/竞争方向
-  |
-  +-- 日志有NCCL/CUDA error，Node有Xid/ECC ?
-  |     |
-  |     +-- 是 -> driver/GPU/fabric健康方向
-  |
-  +-- exit code、signal、probe失败、应用异常？
-        |
-        +-- 按退出与事件证据继续
+`OOM` 是 Out Of Memory，也就是“申请内存时已经没有合适空间”。但要先问清楚：缺的是 **GPU 显存**，还是 **容器使用的主机内存**。这两个根因、证据和处理方式都不同。
+
+读图规则：从上往下逐个看证据；“是”箭头直接进入对应排查方向；不是就继续看下一种证据。
+
+```mermaid
+flowchart TB
+    A["Pod 重启或请求失败"] --> B{"容器 lastState.reason<br/>是 OOMKilled 吗？"}
+    B -->|"是"| C["查主机 / 容器 cgroup 内存<br/>不是先查 GPU 显存"]
+    B -->|"否"| D{"应用日志有<br/>CUDA out of memory 吗？"}
+    D -->|"是"| E["查 GPU HBM 预算、峰值、碎片和同卡竞争"]
+    D -->|"否"| F{"日志或节点有<br/>Xid / ECC / device lost 吗？"}
+    F -->|"是"| G["查 GPU、驱动和多卡连接健康"]
+    F -->|"否"| H["继续查退出码、signal、探针和应用异常"]
 ```
 
 三类不能混写：
@@ -766,6 +931,8 @@ Pod重启或请求失败
 | GPU/driver fault | Xid、ECC、device lost、NCCL async error | Pod 可能挂死、失败或重启 | GPU Node/driver/fabric，衔接第 19 课 |
 
 CUDA OOM 最终导致进程退出时，Pod 可能进入 `CrashLoopBackOff`。这仍不把根因改成 Kubernetes `OOMKilled`。
+
+词语翻译：`cgroup` 是 Linux 给容器记账和限额的机制；exit `137` 通常表示进程收到强制终止信号，但必须结合 `reason` 判断；`Xid` 是 NVIDIA 驱动报告的一类 GPU 错误编号；`ECC` 是显存纠错相关事件；`CrashLoopBackOff` 是容器连续启动失败后，Kubernetes 延长重试间隔的状态，不是根因名称。
 
 ### 7.2 CUDA OOM 出现在不同阶段，含义不同
 
@@ -819,6 +986,8 @@ working set与RSS时间线
 /dev/shm类型和sizeLimit
 请求并发、body与多模态大小
 ```
+
+`working set` 是近期真正在用、较难马上回收的内存近似值；`RSS` 是进程当前驻留在物理内存里的页面；`page cache` 是 Linux 用主机内存缓存文件内容；`profiler trace` 是性能分析记录，本身也可能很大。
 
 ### 7.5 allocator 碎片的判断纪律
 
@@ -1094,6 +1263,8 @@ vLLM Service不直接对外
 
 把同一个 RWO claim 挂给跨 Node 两副本可能出现 Multi-Attach；换成 RWX 也不会自动解决 Hugging Face lock、半写 shard 或 compile cache 并发风险。共享模型工件应优先只读，per-Pod compile/tmp 应独立可写。
 
+`RWO` 表示卷通常只能被一个节点读写挂载；`RWX` 表示允许多个节点读写；`Multi-Attach` 是同一卷不允许按当前方式同时挂到多节点时的冲突；`writer` 就是会向缓存写数据的进程。
+
 #### 为什么示例显存比例是 `0.80`
 
 `0.80` 只是在小模型基线中显式展示“留 headroom 并测量”的原则，不是推荐默认。真正上线要由：
@@ -1198,6 +1369,8 @@ Deployment 超过期限只会在 status condition 写入 `Progressing=False, rea
 
 未验证这些之前，加入 `sleep 20` 只是在隐藏竞态。
 
+`SIGTERM` 是 Kubernetes 删除容器时通常先发送的“请优雅退出”信号；如果进程在宽限时间内没有退出，之后可能被强制结束。
+
 #### `readOnlyRootFilesystem` 需要验证
 
 模板把已知写目录挂为 volume，但第三方库、compile backend 或驱动工具仍可能尝试写其他路径。server 必须在同一 digest 上先做只读根文件系统 smoke；若失败，应该定位并显式挂载最小写目录，而不是直接把整个 rootfs 改回可写。
@@ -1245,6 +1418,16 @@ kubectl --context vllm-lab-shanghai apply --dry-run=server -f .\vllm-qwen3-06b.y
 
 ## 9. 生产指标：先分 Counter、Gauge、Histogram
 
+先把三种指标想成三种仪表：
+
+| 类型 | 大白话 | 典型读法 |
+|---|---|---|
+| Counter（累计计数器） | 像汽车总里程，只会增加，进程重启才从头计 | 用 `rate()` 看每秒速率，用 `increase()` 看一段时间增加多少 |
+| Gauge（当前值仪表） | 像当前车速，可以升也可以降 | 看现在是多少，也看是否持续过高 |
+| Histogram（分桶直方图） | 把请求耗时分别放进“≤0.1 秒、≤0.5 秒……”的桶 | 用桶重建 p95、p99，不能只看平均值 |
+
+这里的 `preemption` 是调度器为了让系统继续前进，暂时把某些请求移出运行集合，之后再恢复或重算；它意味着额外工作和延迟风险。`metric` 是指标，`label` 是指标上的分类标签，`series` 是一组标签固定后的时间序列。
+
 ### 9.1 固定版本的核心指标清单
 
 `v0.25.0` 官方 Production Metrics 与 `vllm/v1/metrics/loggers.py` 中，本课必须掌握：
@@ -1273,7 +1456,7 @@ kubectl --context vllm-lab-shanghai apply --dry-run=server -f .\vllm-qwen3-06b.y
 固定入口：
 
 - [Production Metrics v0.25.0](https://docs.vllm.ai/en/v0.25.0/usage/metrics/)
-- [loggers.py @ v0.25.0](https://github.com/vllm-project/vllm/blob/v0.25.0/vllm/v1/metrics/loggers.py)
+- [loggers.py @ 固定提交](https://github.com/vllm-project/vllm/blob/702f4814fe54fabff350d43cb753ae3e47c0c276/vllm/v1/metrics/loggers.py)
 
 ### 9.2 文档基名与实际 exposition 名
 
@@ -1375,8 +1558,8 @@ sum by (model_name, reason) (
 
 `v0.25.0` 中：
 
-- `reason="capacity"`：受 scheduler capacity 限制；
-- `reason="deferred"`：LoRA budget、KV transfer 或其他瞬态约束导致推迟；
+- `reason="capacity"`：当前可用计算额度或 KV 空间不足，也就是“现在装不下/排不过来”；
+- `reason="deferred"`：受 LoRA 额度、KV 传输或其他临时条件限制，也就是“不是总容量不足，而是某个前置条件还没好”；
 - 两个 reason 的和应与总 waiting 对齐。
 
 只看总 queue 会把两种处置混在一起。capacity 持续升高更像需要降载/扩容/调优；deferred 持续升高要先查对应特性和传输/预算，未必增加副本就能解决。
@@ -1432,6 +1615,8 @@ histogram_quantile(
 2. 不同 bucket layout 不得盲目合并；版本升级先比 schema。
 3. `histogram_quantile` 是桶内插值，尾部精度受 bucket 边界影响；SLO 阈值附近必须确认有合适 bucket。
 
+`le` 是 less than or equal，表示“耗时小于等于这个桶上界”；`bucket layout/schema` 是这组桶的边界设计；“插值”是根据相邻桶估算桶内位置，所以它不是逐条请求精确排序后的真值。
+
 平均值：
 
 ```promql
@@ -1476,9 +1661,11 @@ count by (namespace, pod) (
 
 ## 10. 从指标到 SLO：TTFT、ITL、TPOT、E2E 与吞吐
 
+先区分三个词：`SLI` 是实际测到的服务指标，例如“99% 请求多久出首 token”；`SLO` 是团队承诺要达到的目标；`E2E` 是 end to end，也就是从用户发请求到完整结果结束的端到端时间。`throughput`（吞吐）是单位时间完成了多少请求或 token。
+
 ### 10.1 五个时间边界不能混
 
-以 streaming request 为例：
+以 `streaming request`（服务端不是等全部生成完才返回，而是一段一段把 token 推给客户端）为例：
 
 ```text
 client send
@@ -1523,6 +1710,8 @@ TPOT
 ```
 
 在 OpenAI-compatible response 的顶层扩展字段 `metrics` 中返回请求级 timing；它与 `usage` 同级，Python client 通常从 `response.model_extra.get("metrics")` 读取。字段：
+
+`per-request metrics` 就是“每个请求自己带一份耗时小票”，不同于 Prometheus 汇总后的全局统计。它更适合查某一次慢请求，但收集和返回这些数据也会增加 CPU 工作。
 
 | 字段 | v0.25.0 语义 |
 |---|---|
@@ -1574,6 +1763,8 @@ TPOT
 - 对比新旧版本。
 
 它不应被直接打上 request ID、user ID、prompt hash 等高基数标签送入 Prometheus。
+
+这里的 `overhead` 是为了收集指标额外付出的开销；`A/B benchmark` 是在相同负载下对比“开启”和“关闭”两组；`opt-in` 是默认不开、需要显式启用；“高基数标签”是可能产生海量不同值的标签，例如每个请求一个 ID，会让 Prometheus 时间序列数量爆炸。
 
 ### 10.3 server aggregate 与 client SLI 各自回答什么
 
@@ -1670,6 +1861,8 @@ For each (model_revision, traffic_class, prompt_bucket, output_bucket):
 
 ### 10.6 Error budget 与 burn rate
 
+`error budget`（错误预算）是 SLO 允许出现的那一点失败空间；`burn rate`（预算燃烧速度）表示现在消耗这份空间有多快。它们的作用不是美化报表，而是决定“当前退化是否严重到要叫醒人或停止发布”。
+
 ```text
 error_budget_fraction = 1 - SLO_target
 
@@ -1725,7 +1918,7 @@ GPU utilization 是采样后的忙碌比例，不是“模型效率”的完整�
 
 ### 11.1 先测“单个 Ready 副本能做多少”
 
-扩容公式需要一个固定容量单位。至少按下列 workload class 建基线：
+扩容公式需要一个固定容量单位。`workload class` 是“把消耗特征相近的请求分成一类”；`arrival rate` 是每秒来了多少请求；`arrival pattern` 是请求平稳到来还是一阵一阵到来；`burst` 就是短时间突发；`capacity point` 是在一组固定条件下测到的一个容量数据点。至少按下列请求类别建基线：
 
 | 类别 | prompt tokens | output tokens | arrival pattern | 必测结果 |
 |---|---:|---:|---|---|
@@ -1733,6 +1926,8 @@ GPU utilization 是采样后的忙碌比例，不是“模型效率”的完整�
 | long prompt | 固定长分布 | 中等 | 同上 | prefill、TTFT、KV |
 | long generation | 中等 | 固定长分布 | 同上 | ITL/TPOT、KV |
 | burst | 生产 burst envelope | 生产分布 | 突发 | queue 恢复时间 |
+
+`Poisson` 在这里是一种常用的随机到达模型，用来避免“每秒整齐地同时来 10 个请求”这种不真实节奏；`生产回放` 是把脱敏后的真实请求长度和到达节奏用于受控测试；`burst envelope` 是产品允许的突发范围，例如“10 秒内最多涌入多少请求”。
 
 每个 capacity point 必须记录：
 
@@ -1771,6 +1966,8 @@ L: 系统内平均请求数
 W: 平均停留时间
 ```
 
+别被公式吓住：在流量大致稳定时，**系统里平均有多少请求 ≈ 每秒进来多少请求 × 每个请求平均待多久**。如果进来的速度长期超过处理速度，等待队列只能越来越长。“稳态”只是说观察窗口内没有一直积压或清空，不代表系统永远不变。
+
 当 arrival 超过可服务速率，waiting 会在 latency 全面爆炸前增长。因此 queue 可以作为前导信号。但它有局限：
 
 - 瞬时 burst 不一定需要新 GPU；
@@ -1793,6 +1990,8 @@ capacity waiting持续
 ### 11.3 一个低基数的 scaler 指标
 
 scaler 的 numerator 和 denominator 必须精确指向同一组 `qwen3-06b` Pod。示例查询：
+
+`scaler` 是自动决定副本增减的控制器；`numerator` 是分子，这里是等待请求数；`denominator` 是分母，这里是 Ready 副本数；“低基数”表示标签组合数量可控，不会因为每个请求或用户都产生一条新时间序列。
 
 ```promql
 sum(
@@ -1899,7 +2098,7 @@ and on()
 
 还要告警 `up == 0` 的现存 target。`absent`、`up` 与业务 gauge 分开，才能区分“真的没有排队”和“采集链不存在/失败”。
 
-标准 HPA 使用 Prometheus 指标通常需要 custom/external metrics adapter；KEDA Prometheus scaler 则执行查询并把标量用于触发。无论用哪一个，先验证：
+标准 HPA（Kubernetes 水平自动扩缩容器）使用 Prometheus 指标通常需要 custom/external metrics adapter；KEDA Prometheus scaler 则执行查询并把标量用于触发。无论用哪一个，先验证：
 
 - 查询在 no traffic/no series/Pod restart 时的值；
 - label 不会跨模型聚合；
@@ -1908,6 +2107,8 @@ and on()
 - 多个 scaler 的合并规则；
 - scale-up/scale-down 边界；
 - 控制器失效时的 fallback。
+
+这里的 `recording rule` 是 Prometheus 预先算好并保存的新指标；`adapter` 是把 Prometheus 数值翻译给 HPA 的适配器；KEDA 是根据外部指标伸缩工作负载的控制器；`metrics lag` 是指标从发生到被伸缩器看到的延迟；`fallback` 是指标系统坏掉时采用的保底行为。
 
 ### 11.4 扩容与缩容要用不同节奏
 
@@ -1933,6 +2134,8 @@ Node不存在:
 - GPU 节点池 autoscaler 的额外分钟级延迟；
 - admission/backpressure 保护冷启动窗口。
 
+`admission` 是入口决定“这个请求现在接不接”；`backpressure` 是下游忙时主动让上游减速或拒绝，避免无限排队。
+
 #### Scale down
 
 缩容更危险：
@@ -1953,6 +2156,8 @@ Node不存在:
 - 把长请求最大时长纳入 termination grace；
 - 对取消请求有可观察结果。
 
+`stabilization window` 是在一段时间里先不轻易缩容，防止来回抖动；`cooldown` 是一次缩放后等待系统稳定的冷静期；`drain` 是先停止接新请求，再等正在处理的请求完成；`termination grace` 是 Kubernetes 给进程优雅退出的时间。
+
 ### 11.5 为什么不建议交互服务直接 scale-to-zero
 
 scale-to-zero 的首请求可能承担：
@@ -1969,6 +2174,8 @@ GPU Node启动
 ```
 
 这通常不是交互式 TTFT 能接受的“冷启动”。只有当产品明确接受异步排队或分钟级等待、并有 durable queue/超时语义时，才评估 scale-to-zero。
+
+`scale-to-zero` 是空闲时把副本缩到 0；`durable queue` 是即使服务或节点重启也不会丢请求的持久队列。
 
 ### 11.6 RollingUpdate 的 GPU 峰值公式
 
@@ -2008,20 +2215,16 @@ Kubernetes 对百分比有取整规则；变更评审必须看 controller 最终
 
 #### 典型死锁
 
-```text
-2 replicas × 1 GPU
-集群恰好2张可放置GPU
-maxSurge=1
-maxUnavailable=0
+读图规则：实线表示 Deployment controller 想推进发布；红色虚线表示资源或可用性约束把动作挡住；两边互相等待就形成卡住。
 
-新Pod:
-  Pending: Insufficient nvidia.com/gpu
-
-旧Pod:
-  不允许删除，因为maxUnavailable=0
-
-结果:
-  rollout永久卡住
+```mermaid
+flowchart LR
+    D["Deployment<br/>2 副本；maxSurge=1；maxUnavailable=0"] --> N["先创建 1 个新 Pod"]
+    N -. "集群两张 GPU 都被旧 Pod 占着" .-> P["新 Pod Pending<br/>Insufficient nvidia.com/gpu"]
+    D --> O["尝试保留 2 个可用旧 Pod"]
+    O -. "maxUnavailable=0，不许先少一个" .-> K["旧 Pod 不能先删除"]
+    P -. "等旧 Pod 释放 GPU" .-> K
+    K -. "等新 Pod 先 Ready" .-> P
 ```
 
 #### 两种选择
@@ -2051,6 +2254,8 @@ server image digest
 
 #### Canary
 
+`Canary`（金丝雀发布）是先让极少量新版本副本接一小部分流量，观察没问题再扩大。
+
 一个 GPU canary 适合验证：
 
 - 启动阶段；
@@ -2067,6 +2272,8 @@ server image digest
 #### Blue/green
 
 blue/green 可以让新旧模型完整并存并快速切流，但 GPU 峰值接近双倍，模型 cache、PVC、网关路由和长连接切换也要双份规划。
+
+`blue/green`（蓝绿发布）是新旧两套完整环境同时存在，验证后一次切换流量。它回切快，但对 GPU 最贵。
 
 ### 11.8 发布门禁
 
@@ -2098,6 +2305,8 @@ Gate 7 rollback:
 
 `/health` 只属于 Gate 3 的一小部分，不是所有门禁。
 
+门禁里的 `digest` 是镜像内容的不可变指纹；`SBOM` 是镜像包含哪些软件和版本的清单；`signature` 是证明工件来自可信发布方的签名；`render` 是先把模板渲染成最终 YAML；`smoke` 是用最小真实请求确认主链能跑通；`drain` 是排空正在处理的请求。
+
 ### 11.9 回滚也需要 GPU 与 cache
 
 回滚失败的常见原因：
@@ -2116,6 +2325,8 @@ Gate 7 rollback:
 ---
 
 ## 12. TP、PP、DP：先问要解决哪一个问题
+
+第 4.2 节已经用大白话介绍三种并行。本节只做第二遍深入。再补几个底词：`tensor` 是模型里承载数字的多维数组；`stage` 是流水线中的一段模型层；`collective` 是一组 GPU 都要参加的通信；`topology` 是 GPU、CPU 和网卡实际怎样连接；NVLink/NVSwitch 是 NVIDIA GPU 之间的高速连接，通常比绕普通 PCIe 或跨节点网络更快。
 
 ### 12.1 决策表
 
@@ -2173,6 +2384,8 @@ resources:
 - `NCCL_TOPO_FILE` 等平台约束；
 - 每 rank 逻辑设备映射。
 
+`clique` 是彼此都有高速直连的一组 GPU；`NUMA` 是一台服务器内部 CPU、内存和 PCIe 设备有“近”和“远”的布局；CPU pinning 是把进程固定到指定 CPU；Topology Manager 是 kubelet 协调 CPU、内存和设备亲和性的模块；`NCCL_TOPO_FILE` 是显式描述多卡连接布局的文件。它们的共同作用是避免“虽然拿到四张卡，但卡和 CPU/网卡之间走了很慢的路径”。
+
 ### 12.3 Pipeline Parallelism
 
 PP 把模型层分成 stage。优点：
@@ -2189,6 +2402,8 @@ PP 把模型层分成 stage。优点：
 - batch/并发不足时利用率差；
 - 任一 stage 故障影响整体；
 - 启动/就绪必须等待完整 world。
+
+`pipeline bubble` 是某些流水线工位在等前后工位而空闲的时间；`world` 是这次分布式任务的全部成员集合，`world size` 就是成员总数；master address/port 是成员最初汇合的协调地址。
 
 “两台机器，每台四卡”不等于随便启动两个 Pod 就得到 `TP=4, PP=2`。需要同一个分布式作业定义 rank、master address/port、world size、成员发现和整体失败语义。
 
@@ -2213,6 +2428,8 @@ DP 为不同请求提供多个模型副本/Engine Core rank。它主要增加吞
 | 容易滚动发布 | 需整体 world 与内部端口 |
 
 没有内部 DP 需求时，先用独立 Pod 副本通常更易运维。
+
+`LB` 是 load balancer（负载均衡器），负责把不同请求分给不同服务单元；`coordinator` 是协调多个 rank 状态的进程。
 
 ### 12.5 进程数量与 GPU 数
 
@@ -2264,6 +2481,8 @@ workers_total ≈ DP × TP × PP
 
 官方文档特别提醒，`NET/Socket` 可能是低效路径。能建立 TCP 不代表 collective 达到预期带宽。
 
+`NIC` 是网卡；`RDMA` 让数据以较少 CPU 参与在机器间高速搬运；`MTU` 是单个网络包允许的最大尺寸；TCP 是常见可靠传输协议；NCCL 日志里的 `Socket` 表示走普通网络套接字路径，能通但可能不够快。
+
 ### 12.7 更多 GPU 不保证线性加速
 
 理想：
@@ -2284,6 +2503,8 @@ serial frontend/tokenization
 + batch不足
 + queue与输出消费
 ```
+
+`serial frontend` 是无法被多张 GPU 同时加速的前端串行工作；`occupancy` 是 GPU 计算单元被有效占用的程度；`speedup` 是加卡后快了几倍，`efficiency` 是这份加速相对理想线性加速还剩多少。
 
 扩卡后至少比较：
 
@@ -2329,6 +2550,8 @@ Untrusted client
 
 每条边都可能同时消耗 GPU、CPU、内存、磁盘和网络。推理 API 的安全问题不只是不当输出，还包括资源耗尽、SSRF、供应链代码执行、内部控制面暴露和模型/提示词泄漏。
 
+`攻击面` 是外部输入能够碰到的所有入口；`Untrusted client` 是不能默认相信的调用方；`SSRF` 是攻击者让服务端替他访问本来不该访问的内网地址；`供应链代码执行` 是镜像、模型仓库、依赖或缓存中夹带的代码在服务里运行；`控制面` 是管理服务状态的接口，不是普通用户推理接口。
+
 固定官方页：
 
 - [Security v0.25.0](https://docs.vllm.ai/en/v0.25.0/usage/security/)
@@ -2336,6 +2559,8 @@ Untrusted client
 ### 13.2 `--api-key` 的保护范围有限
 
 `--api-key` 或 `VLLM_API_KEY` 为部分 HTTP API 提供 Bearer authentication，但官方安全页明确：主要保护 `/v1`、`/v2`、`/inference` 等指定前缀的 endpoints；同一 server 上仍有许多不受它保护的 endpoint。
+
+`Bearer authentication` 是客户端在请求头中携带一段令牌来证明身份；`endpoint` 是一个具体接口地址；`allowlist` 是只允许明确列出的地址，其余默认不开放；`reverse proxy` 是站在 vLLM 前面代它接收和转发请求的网关。
 
 `v0.25.0` 官方列出的重要未保护面包括：
 
@@ -2376,6 +2601,8 @@ VLLM_API_KEY configured
 
 它只能位于受信私网，并由防火墙/NetworkPolicy/segmentation 保护。不要把 gRPC port 加进面向互联网的 Service。
 
+`gRPC` 是服务之间调用接口的一种通信方式；authentication 是“你是谁”，authorization 是“你能做什么”，encryption 是“网络中别人看不懂内容”；`segmentation` 是把不同网络区域隔开。
+
 ### 13.4 多节点内部通信默认也不可信
 
 PyTorch Distributed、KV transfer、TP/PP/DP 通信默认缺少面向不可信网络的认证和加密。官方安全页强调：
@@ -2393,6 +2620,8 @@ PyTorch Distributed、KV transfer、TP/PP/DP 通信默认缺少面向不可信�
 - 不把内部 port 复用到 public Service；
 - 需要加密合规时由 mTLS sidecar、IPsec 或合规网络层提供；
 - Network isolation 不是 cryptographic encryption。
+
+`mTLS` 是通信双方都用证书互相验证并加密；`IPsec` 是在网络层加密；“网络隔离”只是限制谁能连进来，不等于报文自身已经加密。
 
 ### 13.5 `trust_remote_code` 是代码执行决策
 
@@ -2426,6 +2655,8 @@ PyTorch Distributed、KV transfer、TP/PP/DP 通信默认缺少面向不可信�
 ### 13.6 模型、tokenizer 与 cache 是供应链
 
 cache 不是“纯性能数据”。`v0.25.0` 安全文档明确指出：vLLM 假定 cache directory 私有且可信；其中某些内容加载时没有 cryptographic integrity verification，并可能使用支持代码执行的格式。
+
+`cryptographic integrity verification` 是用哈希或签名验证文件有没有被替换；`safetensors` 是一种主要保存张量数据、避免普通 Python pickle 任意反序列化路径的权重格式，但它也不能证明模型来源可信。
 
 因此：
 
@@ -2472,6 +2703,8 @@ Secret 挂载/注入仍可能被进程读取；需要配合最小 code trust、e
 
 allowlist 不能只检查字符串后缀；还要考虑 DNS rebinding、redirect、解析后的私网地址和压缩内容膨胀。
 
+`egress` 是服务主动向外发出的网络访问；`cloud metadata` 是云主机上的敏感实例信息地址；`DNS rebinding` 是同一个域名在不同时间解析到不同地址来绕过检查；`解压炸弹` 是下载文件很小、解码后却膨胀得巨大，从而耗尽内存或 CPU。
+
 ### 13.9 请求本身就是资源分配请求
 
 攻击者或误用客户端可以放大：
@@ -2510,6 +2743,8 @@ gateway hard limits
 
 “endpoint 没写进文档导航”也不能当作不存在；以固定 tag route 源码和实际 OpenAPI/路由清单为准。
 
+`profiler` 是性能分析器；`trace` 是它记录的详细执行轨迹；`LoRA` 是在基础模型上叠加的小型适配权重；`tool server` 让模型调用浏览器、Python 等外部工具；`sandbox` 是限制这些工具权限和影响范围的隔离环境。
+
 ### 13.11 日志、指标与 prompt 隐私
 
 故障排查常想记录完整 prompt，但这可能含：
@@ -2520,6 +2755,8 @@ gateway hard limits
 - system prompt；
 - API key 或工具返回；
 - 安全攻击 payload。
+
+`PII` 是能识别个人身份的信息；`payload` 是请求携带的实际内容；“脱敏”是删除或替换其中的 Secret、账号、正文等敏感数据。
 
 生产策略：
 
@@ -2880,6 +3117,8 @@ catch {
 
 ## 15. 受控实验：不在生产上“边试边调”
 
+`benchmark` 是用固定方法测性能；`受控实验` 是先固定大多数条件，每次只改变一个主要变量，这样结果才知道是谁造成的。它不是在生产上随手改参数看曲线。
+
 ### 15.1 任何压测都是有影响操作
 
 即使只发 HTTP request，压测也会改变：
@@ -2889,7 +3128,7 @@ catch {
 - GPU/CPU/memory；
 - prefix cache；
 - autoscaler；
--日志与指标；
+- 日志与指标；
 - 成本；
 - 其他租户的 SLO。
 
@@ -2931,6 +3170,8 @@ catch {
 
 一次只改一个主变量；否则即使更快，也不知道是哪个因素。
 
+表里的 `control` 是对照组，保持原配置；后文的 `treatment` 是实验组，只打开要验证的变化；`dataset hash` 是数据集内容指纹，用来确认两次测试用了同一份数据；`rollback` 是恢复到实验前状态。
+
 ### 15.3 固定 workload 而不是固定一句 prompt
 
 最小 workload corpus 应有：
@@ -2955,6 +3196,8 @@ catch {
 - 是否 prefix 重复。
 
 不能复制真实 prompt 到测试集。合成 prompt 也要避免所有请求共享同一 prefix，否则 prefix cache 会把结果“优化”成不真实。
+
+`corpus` 是一组测试请求；`bucket` 是按长度等特征分组；`random seed` 是固定随机结果的种子；`temperature/top-p` 是控制生成随机性的参数；`prefix cache` 会复用相同输入前缀的计算结果。
 
 ### 15.4 两种负载模型
 
@@ -3034,6 +3277,8 @@ error/cancel/retry
 2. saturation knee；
 3. overload recovery time。
 
+`SLO-safe capacity` 是仍能守住 SLO 的最大安全负载；`saturation knee` 是负载继续增加后，队列和延迟开始明显陡升的拐点；`overload recovery time` 是停止过载后，队列和延迟恢复正常要多久。
+
 不要以 GPU 100% 作为成功标准。
 
 ### 15.7 实验 C：显存与上下文矩阵
@@ -3048,6 +3293,8 @@ error/cancel/retry
 - eager/graph/compile 配置。
 
 每个 cell 先测启动，再测固定 workload。结果表至少有：
+
+这里的 `cell` 是实验矩阵中的一个参数组合；`eager` 表示按普通方式即时执行，与预先 capture 的 CUDA Graph 路径相对。
 
 | Cell | Start | Weight | Non-KV/Profile | KV capacity | Graph | OOM stage | SLO | Throughput |
 |---|---:|---:|---:|---:|---:|---|---|---:|
@@ -3151,6 +3398,8 @@ Treatment:
 
 不要为了“把曲线跑完”越过停损线。
 
+`PID pressure` 是节点可用进程编号接近耗尽；`critical` 表示达到需要立即停止实验和升级处理的严重级别；`load generator` 是负责发测试请求的压测客户端，它自己也可能先成为瓶颈。
+
 ### 15.12 结果可复现清单
 
 ```text
@@ -3196,15 +3445,15 @@ async def run_server(args) -> None:
 ```
 
 - `async def` 定义 coroutine function。
-- 调用它先得到 coroutine object，不会自动跑完。
-- `await` 把控制权交回 event loop，等待可 await 的结果。
-- 等待 socket/ZMQ/queue 时，event loop 可以处理其他请求。
+- 调用它先得到 coroutine object（协程对象，也就是“这项异步工作怎样执行”的对象），不会自动跑完。
+- `await` 在等待结果时把控制权交回 event loop（事件循环，也就是轮流推进很多异步任务的调度者）。
+- 等待 socket（网络连接）、ZMQ 消息或 queue（队列）时，事件循环可以先处理其他请求。
 
 它不等于：
 
 - GPU kernel 自动并行；
-- CPU-bound tokenization 不占 CPU；
-- Python GIL 消失；
+- CPU-bound tokenization（主要受 CPU 计算速度限制的分词）不占 CPU；
+- Python GIL（同一进程中限制多个 Python 线程同时执行某些代码的锁）消失；
 - 一个 event loop 可以承受无限请求；
 - `await` 之后一定切换线程。
 
@@ -3227,7 +3476,7 @@ async def generate(request) -> AsyncIterator[RequestOutput]:
         yield output
 ```
 
-`yield` 让函数成为 generator；`async def + yield` 是 async generator。client 可以：
+`yield` 的意思是“先交出一个结果，但函数还没结束，下次可以从这里继续”；带 `yield` 的函数叫 generator（生成器），`async def + yield` 就是 async generator（异步生成器）。client 可以：
 
 ```python
 async for output in engine.generate(...):
@@ -3248,7 +3497,7 @@ async for output in engine.generate(...):
 
 ### 16.3 `@asynccontextmanager` 与 `async with`
 
-`api_server.py` 使用 `@asynccontextmanager` 管理 engine client 生命周期。等价化简：
+`api_server.py` 使用 `@asynccontextmanager` 管理 Engine Client 生命周期。`context manager`（上下文管理器）可以理解为“进入时准备资源，退出时保证收尾”的结构。等价化简：
 
 ```python
 from contextlib import asynccontextmanager
@@ -3285,11 +3534,11 @@ async with build_engine(config) as engine:
 
 固定源码：
 
-- [api_server.py @ v0.25.0](https://github.com/vllm-project/vllm/blob/v0.25.0/vllm/entrypoints/openai/api_server.py)
+- [api_server.py @ 固定提交](https://github.com/vllm-project/vllm/blob/702f4814fe54fabff350d43cb753ae3e47c0c276/vllm/entrypoints/openai/api_server.py)
 
 ### 16.4 普通 context manager：`with`
 
-`gpu_worker.py` 在模型加载和 memory profiling 中使用 context manager。等价化简：
+`gpu_worker.py` 在模型加载和 memory profiling 中使用 context manager。这里的 `snapshot` 是某一时刻的内存快照，`peak` 是观察窗口内的最高值。等价化简：
 
 ```python
 with memory_profiling(snapshot, weights_memory=weight_bytes) as result:
@@ -3321,6 +3570,8 @@ with (
 
 ### 16.5 decorator：函数外面的行为
 
+`decorator`（装饰器）像在不改函数主体的情况下给它套一层包装，可以增加日志、计时、权限或运行模式。
+
 固定源码中可见：
 
 ```python
@@ -3349,8 +3600,8 @@ f = decorator(f)
 
 所以读函数不能忽略上方装饰器：
 
-- `@instrument` 可能创建 trace/span、记录异常；
-- `@torch.inference_mode()` 关闭 autograd 相关状态，适合 inference/profile；
+- `@instrument` 可能创建 trace/span，也就是一条调用轨迹和其中一小段，并记录异常；
+- `@torch.inference_mode()` 关闭训练才需要的 autograd（自动求导）状态，适合只做推理和测量；
 - 其他 decorator 可能加锁、重试、同步或改参数。
 
 decorator 名称只是入口；性能与异常语义要继续读它的实现。
@@ -3370,7 +3621,7 @@ client_config: dict[str, Any] | None = None
 - 读者理解状态；
 - 文档生成。
 
-普通 Python type hint 本身通常不做运行时校验。下面仍可能在运行时传错：
+普通 Python type hint（类型提示）主要给读者和工具看，本身通常不做运行时校验。下面仍可能在运行时传错：
 
 ```python
 def f(x: int) -> None:
@@ -3379,7 +3630,7 @@ def f(x: int) -> None:
 f("not an int")
 ```
 
-只有函数自己、Pydantic 或其他框架验证，才会拒绝。
+只有函数自己、Pydantic（常用的数据校验库）或其他框架真正检查，才会拒绝。
 
 这解释了为什么 `CacheConfig` 的：
 
@@ -3390,6 +3641,8 @@ Field(default=0.92, gt=0, le=1)
 不只是 type hint；`gt/le` 提供运行时配置约束。
 
 ### 16.7 generics：`list[T]`、`dict[K, V]`、`tuple[...]`
+
+`generics`（泛型标注）是在容器类型后继续写清“里面装什么”。
 
 示例：
 
@@ -3418,7 +3671,7 @@ if kv_cache_memory_bytes := cache_config.kv_cache_memory_bytes:
     ...
 ```
 
-它同时赋值并判断 truthiness，近似：
+它同时赋值并判断 truthiness（真值，也就是这个值放进 `if` 后算真还是假），近似：
 
 ```python
 kv_cache_memory_bytes = cache_config.kv_cache_memory_bytes
@@ -3426,7 +3679,7 @@ if kv_cache_memory_bytes:
     ...
 ```
 
-读代码时要注意它判断的不是严格 `is not None`，而是真值。配置字段自身的验证通常排除不合理的 0，但仍应读 schema。
+读代码时要注意它判断的不是严格 `is not None`，而是真值。配置字段自身的验证通常排除不合理的 0，但仍应读 schema（字段结构和校验规则）。
 
 ### 16.9 comprehension、`any` 与短路
 
@@ -3440,7 +3693,7 @@ has_kv_cache = any(
 )
 ```
 
-`any` 找到第一个 truthy 值就短路。嵌套 generator 顺序：
+这类把循环写在一行表达式里的语法叫 comprehension（推导式）。`any` 找到第一个真值就短路，也就是立刻停止继续检查。嵌套生成器顺序：
 
 ```text
 for each worker_specs
@@ -3478,7 +3731,7 @@ except Exception as error:
 - liveness 何时能看到；
 - 是否存在 catch 后继续运行的降级。
 
-重复 traceback 不代表有多个根因，可能是同一异常跨层记录。
+`traceback` 是异常从哪里一路传上来的调用记录。重复 traceback 不代表有多个根因，可能是同一异常跨层记录。
 
 ### 16.11 class、state 与进程边界
 
@@ -3488,7 +3741,7 @@ except Exception as error:
 self.scheduler.add_request(request)
 ```
 
-只说明当前对象调用成员，不证明它是本地函数还是跨进程 RPC 的最终落点。架构文档说明 API server 与 Engine Core 之间可经 ZMQ；executor 又协调 workers。
+只说明当前对象调用成员，不证明它是本地函数还是跨进程 RPC 的最终落点。`RPC` 是“像调用本地函数一样，请另一个进程执行动作”的通信方式。架构文档说明 API server 与 Engine Core 之间可经 ZMQ；Executor 又协调 Workers。
 
 读源码时建立表：
 
@@ -3893,29 +4146,28 @@ TTFT/ITL更差
 5. 运行第14节只读脚本
 ```
 
-### 18.2 按最早失败层分流
+### 18.2 仍按本课六站分流，不发明第二套顺序
 
-| 最早失败 | 先查 | 不要先做 |
-|---|---|---|
-| Pending | scheduler event、GPU allocatable、topology/quota/PVC | 查 vLLM log |
-| ContainerCreating | image、mount、sandbox、Device Plugin/runtime | 加大 probe |
-| Running 不 Ready、无重启 | 启动阶段、`/health`、startup budget | scale traffic |
-| 反复重启 | lastState、previous log、probe event | 只看 current log |
-| CUDA OOM | 阶段、HBM、其他进程、配置 | 调 Pod memory |
-| OOMKilled | cgroup/host memory、`/dev/shm` | 调 GPU utilization |
-| Ready 但 SLO 差 | client/gateway、queue、KV、CPU/GPU | 让 readiness 跟 queue 抖 |
-| TP/PP 卡住 | rank/world/device/NCCL/topology | 逐个重启 rank |
+六站是请求正常前进的顺序；排障不必每次从第 1 站查到第 6 站，而是先根据最早异常状态落到对应站，再向相邻站找证据。
 
-### 18.3 Ready 但慢：固定诊断顺序
+| 站点 | 现场信号 | 先查 | 不要先做 |
+|---|---|---|---|
+| 第 1 站：GPU 放置 | Pod `Pending` | scheduler event、GPU allocatable、拓扑、配额、PVC | 查还没启动的 vLLM 日志 |
+| 第 2 站：启动 | `ContainerCreating`，或 `Running` 但模型仍在初始化 | image、mount、Device Plugin/runtime、启动阶段日志 | 盲目加大 probe |
+| 第 3 站：接流量 | 模型似乎装好，但不 Ready；或 Endpoint 不对 | `/health`、readiness 结果、EndpointSlice、启动预算 | 直接放大流量 |
+| 第 4 站：排队与生成 | waiting 增长、prefill/decode 变慢 | 请求长度、到达率、waiting reason、preemption | 让 readiness 跟着 queue 抖 |
+| 第 5 站：GPU 容量 | CUDA OOM、OOMKilled、Xid/ECC、TP/PP 卡住 | 对应内存域、每卡进程、rank、NCCL、节点健康 | 混改 Pod 内存和 GPU 参数 |
+| 第 6 站：用户 SLO | Ready 且 `/health 200`，但用户慢或失败 | 客户端/网关 TTFT、ITL、E2E、成功率，再回查第 4～5 站 | 只看 `/health` 下结论 |
+
+### 18.3 Ready 但慢：从第 6 站带着证据向前回查
 
 ```text
-client/gateway可用性与TTFT
-  -> request length/arrival分布
-  -> queue time + waiting reason
-  -> running/KV/preemption
-  -> prefill/decode/ITL/E2E
-  -> CPU/throttle/memory/network
-  -> GPU/DCGM/NCCL/topology
+第6站：确认client/gateway成功率、TTFT、ITL、E2E到底哪项坏了
+  -> 第4站：核对request长度/到达率、queue time、waiting reason、prefill/decode
+  -> 第5站：核对running、KV、preemption、CPU、内存、GPU、DCGM/NCCL
+  -> 第3站：确认Ready与Endpoint只是在正确放流，不是错误摘流或流量集中
+  -> 第2站：若发布后才发生，回查模型、参数、缓存和启动基线变化
+  -> 第1站：若副本不足或发布卡住，回查GPU供给和放置
 ```
 
 ### 18.4 四个停手条件
@@ -3949,27 +4201,25 @@ current risk and next evidence
 
 ## 19. 学习深度与源码停损线
 
-### 19.1 S1：必须能独立值班
+`停损线` 的意思是：先学到足以解决当前运维问题的深度，到这里就停；只有生产证据指向更底层时才继续钻，避免一上来掉进算法细节。
 
-必须掌握：
+### 19.1 第一遍：先能讲清六站，不要求独立值班
 
-- `v0.25.0` 版本、MRv2 默认和旧 PagedAttention 资料断点；
-- request → waiting → schedule → worker → output；
-- prefill/decode/continuous batching 的运维语义；
-- 显存科目、`gpu_memory_utilization`、`kv_cache_memory_bytes`；
-- CUDA OOM 与 OOMKilled 分流；
-- startup/readiness/liveness 边界；
-- Counter/Gauge/Histogram 与 raw series；
-- TTFT/ITL/TPOT/E2E/throughput；
-- queue scaler、GPU rollout 峰值；
-- 单 GPU、TP、PP、DP 的选择；
-- API、cache、remote code、内部网络安全。
+第一遍只掌握：
 
-验收标准：能对第 17 节任一场景给出“证据、非证据、止血、根修、预防”。
+- `Running`、HTTP health、模型加载、Ready、SLO 是五个不同判断；
+- vLLM、prefill、decode、continuous batching、KV cache 的大白话含义；
+- 请求怎样从 waiting 经过 Scheduler、Worker 和 GPU 再返回；
+- TTFT、ITL、TPOT 分别看哪段等待；
+- 显存除了权重还有哪些主要科目；
+- CUDA OOM 与 Kubernetes `OOMKilled` 不能混；
+- 六站排查路线和每站第一证据。
 
-### 19.2 S2：定向读源码
+第一遍不要求背完整指标名、发布公式和安全清单。验收在第 20.1～20.2 节。
 
-必须亲自打开并追：
+### 19.2 第二遍：定向读源码并达到独立值班
+
+第二遍必须亲自打开并追：
 
 ```text
 api_server.build_async_engine_client*
@@ -3989,7 +4239,17 @@ api_server.build_async_engine_client*
 4. health 为什么不等于 SLO；
 5. metric name/type/label 从哪里定义。
 
-### 19.3 S3：本课允许略读
+同时掌握：
+
+- `gpu_memory_utilization`、`kv_cache_memory_bytes` 和 `max_model_len` 的边界；
+- startup/readiness/liveness 的动作差异；
+- Counter/Gauge/Histogram、TTFT/ITL/TPOT/E2E 和缺失指标；
+- queue scaler、GPU rollout 峰值、TP/PP/DP 选择；
+- API、cache、remote code 和内部网络安全。
+
+第二遍验收：能对第 17 节任一场景给出“证据、非证据、止血、根修、预防”，并通过第 20.3～20.4 节。
+
+### 19.3 第三层：本课允许略读
 
 可以后续再深挖：
 
@@ -4001,7 +4261,7 @@ api_server.build_async_engine_client*
 - expert parallel/MoE；
 - Ray 内部调度。
 
-它们只有在生产配置实际启用或证据指向时才升级为 S1/S2。
+它们只有在生产配置实际启用或证据指向时，才升级为第二遍必学内容。
 
 ### 19.4 Java 经验的使用边界
 
@@ -4024,63 +4284,75 @@ api_server.build_async_engine_client*
 
 ## 20. 自测题
 
-### 20.1 问题
+### 20.1 第一遍验收：先确认主线真的懂了
 
-1. 本课冻结的 vLLM tag、release commit 和事实核对日期是什么？
+先合上文档，用自己的话回答：
+
+1. Pod `Running`、`Ready`、`/health 200` 分别只证明什么？为什么都不能证明 SLO 达标？
+2. vLLM、prefill、decode、continuous batching 和 KV cache 分别是做什么的？
+3. TTFT、ITL、TPOT 各描述用户等待的哪一段？
+4. 本课六站排查路线是什么？“Ready 但首 token 很慢”应该从哪几站找证据？
+5. Kubernetes 的 HTTP probe 源码收到 `200` 时做了什么，又完全没有做什么？
+6. `EngineCore.step()` 为什么可以概括成“挑工作、交给 GPU、收结果、更新队列”？
+7. continuous batching 为什么不是“凑满固定一批后一起跑到底”？
+8. 为什么模型权重能装进 GPU，运行时仍可能 CUDA OOM？
+9. CUDA OOM 和 Kubernetes `OOMKilled` 的第一证据分别是什么？
+10. 为什么等待队列增长，比只看 GPU utilization 更早暴露容量风险？
+
+### 20.2 第一遍参考答案与通过标准
+
+1. `Running` 说明进程已启动；`Ready` 说明就绪探针通过；`/health 200` 说明健康接口返回可接受状态码。它们都没有替用户完成真实推理，也没有判断尾延迟。
+2. vLLM 是在线推理服务；prefill 先读完整 prompt；decode 逐个生成 token；continuous batching 每一步重新组合请求；KV cache 保存上下文计算笔记。
+3. TTFT 看首 token 等多久，ITL 看相邻 token 是否卡顿，TPOT 概括首 token 以后平均每个输出 token 的时间。
+4. 六站是 GPU 放置、启动、探针接流量、排队与生成、GPU 容量、用户 SLO。Ready 但慢，至少联查第 4～6 站，并根据证据回查启动或资源。
+5. kubelet 把 200～299 判为 `probe.Success`；它没有看 vLLM 队列、没有发模型请求、没有算 TTFT 或 SLO。
+6. 源码依次调用调度、模型执行、取回结果和更新 Scheduler 状态；一个请求不会独占整个循环。
+7. 每个 step 都允许完成者退出、等待者加入，并按 token 预算和 KV 空间重新选择工作集合。
+8. 权重之外还有驱动、activation/workspace、KV cache、CUDA Graph、通信缓冲、分配器预留和安全余量。
+9. CUDA OOM 先看应用里的 CUDA/PyTorch 错误和发生阶段；`OOMKilled` 先看容器 `lastState.reason`、退出码和 cgroup 主机内存证据。
+10. 到达速度长期超过处理速度时，等待队列会先持续积累；GPU utilization 只是采样到的忙碌比例，解释不了 CPU、队列、同步和流式返回。
+
+第一遍通过标准：你能在 3 分钟内不看文档讲清六站；能指着两段 Go 源码解释“200 为什么只等于探针成功”；能指着 Python `step()` 说清队列怎样变化。做不到时先回看第 0、1、3、6、7 节，不要急着背参数。
+
+### 20.3 第二遍验收：再检查能否独立值班
+
+1. 本课冻结的 vLLM tag、完整 commit 和 Kubernetes 本地 commit 是什么？
 2. `v0.25.0` dense model 默认 runner 有什么变化？“PagedAttention removed”应怎样解释？
-3. 写出 `EngineCore.step()` 的三个核心动作。
-4. 为什么不能把当前 scheduler 讲成两个互斥的大阶段？
-5. continuous batching 与固定 batch 的根本区别是什么？
-6. `gpu_memory_utilization=0.8` 能否解释成“KV cache 占 80%”？为什么？
-7. 同时设置 `kv_cache_memory_bytes` 后，`gpu_memory_utilization` 怎样影响 KV cache？
-8. `max_model_len=auto` 能否替代产品请求上限与容量规划？
-9. `/health 200` 能证明和不能证明什么？
-10. startup、readiness、liveness 各自的失败动作与适用语义是什么？
-11. CUDA OOM 与 `lastState.reason=OOMKilled` 的第一证据分别是什么？
-12. 文档写 `vllm:num_preemptions`，raw series 为什么可能是 `vllm:num_preemptions_total`？
-13. 为什么 `vllm:request_success_total` 不能直接叫成功请求数？
-14. `waiting_by_reason` 的两个固定 reason 是什么？它们与总 waiting 什么关系？
-15. TTFT p99 的 PromQL 为什么必须保留 `le`？
-16. 一个 metric series 不存在时，为什么不能当作零？
-17. per-request `metrics` 位于响应哪里？五个字段是什么？
-18. `n>1`、multiple prompts 和 streaming 对 per-request metrics 有什么限制？
-19. client TTFT 与 `time_to_first_token_ms` 的边界有什么不同？
-20. 为什么 aggregate output token/s 上升不一定是交互服务优化成功？
-21. queue scaler 为什么要除以 Ready replica？零 Ready 怎样处理？
-22. 两副本、两张 GPU、`maxSurge=1,maxUnavailable=0` 为什么可能死锁？
-23. hostname topology spread 同时配置 `maxSkew: 1`、`minDomains: 2`、`DoNotSchedule` 时，为什么可能让第二副本 Pending？
-24. TP、PP、DP 分别优先解决什么问题？
-25. `VLLM_API_KEY`、`trust_remote_code` 和共享 cache 各有什么关键安全边界？
-26. 只读取证为什么必须固定 Pod UID 与 Node UID，而不只固定名字？
+3. `gpu_memory_utilization=0.8` 能否解释成“KV cache 占 80%”？同时设置 `kv_cache_memory_bytes` 后又怎样？
+4. `max_model_len=auto` 为什么不能替代产品请求上限与容量规划？
+5. startup、readiness、liveness 的失败动作和适用语义分别是什么？
+6. 文档写 `vllm:num_preemptions`，原始指标为什么可能是 `vllm:num_preemptions_total`？
+7. 为什么 `vllm:request_success_total` 不能直接叫成功请求数？
+8. `waiting_by_reason` 的 `capacity` 与 `deferred` 分别说明什么？
+9. TTFT p99 的 PromQL 为什么必须保留 `le`？一个指标不存在时为什么不能当作零？
+10. 请求级 `metrics` 在响应哪里？它的 TTFT 与客户端 TTFT 边界有什么不同？
+11. 为什么 aggregate output token/s 上升，不一定代表交互服务优化成功？
+12. queue scaler 为什么要除以 Ready 副本数？零 Ready 应怎样处理？
+13. 两副本、两张 GPU、`maxSurge=1,maxUnavailable=0` 为什么可能卡住？
+14. TP、PP、DP 分别优先解决什么问题？
+15. `VLLM_API_KEY`、`trust_remote_code` 和共享 cache 各有什么关键安全边界？
+16. 为什么只读取证也要固定 Pod UID 与 Node UID，而不能只记名字？
 
-### 20.2 答案
+### 20.4 第二遍参考答案与通过标准
 
-1. `v0.25.0`，commit `702f481`，核对日 `2026-07-14`；release 日 `2026-07-11`。
-2. dense 默认 MRv2，主入口为 `vllm/v1/worker/gpu/model_runner.py`。旧 PagedAttention 实现被移除，不等于块化/paged KV cache 概念消失。
-3. `scheduler.schedule() -> model_executor.execute_model() -> scheduler.update_from_output()`。
-4. scheduler 按每请求已计算 token 与目标 token 的差额，在每个 step 分配 token；同一步可混合 decode、chunked prefill 等工作。
-5. continuous batching 每个 engine step 重新组合运行/新接纳请求；固定 batch 则让一组请求长期绑定。
-6. 不能。它是单 instance 的目标 GPU memory budget 比例，权重、activation、graph 等先占用，剩余才规划 KV；也不是硬隔离。
-7. 显式 KV bytes 覆盖 KV 自动推导，worker 仍可能做 profile/compile，但不会把二者解释成“取最小”。
-8. 不能。auto 只在显存约束下适配长度；产品仍要限制 prompt/output、并发和请求放大项并压测。
-9. 能证明 health route 可响应且 engine client 未报告已知死亡；不能证明合成推理、queue、TTFT/ITL、模型质量、网关或产品 SLO。
-10. startup 达阈值重启，保护但限制冷启动；readiness 摘流量；liveness 重启失活实例，只应在“重启有恢复价值”且阈值经验证时启用。
-11. CUDA OOM 看 PyTorch/CUDA error 与 GPU memory/阶段；OOMKilled 看 container lastState、exit/cgroup memory evidence。
-12. Python Prometheus Counter exposition 通常自动加 `_total`；查询必须以该实例 `/metrics` 为准。
-13. 源码按 FinishReason 计 `stop/length/abort/error/repetition` 等完成事件；名字有误导性，且缺 gateway/client 全请求分母。
-14. `capacity` 与 `deferred`；二者之和应与总 waiting 对齐。
-15. `histogram_quantile` 需要按 bucket 上界重建累计分布；聚合丢 `le` 就没有桶结构。
-16. 可能是 scrape/RBAC/label/name/version/重启问题；零是观测值，missing 是观测链不完整。
-17. 顶层扩展字段 `metrics`，与 `usage` 同级；字段是 `time_to_first_token_ms`、`generation_time_ms`、`queue_time_ms`、`mean_itl_ms`、`tokens_per_second`。
-18. `n>1` 和 multiple prompts 时 metrics object 为 null；stream 只在最终 usage chunk 同一响应对象附带，client 需 include usage 或 server force flag。
-19. per-request TTFT 从 scheduled 到 first output，不含 queue；client TTFT 还可能含网络、gateway、tokenization、queue 和 flush。
-20. scheduler 可能用更大批次换吞吐，导致 TTFT/ITL/E2E 尾部恶化；目标由服务等级决定。
-21. 总 queue 要按可服务单元归一；零 Ready 必须独立高优告警，`clamp_min` 只防除零。
-22. 新 Pod 需要第三张 GPU，旧 Pod 又不允许减少，双方都不能推进。
-23. `minDomains: 2` 要求至少两个合格 hostname topology domain；单 GPU Node/单域下第二个副本会因 skew 约束 Pending。没有 `minDomains: 2` 时，不能只凭 `DoNotSchedule` 宣称已强制跨 Node。
-24. TP 切同层 tensor、常用于单卡放不下；PP 切 layer stage、可跨节点；DP 用多个副本/rank 处理不同请求以扩吞吐。
-25. API key 不保护全部路由；remote code 是模型仓库 Python 执行决策；cache 被假定可信且可能缺完整性校验，不能让不可信 writer 共享。
-26. Pod/Node 可同名重建，UID 才绑定对象 incarnation；否则会把不同实例的状态、event、log 和 metrics 混在一起。
+1. vLLM `v0.25.0`，完整提交 `702f4814fe54fabff350d43cb753ae3e47c0c276`；Kubernetes 本地提交 `301946d15e67a4a2e8a5fb8292eb836acd366d78`。
+2. dense 默认 MRv2，主入口为 `vllm/v1/worker/gpu/model_runner.py`。删除旧 PagedAttention 实现，不等于块化的 KV cache 管理概念消失。
+3. 不能。它是单实例目标显存预算比例，不是 KV 百分比或硬隔离；显式 KV 字节值会覆盖 KV 自动推导，不能解释成两个值取小。
+4. `auto` 只按显存约束适配长度；产品仍要限制 prompt、output、并发和请求放大项，并按真实分布压测。
+5. startup 超阈值后重启，用来保护有限冷启动；readiness 失败会摘流量；liveness 失败会重启，只应用在重启有恢复价值的失活。
+6. Python Prometheus Counter 展示时通常加 `_total`；最终以目标实例 `/metrics` 为准。
+7. 它按多种 FinishReason 记录完成事件，名字有历史误导，而且没有网关和客户端侧的完整请求分母。
+8. `capacity` 表示当前计算或 KV 容量装不下；`deferred` 表示某个临时前置条件未满足，不一定靠加副本解决。
+9. 直方图需要保留桶上界 `le` 才能重建分布；指标缺失可能是采集链坏了，和观测值为 0 不是一回事。
+10. `metrics` 与 `usage` 同在响应顶层扩展字段；其中 TTFT 从 scheduled 算到 first output，不包含客户端网络、网关和 queue 等完整等待。
+11. 调度器可能用更大工作集合换总吞吐，却让 TTFT、ITL 或 E2E 尾部变差。
+12. 总 queue 要按实际可服务单元归一；零 Ready 要独立高优告警，`clamp_min` 只能防除零，不能伪装健康。
+13. 新 Pod 等第三张 GPU，旧 Pod 又因为不能降低可用数而不能先删，双方互相等待。
+14. TP 切同一层的大计算；PP 切模型层形成流水线；DP 放多份副本处理不同请求。
+15. API key 不保护全部路由；remote code 允许模型仓库 Python 代码执行；cache 被视为可信输入，不能给不可信写入者共享。
+16. Pod 或 Node 可以同名重建，UID 才绑定这一次真实对象，否则日志、事件和指标可能串到不同实例。
+
+第二遍通过标准：你能拿一个真实 Pod 的只读证据，判断最早失败站点；能解释至少一个指标查询的分母和缺失语义；能在发布评审中算出 GPU 峰值并指出安全停手条件。达到这里才算“能独立值班”，不是把所有命令背下来。
 
 ---
 
@@ -4089,7 +4361,7 @@ api_server.build_async_engine_client*
 ### 21.1 Release、架构与配置
 
 - [vLLM v0.25.0 release](https://github.com/vllm-project/vllm/releases/tag/v0.25.0)
-- [vLLM v0.25.0 source tree](https://github.com/vllm-project/vllm/tree/v0.25.0)
+- [vLLM v0.25.0 fixed source tree](https://github.com/vllm-project/vllm/tree/702f4814fe54fabff350d43cb753ae3e47c0c276)
 - [Architecture Overview v0.25.0](https://docs.vllm.ai/en/v0.25.0/design/arch_overview/)
 - [Optimization and Tuning v0.25.0](https://docs.vllm.ai/en/v0.25.0/configuration/optimization/)
 - [Conserving Memory v0.25.0](https://docs.vllm.ai/en/v0.25.0/configuration/conserving_memory/)
@@ -4109,17 +4381,19 @@ api_server.build_async_engine_client*
 
 ### 21.3 本课主线固定源码
 
-- [api_server.py @ v0.25.0](https://github.com/vllm-project/vllm/blob/v0.25.0/vllm/entrypoints/openai/api_server.py)
-- [health.py @ v0.25.0](https://github.com/vllm-project/vllm/blob/v0.25.0/vllm/entrypoints/serve/instrumentator/health.py)
-- [async_llm.py @ v0.25.0](https://github.com/vllm-project/vllm/blob/v0.25.0/vllm/v1/engine/async_llm.py)
-- [core.py @ v0.25.0](https://github.com/vllm-project/vllm/blob/v0.25.0/vllm/v1/engine/core.py)
-- [scheduler.py @ v0.25.0](https://github.com/vllm-project/vllm/blob/v0.25.0/vllm/v1/core/sched/scheduler.py)
-- [gpu_worker.py @ v0.25.0](https://github.com/vllm-project/vllm/blob/v0.25.0/vllm/v1/worker/gpu_worker.py)
-- [MRv2 gpu/model_runner.py @ v0.25.0](https://github.com/vllm-project/vllm/blob/v0.25.0/vllm/v1/worker/gpu/model_runner.py)
-- [metrics/loggers.py @ v0.25.0](https://github.com/vllm-project/vllm/blob/v0.25.0/vllm/v1/metrics/loggers.py)
-- [config/cache.py @ v0.25.0](https://github.com/vllm-project/vllm/blob/v0.25.0/vllm/config/cache.py)
-- [config/model.py @ v0.25.0](https://github.com/vllm-project/vllm/blob/v0.25.0/vllm/config/model.py)
-- [kv_cache_utils.py @ v0.25.0](https://github.com/vllm-project/vllm/blob/v0.25.0/vllm/v1/core/kv_cache_utils.py)
+以下链接都固定到完整提交 `702f4814fe54fabff350d43cb753ae3e47c0c276`，不会随着 vLLM 主分支变化。
+
+- [api_server.py @ 固定提交](https://github.com/vllm-project/vllm/blob/702f4814fe54fabff350d43cb753ae3e47c0c276/vllm/entrypoints/openai/api_server.py)
+- [health.py @ 固定提交](https://github.com/vllm-project/vllm/blob/702f4814fe54fabff350d43cb753ae3e47c0c276/vllm/entrypoints/serve/instrumentator/health.py)
+- [async_llm.py @ 固定提交](https://github.com/vllm-project/vllm/blob/702f4814fe54fabff350d43cb753ae3e47c0c276/vllm/v1/engine/async_llm.py)
+- [core.py @ 固定提交](https://github.com/vllm-project/vllm/blob/702f4814fe54fabff350d43cb753ae3e47c0c276/vllm/v1/engine/core.py)
+- [scheduler.py @ 固定提交](https://github.com/vllm-project/vllm/blob/702f4814fe54fabff350d43cb753ae3e47c0c276/vllm/v1/core/sched/scheduler.py)
+- [gpu_worker.py @ 固定提交](https://github.com/vllm-project/vllm/blob/702f4814fe54fabff350d43cb753ae3e47c0c276/vllm/v1/worker/gpu_worker.py)
+- [MRv2 gpu/model_runner.py @ 固定提交](https://github.com/vllm-project/vllm/blob/702f4814fe54fabff350d43cb753ae3e47c0c276/vllm/v1/worker/gpu/model_runner.py)
+- [metrics/loggers.py @ 固定提交](https://github.com/vllm-project/vllm/blob/702f4814fe54fabff350d43cb753ae3e47c0c276/vllm/v1/metrics/loggers.py)
+- [config/cache.py @ 固定提交](https://github.com/vllm-project/vllm/blob/702f4814fe54fabff350d43cb753ae3e47c0c276/vllm/config/cache.py)
+- [config/model.py @ 固定提交](https://github.com/vllm-project/vllm/blob/702f4814fe54fabff350d43cb753ae3e47c0c276/vllm/config/model.py)
+- [kv_cache_utils.py @ 固定提交](https://github.com/vllm-project/vllm/blob/702f4814fe54fabff350d43cb753ae3e47c0c276/vllm/v1/core/kv_cache_utils.py)
 
 ### 21.4 示例工件与模型
 
@@ -4138,6 +4412,8 @@ api_server.build_async_engine_client*
 ```
 
 - [prober/worker.go @ 301946d](https://github.com/kubernetes/kubernetes/blob/301946d15e67a4a2e8a5fb8292eb836acd366d78/pkg/kubelet/prober/worker.go)
+- [probe/http/http.go @ 301946d](https://github.com/kubernetes/kubernetes/blob/301946d15e67a4a2e8a5fb8292eb836acd366d78/pkg/probe/http/http.go)
+- [kubelet/prober/prober.go @ 301946d](https://github.com/kubernetes/kubernetes/blob/301946d15e67a4a2e8a5fb8292eb836acd366d78/pkg/kubelet/prober/prober.go)
 - [kubelet.go @ 301946d](https://github.com/kubernetes/kubernetes/blob/301946d15e67a4a2e8a5fb8292eb836acd366d78/pkg/kubelet/kubelet.go)
 - [kuberuntime_manager.go @ 301946d](https://github.com/kubernetes/kubernetes/blob/301946d15e67a4a2e8a5fb8292eb836acd366d78/pkg/kubelet/kuberuntime/kuberuntime_manager.go)
 

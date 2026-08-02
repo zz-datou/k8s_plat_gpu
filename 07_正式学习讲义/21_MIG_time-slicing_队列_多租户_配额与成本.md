@@ -1,15 +1,55 @@
-# 第 21 课：MIG、time-slicing、队列、多租户、配额与成本
+# 第 21 课：8 张 GPU 为什么显示成 80 张——MIG、共享槽、Kueue 配额和成本到底各算哪本账
 
-> 主案例：一套原本按“8 张物理 GPU”规划的集群，在开启 time-slicing 后显示 `nvidia.com/gpu=80`；团队把这 80 个逻辑访问槽当成 80 张卡出售，随后在线推理 P99、批训练排队、成本分摊和故障归因同时失真
-> 组件主线：物理 GPU → MIG/time-slicing/MPS/DRA → Device Plugin→kubelet Node扩展资源账，或DRA Driver→DeviceClass/ResourceSlice/ResourceClaim账 → Kueue 配额入场 → kube-scheduler 节点放置 → 容器与 GPU 进程 → DCGM/vLLM/成本账
-> 源码主线：Kueue `v0.18.3`、commit `afd60c3` 的 API、队列、cache、admission 与 job framework；复用本地 Kubernetes commit `301946d15e67a4a2e8a5fb8292eb836acd366d78` 的调度主线
-> NVIDIA 基线：GPU Operator `v26.3.3`、k8s-device-plugin `v0.19.3`、MIG Manager `v0.14.2`
-> Kueue 基线：`v0.18.3`，release date `2026-07-10`，本课只使用 `kueue.x-k8s.io/v1beta2` 示例
-> 事实核对日期：`2026-07-14`
-> 本课深度：S1。必须能区分物理容量、共享访问、命名空间门槛和批任务预算，能设计 GPU 池、处理重配置、解释排队与成本；不要求实现 MIG firmware、CUDA MPS server 或 Kueue 调度器
+先说结论：**机器还是 8 张物理 GPU。`nvidia.com/gpu=80` 只是 Kubernetes 收到了 80 个“可以申请的共享名额”，绝不是凭空多出 72 张卡。**
+
+这正像 Java 平台把线程池队列从 10 调成 100：能同时排队的任务名额变多了，不代表机器多出 90 个 CPU 核。GPU 更危险，因为同一张卡上的多个进程还会争显存、争算力，并一起承受这张卡的故障。
+
+本课先把几个容易吓人的词翻成人话：
+
+| 术语 | 大白话 | 它真正管什么 |
+|---|---|---|
+| MIG | 把一张支持 MIG 的物理卡切成几块硬件小卡 | 切分卡内硬件资源，隔离强于进程共享 |
+| time-slicing | 多个进程轮流使用同一张卡 | 增加共享访问名额，不保证固定显存和固定算力 |
+| MPS | NVIDIA 在多个 CUDA 进程之间加一层协作服务 | 比纯轮流共享多一些控制，但不是 MIG 硬件切分 |
+| Device Plugin | GPU 厂商放在节点上的“设备盘点员” | 向 kubelet 报设备编号和健康状态，再由 kubelet 形成 Node 资源账 |
+| Capacity / Allocatable | Node 状态里的资源总量 / 可分配上限 | 是 Kubernetes 资源广告，不等于物理库存，也不等于尚未占用的余额 |
+| ResourceQuota | namespace 门口的“最多准许申请多少” | 管 API 接纳，不证明集群里真有这些卡 |
+| Kueue | 批任务的排队和预算管理员 | 决定谁先拿到配额；ResourceFlavor（配额类别标签）或 TAS（拓扑感知调度）可缩小候选范围，但最终 Pod 到 Node 的绑定仍由 kube-scheduler 完成 |
+| flavor | 一类配额的标签，例如 A100 整卡或某种 MIG 规格 | 表示“哪种预算”，不是某一台具体 Node |
+| `Admitted` | Kueue 已预留预算、所需检查已 Ready；启用延迟拓扑分配时还要等拓扑结果 | 不等于 Pod 已被 kube-scheduler 绑定到节点 |
+| DRA | 用声明对象申请设备的一套 Kubernetes 新接口 | 管设备声明和分配流程；不会自动带来性能隔离 |
+
+> 主案例：一套原本按“8 张物理 GPU”规划的集群，在开启 time-slicing 后显示 `nvidia.com/gpu=80`；团队把这 80 个逻辑访问槽当成 80 张卡出售，随后在线推理 P99（99% 请求都不应超过的延迟线）、批训练排队、成本分摊和故障归因同时失真。
+>
+> 组件主线：物理 GPU → MIG/time-slicing/MPS/DRA → Device Plugin 或 DRA 驱动 → Kueue 配额入场 → kube-scheduler 节点放置 → kubelet 分配设备 → GPU 进程 → 指标和成本账。
+>
+> 源码主线：Kueue `v0.18.3` 的 API、队列、cache（内存账本）、admission（配额入场）与 Job 接口；再复用本地 Kubernetes commit `301946d15e67a4a2e8a5fb8292eb836acd366d78` 的调度和 kubelet 主线。
+>
+> NVIDIA 基线：GPU Operator `v26.3.3`、k8s-device-plugin `v0.19.3`、MIG Manager `v0.14.2`。Kueue 基线：`v0.18.3`，本课对象示例使用 `kueue.x-k8s.io/v1beta2`。事实核对日期：`2026-07-14`。
+>
+> 本课深度：定向读关键源码。你要能沿生产现象找到“哪本账出了问题”和关键判断函数；暂时不要求实现 MIG 固件、CUDA MPS server 或 Kueue 调度器。
+
+### 怎么读这章，才不会被六千多行吓住
+
+首遍只走下面七站，其他小节都先当字典：
+
+1. [事故现场：8 张卡为什么显示 80](#ch21-station-1)
+2. [第一段源码：Kueue 到底决定什么](#ch21-station-2)
+3. [方案选择：整卡、MIG、共享怎么选](#ch21-station-3)
+4. [数量账：Node、ResourceQuota、Kueue 为什么对不上](#ch21-station-4)
+5. [两道关：Kueue 入场与 scheduler 放置](#ch21-station-5)
+6. [成本账：共享名额为什么不能直接除](#ch21-station-6)
+7. [值班一页纸：出问题先查什么](#ch21-station-7)
+
+七站走完，再做[首遍验收](#ch21-first-check)。首遍达标线只有三条：能解释“80 不是 80 张卡”；能解释 `Admitted` 为什么仍可能 `Pending`；能把物理卡时和共享名额分开算。第二遍再读 MIG 重配置、Cohort、抢占、公平、多租户与完整事故推演。
+
+**阅读方向约定：** 本章表格按“先选一行，再从左往右比较”来读；流程图从 `LR`（左到右）或 `TB`（上到下）方向读。实线箭头表示实际状态或控制动作的先后关系，虚线箭头只表示“拿来对照”，不代表组件之间同步调用。
+
+**源码阅读约定：** 标成“上游源码、教学注释版”的 Go 代码来自固定版本；中文 `//` 是本讲义新增解释，不是上游原注释。代码块会说明完整函数还是连续摘录，区间外内容不会用 `...` 冒充源码。标成“Go 小例子”的代码只用于讲语法，不会伪装成 Kubernetes 或 Kueue 源码。
 
 ---
 
+<a id="ch21-station-1"></a>
 ## 0. 生产事故：集群为什么突然“多了 72 张 GPU”
 
 周一早上，容量平台显示：
@@ -54,11 +94,11 @@ sharing:
 
 事故继续发展：
 
-1. 在线 vLLM 和批训练共用同一个 time-slicing 节点池；
-2. 批任务开始大 kernel 后，在线请求 TTFT 与 ITL 抖动；
-3. 某个进程吃满显存，邻居进程 CUDA OOM；
-4. 同一物理 GPU 出现 Xid，多个 Pod 同时失败；
-5. Kueue 已把训练 Job 标为 `Admitted`，但 Pod 因节点显存形态和 taint 一直 `Pending`；
+1. 在线 vLLM（一个常见的大模型推理服务）和批训练共用同一个 time-slicing 节点池；
+2. 批任务开始执行很重的 GPU kernel（交给 GPU 跑的一段计算）后，在线请求 TTFT（等到第一个 token 的时间）与 ITL（相邻 token 之间的时间）一起抖动；
+3. 某个进程吃满显存，邻居进程发生 CUDA OOM（GPU 显存不够）；
+4. 同一物理 GPU 出现 Xid（NVIDIA 驱动报告的 GPU 故障代码），多个 Pod 同时失败；
+5. Kueue 已把训练 Job 标为 `Admitted`，但 Pod 因节点显存形态和 taint（节点拒绝规则）一直 `Pending`；
 6. 成本系统把设备级利用率复制给每个共享 Pod，再求和得到 560%；
 7. 财务按 56/80 认定只消耗 70% 卡时，物理机器实际已经按整机计费；
 8. 值班同学看到 Namespace ResourceQuota 还有 8，误以为 Kueue 一定还能放行 8 个任务。
@@ -80,8 +120,9 @@ sharing:
   -> Job对象经过API准入与RBAC
   -> LocalQueue选择租户入口
   -> ClusterQueue检查配额、flavor、借用与公平性
-  -> Kueue形成quota reservation
-  -> 所需AdmissionChecks就绪后Admit
+  -> Kueue形成quota reservation（先把这份预算占住）
+  -> 所需AdmissionChecks（额外检查项）已登记
+  -> 检查项Ready，且延迟拓扑分配不再Pending后Admit
   -> Job解除suspend
   -> Job controller创建Pod
   -> 每个Pod经过API准入与GPU ResourceQuota
@@ -105,6 +146,10 @@ batch Job 创建时，GPU requests 位于 Pod template。
 Job 对象通过创建准入时，不会因为这份 Pod template 立刻扣除 `requests.nvidia.com/gpu`。
 
 真正创建每个 Pod 时才进入 Pod ResourceQuota admission。
+
+第一次出现的 Kueue 对象可以先这样记：`LocalQueue` 是 namespace 内的提交入口，`ClusterQueue` 是集群级预算池，`Workload` 是 Kueue 用来计算整份任务资源的对象，`suspend` 是“先暂停 Job，不让它创建 Pod”的开关。Plain Pod 的 `scheduling gate` 则像 Pod 调度前的一道门，门未移除时 kube-scheduler 不会开始放置。
+
+`DCGM` 是 NVIDIA 的 GPU 指标与健康观测组件；`PodResources` 是 kubelet 暴露的本地资源分配查询接口。它们用于事后把 GPU、Pod 和进程证据连起来，不参与 Kueue 配额审批。
 
 其中最重要的两个不等号是：
 
@@ -141,9 +186,62 @@ GPU 场景也有类似的控制面分层。
 
 因此，本章会借 Java 平台经验解释“队列”和“配额”，但所有最终判断都回到 GPU 设备事实。
 
+先把“8 变 80”的变化画出来。下面从左往右读，实线箭头表示配置和资源广告逐步产生下一层可见状态：
+
+```mermaid
+flowchart LR
+    A["硬件事实：8 张物理 GPU"] --> B["Device Plugin 配置：每张卡 10 个 time-slicing 名额"]
+    B --> C["kubelet 收到 80 个可分配设备 ID"]
+    C --> D["Node.status.capacity：nvidia.com/gpu=80"]
+    D --> E["Node 调度账最多容纳<br/>80 个共享请求单位"]
+    A -.-> F["物理卡数量仍是 8"]
+```
+
+虚线只是在提醒你回头对照物理事实：`Node.status.capacity=80` 没有反向改变硬件。
+
+<a id="ch21-station-2"></a>
+### 0.3 第一段源码：`QuotaReserved` 和 `Admitted` 为什么不是一回事
+
+这一章最容易混淆的一句话是：“Kueue 已经调度成功了。”这句话不准确。Kueue 先做的是**入队和配额准入**：决定任务能不能拿到哪一类预算。ResourceFlavor 或 TAS（拓扑感知调度）还可能给出节点标签、拓扑范围等约束，把候选 Node 缩小；但它们不写 `Pod.spec.nodeName`，最终过滤并绑定具体 Node 的仍是 kube-scheduler。
+
+固定源码：Kueue `v0.18.3`，commit `afd60c37e0c86de83dc0e708f76016b8debe1498`，`pkg/scheduler/scheduler.go:886-892`，完整函数，教学注释版。这个仓库不是本地 Kubernetes 源码的一部分，因此本节明确按 Kueue 固定 tag 与 commit 取证。
+
+```go
+// s 是 Kueue 的 Scheduler，不是 Kubernetes 的 kube-scheduler。
+// wl 是 Kueue Workload；cq 是 ClusterQueue 的内存快照；admission 是本轮算出的配额结果。
+func (s *Scheduler) prepareWorkload(log logr.Logger, wl *kueue.Workload, cq *schdcache.ClusterQueueSnapshot, admission *kueue.Admission) {
+	// 写入 status.admission，并把 QuotaReserved condition 置为 True；这时还不等于 Admitted。
+	workload.SetQuotaReservation(wl, admission, s.clock)
+	// 只有 ClusterQueue 要求的检查项都已登记，才进入 condition 同步；“已登记”不代表已经 Ready。
+	if workload.HasAllRequiredChecks(log, wl, cq.AdmissionChecks) {
+		// 再检查 QuotaReserved、检查项 Ready 状态和延迟拓扑分配，随后同步 Admitted condition。
+		_ = workload.SyncAdmittedCondition(wl, s.clock.Now())
+	}
+}
+```
+
+**大白话总结：** Kueue 先把配额预留写进 Workload；只有检查项已经登记，才继续同步 `Admitted`。真正变成 `Admitted=True` 还要求配额仍有效、所有检查都 Ready，并且没有待完成的延迟拓扑分配。这段代码没有写 `Pod.spec.nodeName`。检查项后来变化时，Workload controller 的 Reconcile 也可能再次调用 `SyncAdmittedCondition`，所以不能说只有 scheduler 这一处会写该条件。
+
+**Go 语法补课：** `func (s *Scheduler)` 里的 `s` 类似 Java 方法中的 `this`；`*Scheduler` 表示拿到的是对象地址，可以读取或修改内部状态。`SyncAdmittedCondition` 返回一个 bool，表示 condition 是否发生变化；`_ = ...` 表示这里故意丢弃这个 bool，但函数仍然执行。
+
+下面从左往右读。每条实线箭头都表示一个对象或状态变化触发下一阶段继续工作，不表示 Kueue 同步调用 kube-scheduler：
+
+```mermaid
+flowchart LR
+    J["Job / Workload 进入队列"] --> Q["Kueue 检查配额与 flavor"]
+    Q -->|"已预留配额，检查与拓扑条件满足"| A["Workload：Admitted=True"]
+    A --> U["Job 解除 suspend 并创建 Pod"]
+    U --> S["kube-scheduler 过滤 Node 并绑定"]
+    S --> K["kubelet 分配具体 GPU 并启动容器"]
+    Q -->|"预算不足"| W["Workload 留在队列等待"]
+    S -->|"节点条件不满足"| P["Pod 仍然 Pending"]
+```
+
 ---
 
-## 1. 先钉死四十个结论
+## 1. 完整结论清单（二遍查阅，不要求首遍背）
+
+这 40 条是后续值班时的查阅索引，不是第一遍的背诵任务。首遍只抓住开头三条达标线；遇到具体事故，再回来查对应结论。
 
 1. 整卡独占、MIG、time-slicing、MPS 和 NVIDIA DRA 是不同层面的方案，不能只按“利用率高不高”选择。
 2. time-slicing 的 `replicas` 是共享访问槽位，不是保底算力份额。
@@ -198,7 +296,7 @@ GPU 场景也有类似的控制面分层。
 | GPU Operator | `v26.3.3` | 组件编排、MIG Manager部署与变更边界 |
 | k8s-device-plugin | `v0.19.3` | MIG策略、time-slicing、MPS资源广告语义 |
 | MIG Manager | `v0.14.2` | MIG几何状态机和`mig-parted`执行 |
-| Kueue | `v0.18.3`，commit `afd60c3` | 队列、quota reservation、admission、公平与抢占 |
+| Kueue | `v0.18.3`，commit `afd60c37e0c86de83dc0e708f76016b8debe1498` | 队列、quota reservation、admission、公平与抢占 |
 | Kueue API | `kueue.x-k8s.io/v1beta2` | 本章所有可复制的对象示例 |
 
 版本账本不是装饰。
@@ -219,7 +317,7 @@ GPU 场景也有类似的控制面分层。
 - [MIG Manager v0.14.2 固定 tag](https://github.com/NVIDIA/mig-parted/tree/v0.14.2)
 - [NVIDIA MIG User Guide](https://docs.nvidia.com/datacenter/tesla/mig-user-guide/)
 - [Kueue v0.18.3 release](https://github.com/kubernetes-sigs/kueue/releases/tag/v0.18.3)
-- [Kueue commit afd60c3](https://github.com/kubernetes-sigs/kueue/tree/afd60c3)
+- [Kueue commit `afd60c37e0c86de83dc0e708f76016b8debe1498`](https://github.com/kubernetes-sigs/kueue/tree/afd60c37e0c86de83dc0e708f76016b8debe1498)
 - [Kueue v1beta2 API](https://kueue.sigs.k8s.io/docs/reference/kueue.v1beta2/)
 - [Kueue ClusterQueue](https://kueue.sigs.k8s.io/docs/concepts/cluster_queue/)
 - [Kueue Cohort](https://kueue.sigs.k8s.io/docs/concepts/cohort/)
@@ -256,6 +354,7 @@ Kueue feature gates与controller配置
 
 ---
 
+<a id="ch21-station-3"></a>
 ## 3. 企业方案决策矩阵：先问隔离与故障域，再问利用率
 
 ### 3.1 五种方案放在同一张表里
@@ -801,7 +900,7 @@ Invoke-Kubectl --context $ExpectedContext get pods -n $OperatorNamespace -o wide
 
 ### 6.6 MIG 几何变更 runbook
 
-#### 前置检查
+#### MIG 变更前置检查
 
 1. 记录 context、Node UID、provider ID、GPU UUID、型号、driver；
 2. 读取当前 `mig.config`、`mig.config.state` 和资源广告；
@@ -812,7 +911,7 @@ Invoke-Kubectl --context $ExpectedContext get pods -n $OperatorNamespace -o wide
 7. 确认 Node 可重启以及云平台不会更换错误实例；
 8. 准备已知良好配置名和回滚窗口。
 
-#### Canary
+#### MIG Canary 节点
 
 只选择一台精确节点。
 
@@ -929,7 +1028,7 @@ canary完成GPU计算和业务探针
 在线池SLO无回归
 ```
 
-#### 回滚
+#### MIG 变更回滚
 
 回滚不是删 label。
 
@@ -1140,7 +1239,7 @@ Xid处置按物理GPU故障域
 
 ### 7.8 time-slicing/MPS 变更 runbook
 
-#### 前置检查
+#### 共享策略变更前置检查
 
 1. 固定 Device Plugin ConfigMap 名、namespace 和 checksum；
 2. 列出目标 NodeSelector 命中的精确 Node；
@@ -1150,7 +1249,7 @@ Xid处置按物理GPU故障域
 6. 确认 ResourceQuota、Kueue flavor 与成本规则同步变更；
 7. 准备旧 ConfigMap 和旧 DaemonSet revision。
 
-#### Canary
+#### time-slicing / MPS Canary
 
 先建立单节点 canary 池。
 
@@ -1173,7 +1272,7 @@ DCGM与PodResources归属
 
 本章不声称已在你的集群通过。
 
-#### 停止扩散
+#### 共享策略停止扩散
 
 - 资源名未按预期改为 `.shared`；
 - 逻辑数量与 `物理数×replicas` 不一致；
@@ -1184,7 +1283,7 @@ DCGM与PodResources归属
 - 指标产生重复归因；
 - 回滚后资源广告不能恢复。
 
-#### 回滚
+#### 共享策略回滚
 
 1. 停止新工作负载进入共享池；
 2. 等待或迁移 canary 任务；
@@ -1390,7 +1489,26 @@ kubectl api-resources
 
 ---
 
+<a id="ch21-station-4"></a>
 ## 10. 三本数量账：不要再问“到底还剩几张卡”
+
+这几本账不是谁覆盖谁，而是分别回答不同问题。下面从上往下读；实线表示同一份工作负载依次会被不同账本检查，虚线表示事后拿来核对，不能据此认为数值应该相等：
+
+```mermaid
+flowchart TB
+    H["物理库存账：机房里到底有几张卡、什么型号"]
+    N["Node 资源广告账：scheduler 看见多少个可申请单位"]
+    R["ResourceQuota：namespace 门口最多准许申请多少"]
+    Q["Kueue quota：这个批任务现在能否拿到队列预算"]
+    C["成本账：实际付了多少物理卡时，怎样向业务分摊"]
+    R --> Q
+    Q --> N
+    H -.-> N
+    H -.-> C
+    N -.-> C
+```
+
+一句话记忆：`ResourceQuota` 管“能不能进门”，Kueue 管“轮到谁拿预算”，Node 账管“有没有位置”，物理库存和成本账管“真实资产与钱”。
 
 ### 10.1 第一本：传统 Device Plugin 的 Node Capacity/Allocatable
 
@@ -1606,6 +1724,7 @@ ClusterQueue admitted usage = 48
 
 ---
 
+<a id="ch21-station-5"></a>
 ## 11. Kueue：它决定“谁先拿预算”，不决定“Pod放哪台Node”
 
 ### 11.1 五个核心对象
@@ -2382,7 +2501,7 @@ GPU 上的 kernel、显存和进程调度由更下层控制。
 
 ### 14.8 Kueue quota/cohort/preemption 变更 runbook
 
-#### 前置检查
+#### Kueue 配额变更前置检查
 
 1. 导出 ClusterQueue、Cohort、ResourceFlavor 和 LocalQueue；
 2. 记录 admitted、pending、borrowed、weightedShare；
@@ -2398,7 +2517,7 @@ GPU 上的 kernel、显存和进程调度由更下层控制。
 
 不要在终端临时 `kubectl edit`。
 
-#### Canary
+#### Kueue 配额 Canary
 
 先修改一个非核心 ClusterQueue 的小额度：
 
@@ -2408,7 +2527,7 @@ GPU 上的 kernel、显存和进程调度由更下层控制。
 - 制造可控的 quota 不足，验证 pending reason；
 - 不用真实长训练验证抢占。
 
-#### 停止扩散
+#### Kueue 配额停止扩散
 
 - 非目标 ClusterQueue quota 变化；
 - 借用计算与评审表不一致；
@@ -2417,7 +2536,7 @@ GPU 上的 kernel、显存和进程调度由更下层控制。
 - controller error 或 status 不收敛；
 - cost/chargeback 无法识别新 flavor。
 
-#### 回滚
+#### Kueue 配额回滚
 
 1. 停止新提交；
 2. 恢复已审阅的旧对象；
@@ -3105,6 +3224,7 @@ MIG 是重要硬件隔离层，不是多租户平台的全部。
 
 ---
 
+<a id="ch21-station-6"></a>
 ## 18. 成本账：先算物理卡时，再谈怎么分摊
 
 ### 18.1 Physical GPU-hours
@@ -3798,7 +3918,7 @@ Pod attribution
 
 以下链接固定到 `v0.18.3` tag。
 
-若 tag 页面与 commit 有差异，继续用本课 commit `afd60c3` 核对。
+若 tag 页面与 commit 有差异，继续用本课 commit `afd60c37e0c86de83dc0e708f76016b8debe1498` 核对。
 
 - [`apis/kueue/v1beta2`](https://github.com/kubernetes-sigs/kueue/tree/v0.18.3/apis/kueue/v1beta2)
 - [`workload_types.go`](https://github.com/kubernetes-sigs/kueue/blob/v0.18.3/apis/kueue/v1beta2/workload_types.go)
@@ -3957,7 +4077,8 @@ cache
 选择ResourceFlavor
 检查nominal与borrow
 必要时评估preemption
-写入quota reservation并形成QuotaReserved
+写入quota reservation
+如果所需AdmissionChecks已经全部Ready，同时同步Admitted condition
 ```
 
 它不执行 Kubernetes Node Filter/Score/Bind。
@@ -3967,23 +4088,23 @@ reservation 之后的职责必须拆开：
 ```text
 pkg/scheduler
   -> flavor/quota/borrowing/preemption
-  -> 写quota reservation
-  -> QuotaReserved=True
+  -> prepareWorkload写quota reservation
+  -> 若所需checks已经Ready，可在同一路径同步Admitted condition
 
 各AdmissionCheck controller
   -> 更新Workload status.admissionChecks中的state与message
 
-workload/admission controller路径
-  -> 观察quota reservation
-  -> 确认所有必需AdmissionChecks为Ready
-  -> 设置Admitted=True
+core WorkloadReconciler
+  -> 同步这个Workload需要哪些AdmissionChecks
+  -> Workload尚未Admitted时再次调用SyncAdmittedCondition
+  -> 条件全部满足后把Admitted更新为True
 
 job framework
   -> 观察Workload已Admitted
   -> resume Job或推进对应集成
 ```
 
-所以 `status.admission` 存在主要证明 quota assignment/reservation，不应直接解释成“scheduler 已完成所有 checks 并写了 Admitted”。
+因此要分清两个事实：`status.admission` 存在主要证明 quota assignment/reservation 已写入；`Admitted=True` 还说明所需 checks 已满足。固定版本里，scheduler 的 `prepareWorkload` 和 core WorkloadReconciler 都可能调用 `SyncAdmittedCondition`，它们是在不同事件时机推进同一个状态条件，不能硬说“永远只由其中一个组件写”。无论谁推进这个 condition，都没有替 kube-scheduler 选择 Node。
 
 ### 20.9 一条源码追踪练习
 
@@ -4070,9 +4191,9 @@ Kueue Workload queue
 
 ---
 
-## 21. 为本章定向补 Go：只学读源码真正用到的语法
+## 21. Go 语法定向补课：只学读这条源码链真正用到的写法
 
-### 21.1 struct 与嵌套
+### 21.1 Go 语法：struct 与嵌套
 
 示意代码，不是从 Kueue 原样复制：
 
@@ -4109,7 +4230,7 @@ spec:
     - cpu
 ```
 
-### 21.2 pointer 与 `omitempty`
+### 21.2 Go 语法：pointer 与 `omitempty`
 
 示意：
 
@@ -4138,7 +4259,7 @@ nil
 
 但“省略”的默认语义必须看 API 注释与 defaulting，不能仅靠 Go 猜。
 
-### 21.3 slice 与 map
+### 21.3 Go 语法：slice 与 map
 
 Slice：
 
@@ -4170,15 +4291,20 @@ ClusterQueue -> usage
 Workload -> assignment
 ```
 
-### 21.4 interface
+### 21.4 Go 语法：interface
 
 示意代码：
 
 ```go
+// GenericJob 只规定能力，不关心背后究竟是 Job、RayJob 还是其他任务对象。
 type GenericJob interface {
+    // Object 返回这个任务对应的 Kubernetes API 对象。
     Object() client.Object
+    // IsSuspended 查询任务当前是否被暂停。
     IsSuspended() bool
+    // Suspend 把任务切到暂停状态。
     Suspend()
+    // RunWithPodSetsInfo 把 Kueue 算出的 PodSet 信息交给具体任务实现。
     RunWithPodSetsInfo([]PodSetInfo) error
 }
 ```
@@ -4189,15 +4315,19 @@ type GenericJob interface {
 
 具体固定版本 interface 方法以源码为准。
 
-### 21.5 `context.Context`
+### 21.5 Go 语法：`context.Context`
 
 常见签名：
 
 ```go
+// Reconcile 处理一次“对象状态可能变化了”的协调任务。
 func (r *Reconciler) Reconcile(
+    // ctx 把取消、超时和日志关联信息传给本轮调用链。
     ctx context.Context,
+    // req 只带本次要处理对象的 namespace/name 等定位信息。
     req ctrl.Request,
 ) (ctrl.Result, error) {
+    // 空 Result 加 nil：本轮成功结束，不主动设置定时重试。
     return ctrl.Result{}, nil
 }
 ```
@@ -4211,13 +4341,17 @@ func (r *Reconciler) Reconcile(
 
 不要把 `ctx` 当业务对象。
 
-### 21.6 receiver
+### 21.6 Go 语法：receiver
 
 ```go
+// (r *Reconciler) 表示这是 Reconciler 对象的方法。
 func (r *Reconciler) Reconcile(
+    // 本轮调用的上下文。
     ctx context.Context,
+    // 要协调的对象定位信息。
     req ctrl.Request,
 ) (ctrl.Result, error) {
+    // 正常结束本轮协调。
     return ctrl.Result{}, nil
 }
 ```
@@ -4228,7 +4362,7 @@ func (r *Reconciler) Reconcile(
 
 > 这个函数属于 Reconciler，函数内通过 r 访问 client、cache、recorder 等成员。
 
-### 21.7 Reconcile result
+### 21.7 Go 语法：Reconcile result
 
 ```go
 return ctrl.Result{}, nil
@@ -4250,7 +4384,7 @@ return ctrl.Result{}, err
 
 表示本轮失败，由 controller-runtime 的错误重试处理。
 
-### 21.8 errors
+### 21.8 Go 语法：errors
 
 常见模式：
 
@@ -4271,7 +4405,7 @@ if err != nil {
 - 日志不能只截取最外层一句；
 - API conflict 通常应重读对象再重试。
 
-### 21.9 Kubernetes Quantity
+### 21.9 Go 语法：Kubernetes Quantity
 
 示意：
 
@@ -4301,7 +4435,7 @@ nvidia.com/gpu: "1500m"
 
 共享通过 Device Plugin/DRA 提供的资源单位表达，不是原生小数 GPU request。
 
-### 21.10 range
+### 21.10 Go 语法：range
 
 ```go
 for i, podSet := range workload.Spec.PodSets {
@@ -4321,7 +4455,7 @@ for i, podSet := range workload.Spec.PodSets {
 还是slice中的原元素？
 ```
 
-### 21.11 defer
+### 21.11 Go 语法：defer
 
 ```go
 defer timer.ObserveDuration()
@@ -4331,7 +4465,7 @@ defer timer.ObserveDuration()
 
 常用于指标计时、unlock、close 和清理。
 
-### 21.12 本章 Go 学习边界
+### 21.12 Go 语法学习边界
 
 必须会：
 
@@ -4723,7 +4857,7 @@ NOT APPLICABLE
 
 ### 23.1 事故一：Workload 已 Admitted，Pod 为什么还 Pending
 
-#### 现象
+#### 现象：Admitted 后 Pod 仍 Pending
 
 ```text
 Workload:
@@ -4738,7 +4872,7 @@ Pod:
   PodScheduled=False
 ```
 
-#### 常见误判
+#### 常见误判：把 Admitted 当成 Scheduled
 
 ```text
 Kueue已经Admitted
@@ -4753,7 +4887,7 @@ Admitted后Pending
   -> 增大ClusterQueue quota
 ```
 
-#### 证据链
+#### 证据链：从 Workload 追到 PodScheduled
 
 第一步，确认 Kueue 层：
 
@@ -4786,7 +4920,7 @@ Admitted后Pending
 - Node 是否刚重配；
 - 资源是否被已绑定 Pod 占用。
 
-#### 控制面与源码
+#### 控制面与源码：Kueue 与 kube-scheduler 分界
 
 ```text
 Kueue scheduler
@@ -4811,7 +4945,7 @@ kube-scheduler
 
 这时应转到第 9、10 课的 scheduler 证据链。
 
-#### 安全处置
+#### 安全处置：保留配额与节点放置证据
 
 1. 不要盲目扩大 quota；
 2. 冻结同类 Job 新提交；
@@ -4821,7 +4955,7 @@ kube-scheduler
 6. 若是 topology 不可满足，重新做 PodSet/节点池设计；
 7. 若 waitForPodsReady 将超时，先评估部分 Pod 副作用。
 
-#### 防复发
+#### 防复发：监控两道关而不是一个状态
 
 - admission 后 placement wait 告警；
 - Flavor 到 Node label 的持续对账；
@@ -4834,7 +4968,7 @@ kube-scheduler
 
 ### 23.2 事故二：把 80 个共享槽当成 80 张物理卡
 
-#### 现象
+#### 现象：80 个共享槽被当成 80 张卡
 
 一台 8 卡节点启用 `replicas=10`：
 
@@ -4845,7 +4979,7 @@ Node Capacity nvidia.com/gpu=80
 财务利用率：56/80=70%
 ```
 
-#### 常见误判
+#### 常见误判：把逻辑广告数当物理库存
 
 把 kubelet 扩展资源广告直接当 CMDB 物理资产。
 
@@ -4861,7 +4995,7 @@ Node Capacity nvidia.com/gpu=80
 物理GPU利用率
 ```
 
-#### 证据链
+#### 证据链：从 replicas 追到物理 GPU
 
 1. CMDB/云实例规格：物理 GPU 数；
 2. GPU UUID 与 PCI Bus ID；
@@ -4872,7 +5006,7 @@ Node Capacity nvidia.com/gpu=80
 7. DCGM：设备级 metric 实体数；
 8. 成本系统：计费实例和小时单价。
 
-#### 控制面与源码
+#### 控制面与源码：共享槽怎样进入 Node 资源账
 
 ```text
 Device Plugin为每个物理设备复制逻辑可分配资源
@@ -4883,7 +5017,7 @@ Device Plugin为每个物理设备复制逻辑可分配资源
 
 kubelet 不负责告诉财务这些单位是不是物理卡。
 
-#### 安全处置
+#### 安全处置：冻结错误售卖口径
 
 1. 立即停止新增承诺；
 2. 标记容量报表口径错误；
@@ -4893,7 +5027,7 @@ kubelet 不负责告诉财务这些单位是不是物理卡。
 6. 核对是否已过度接入严格 SLO 业务；
 7. 不因报表修正而直接驱逐业务，另开容量止损计划。
 
-#### 防复发
+#### 防复发：资源目录同时标明物理与逻辑单位
 
 任何 GPU Dashboard 顶部固定展示：
 
@@ -4909,7 +5043,7 @@ shared_access_slot_count
 
 ### 23.3 事故三：time-slicing 邻居 OOM，随后多个 Pod 同时异常
 
-#### 现象
+#### 现象：共享邻居 OOM 后多 Pod 异常
 
 同一物理 GPU 上 6 个共享 Pod：
 
@@ -4921,7 +5055,7 @@ kernel log出现Xid
 多个Pod重启
 ```
 
-#### 常见误判
+#### 常见误判：把同卡故障当多个独立故障
 
 ```text
 每个Pod请求1个GPU
@@ -4935,7 +5069,7 @@ kernel log出现Xid
   -> 只重启A即可，其他业务无关
 ```
 
-#### 证据链
+#### 证据链：从 Pod 映射回父 GPU
 
 1. Node sharing label；
 2. PodResources 的 device ID；
@@ -4948,7 +5082,7 @@ kernel log出现Xid
 9. 业务 TTFT/ITL；
 10. Device Plugin health 与 Node Allocatable。
 
-#### 控制面与源码
+#### 控制面与源码：time-slicing 的共享故障域
 
 time-slicing 增加访问槽。
 
@@ -4958,7 +5092,7 @@ Kubernetes scheduler 看到每个 Pod 请求 1 个逻辑资源，无法从该整
 
 Device Plugin 的 Allocate 成功也不表示显存预留成功。
 
-#### 安全处置
+#### 安全处置：隔离父卡与受影响 Pod
 
 1. 停止该 Node 新调度；
 2. 标出同物理 GPU 的所有 Pod；
@@ -4969,7 +5103,7 @@ Device Plugin 的 Allocate 成功也不表示显存预留成功。
 7. 将严格 SLO 服务迁出共享池；
 8. 限制模型、batch 和并发参数。
 
-#### 防复发
+#### 防复发：共享池限制显存与租户范围
 
 - `.shared` 资源名；
 - 可信 namespace；
@@ -4984,7 +5118,7 @@ Device Plugin 的 Allocate 成功也不表示显存预留成功。
 
 ### 23.4 事故四：MIG 重配置卡在 pending、failed 或 rebooting
 
-#### 现象
+#### 现象：MIG 重配置停在状态机中
 
 变更单只写：
 
@@ -5014,7 +5148,7 @@ mig.config.state=failed
 Capacity中GPU资源消失
 ```
 
-#### 常见误判
+#### 常见误判：只把重配置当 label 变更
 
 ```text
 kubectl label退出码0
@@ -5028,7 +5162,7 @@ Node重启
   -> kubelet偶发问题
 ```
 
-#### 证据链
+#### 证据链：从 mig.config 追到 Manager 日志
 
 1. 精确 Node name、UID、provider ID；
 2. 变更前后 `mig.config`；
@@ -5043,7 +5177,7 @@ Node重启
 11. GFD label；
 12. DCGM entity。
 
-#### 控制面与源码
+#### 控制面与源码：MIG Manager 重配置状态机
 
 ```text
 Node label变化
@@ -5056,7 +5190,7 @@ Node label变化
   -> success或failed
 ```
 
-#### 安全处置
+#### 安全处置：停止变更并保护节点
 
 1. 保持 Node cordon；
 2. 停止后续节点 rollout；
@@ -5067,7 +5201,7 @@ Node label变化
 7. 对 failed 按已知良好 profile 回滚；
 8. 资源、设备、指标和 canary 全部通过后再 uncordon。
 
-#### 防复发
+#### 防复发：MIG 变更执行维护窗口
 
 - 单节点 canary；
 - GPU workload=0 断言；
@@ -5082,7 +5216,7 @@ Node label变化
 
 ### 23.5 事故五：mixed 策略下资源请求名写错
 
-#### 现象
+#### 现象：mixed 资源名与请求不匹配
 
 Node：
 
@@ -5100,7 +5234,7 @@ resources:
 
 Pod 长期 Pending。
 
-#### 常见误判
+#### 常见误判：把不同扩展资源名相加
 
 ```text
 Node上明明有7个GPU
@@ -5113,7 +5247,7 @@ Node上明明有7个GPU
 把ResourceQuota从1改成10
 ```
 
-#### 证据链
+#### 证据链：对照 Pod 请求与 Node 广告
 
 1. Node Capacity 的完整资源 key；
 2. Pod request 的完整 key；
@@ -5125,7 +5259,7 @@ Node上明明有7个GPU
 8. Device Plugin 配置；
 9. 业务模板来源。
 
-#### 控制面与源码
+#### 控制面与源码：严格资源名匹配
 
 NodeResourcesFit 按资源名分别计算。
 
@@ -5135,7 +5269,7 @@ NodeResourcesFit 按资源名分别计算。
 
 Kueue 也不能把一个 flavor 的 MIG quota 自动兑换成整卡。
 
-#### 安全处置
+#### 安全处置：修正模板前先确认真实资源名
 
 1. 不改 Node 资源；
 2. 确认业务需要整卡还是 profile；
@@ -5144,7 +5278,7 @@ Kueue 也不能把一个 flavor 的 MIG quota 自动兑换成整卡。
 5. 若确实要整卡，调度到整卡池；
 6. 不为一个 Pod 临时重配整节点 MIG 几何。
 
-#### 防复发
+#### 防复发：版本化发布 GPU 资源目录
 
 - 资源目录；
 - ValidatingAdmissionPolicy；
@@ -5189,7 +5323,7 @@ ResourceQuota:
   Pod未创建
 ```
 
-#### 常见误判
+#### 常见误判：把两套配额当同一本账
 
 ```text
 只要ResourceQuota有余
@@ -5203,7 +5337,7 @@ Kueue Dashboard显示有余
   -> Job解除suspend后Pod一定创建成功
 ```
 
-#### 证据链
+#### 证据链：分别检查 ResourceQuota 与 Kueue
 
 1. Job API create 响应；
 2. ResourceQuota `spec.hard` 和 `status.used`；
@@ -5217,7 +5351,7 @@ Kueue Dashboard显示有余
 10. admission checks；
 11. PodSet 总资源。
 
-#### 控制面与源码
+#### 控制面与源码：API 接纳与批任务入场分界
 
 ```text
 Job API admission
@@ -5237,7 +5371,7 @@ Pod API admission / ResourceQuota
 
 任何一个都可以阻止任务继续。
 
-#### 安全处置
+#### 安全处置：先确定被哪一道门拦住
 
 1. 先确定失败发生在哪一层；
 2. Job `FailedCreate` 或无 Pod 时查 Job Event 与 ResourceQuota；
@@ -5247,7 +5381,7 @@ Pod API admission / ResourceQuota
 6. 检查 quota key 是否是正确扩展资源名；
 7. 变更前模拟会影响的其他租户。
 
-#### 防复发
+#### 防复发：两套配额分别监控
 
 同一页面并排展示：
 
@@ -5263,7 +5397,7 @@ Node placement ledger
 
 ### 23.7 事故七：借用后，高优任务抢占导致长训练损失
 
-#### 现象
+#### 现象：抢占让长训练丢失进度
 
 ```text
 team-a nominal=8
@@ -5276,7 +5410,7 @@ team-a训练已运行9小时
 最近checkpoint在3小时前
 ```
 
-#### 常见误判
+#### 常见误判：把配额回收当成本回滚
 
 ```text
 借用就是空闲资源
@@ -5290,7 +5424,7 @@ Priority高
   -> 可以忽略被抢占业务
 ```
 
-#### 证据链
+#### 证据链：从借用追到抢占目标
 
 1. Cohort 和 ClusterQueue 配置；
 2. nominal、borrow、lend；
@@ -5304,7 +5438,7 @@ Priority高
 10. 重启预计成本；
 11. 交付 SLA。
 
-#### 控制面与源码
+#### 控制面与源码：借用与抢占决策
 
 Kueue preemption 在 quota 层选择 victim。
 
@@ -5319,7 +5453,7 @@ Kueue preemption 在 quota 层选择 victim。
 - 财务损失；
 - 业务发布日期。
 
-#### 安全处置
+#### 安全处置：保护 checkpoint 与训练进度
 
 1. 若策略允许，暂停新的抢占扩散；
 2. 保留 victim 与决策证据；
@@ -5329,7 +5463,7 @@ Kueue preemption 在 quota 层选择 victim。
 6. 把丢失 GPU-hours 计入失败成本；
 7. 核对高优任务是否真的可放置，避免“抢占后仍 Pending”。
 
-#### 防复发
+#### 防复发：为可抢占任务定义损失上限
 
 - 只让可恢复任务进入可抢占队列；
 - checkpoint 周期小于回收 SLA；
@@ -5344,7 +5478,7 @@ Kueue preemption 在 quota 层选择 victim。
 
 ### 23.8 事故八：waitForPodsReady 反复循环
 
-#### 现象
+#### 现象：waitForPodsReady 反复释放再入场
 
 ```text
 Workload admitted
@@ -5361,7 +5495,7 @@ requeue
 
 对象存储显示模型被重复下载。
 
-#### 常见误判
+#### 常见误判：把就绪等待当原子 gang
 
 ```text
 waitForPodsReady是gang scheduler
@@ -5374,7 +5508,7 @@ waitForPodsReady是gang scheduler
 增加requeue次数就会恢复
 ```
 
-#### 证据链
+#### 证据链：追踪 admission、Pod 与超时
 
 1. Workload condition 时间线；
 2. `PodsReadyTimeout` reason；
@@ -5388,7 +5522,7 @@ waitForPodsReady是gang scheduler
 10. checkpoint 和临时文件；
 11. Kueue queue wait 与 placement wait。
 
-#### 控制面与源码
+#### 控制面与源码：就绪超时和重排队
 
 ```text
 Kueue先Admit
@@ -5400,7 +5534,7 @@ Kueue先Admit
 
 没有原子回滚已发生的下载和初始化。
 
-#### 安全处置
+#### 安全处置：先阻断循环消耗
 
 1. 暂停或 deactivate 该 Workload；
 2. 停止无限 requeue；
@@ -5410,7 +5544,7 @@ Kueue先Admit
 6. 确认模型 cache 可以安全复用；
 7. 重新提交前进行可放置性检查。
 
-#### 防复发
+#### 防复发：校准超时、backoff 与容量
 
 - `backoffLimitCount`；
 - placement reason 告警；
@@ -5425,7 +5559,7 @@ Kueue先Admit
 
 ### 23.9 事故九：在线和批任务同池，SLO 被“高利用率”吞掉
 
-#### 现象
+#### 现象：在线与批任务同池导致 SLO 抖动
 
 ```text
 GPU utilization从55%升到95%
@@ -5437,7 +5571,7 @@ ITL持续抖动
 
 容量团队认为“利用率更健康”。
 
-#### 常见误判
+#### 常见误判：只看平均 GPU 利用率
 
 ```text
 GPU利用率高
@@ -5451,7 +5585,7 @@ Kueue按quota公平
   -> GPU性能也公平
 ```
 
-#### 证据链
+#### 证据链：关联队列、GPU 与业务延迟
 
 1. Node pool 和 ResourceFlavor；
 2. 在线/批 Pod 是否共享物理 GPU；
@@ -5466,7 +5600,7 @@ Kueue按quota公平
 11. token/GPU-hour；
 12. 错误和取消请求。
 
-#### 控制面与源码
+#### 控制面与源码：配额公平不等于性能隔离
 
 Kueue 只控制哪些 Workload 入场。
 
@@ -5474,7 +5608,7 @@ time-slicing 不提供稳定计算份额。
 
 DCGM 95% 只表示设备忙，不说明忙的是哪个业务，也不说明 SLO。
 
-#### 安全处置
+#### 安全处置：优先恢复在线 SLO
 
 1. 停止新的 batch admission；
 2. 若安全，等待或 checkpoint 当前批任务；
@@ -5484,7 +5618,7 @@ DCGM 95% 只表示设备忙，不说明忙的是哪个业务，也不说明 SLO�
 6. 不为降利用率直接 reset GPU；
 7. 以 SLO 恢复作为验收，而非 DCGM utilization 降低。
 
-#### 防复发
+#### 防复发：在线池与批处理池分离
 
 - online 与 batch 物理分池；
 - Flavor/taint；
@@ -5498,7 +5632,7 @@ DCGM 95% 只表示设备忙，不说明忙的是哪个业务，也不说明 SLO�
 
 ### 23.10 事故十：设备指标被复制到多个 Pod，账单与告警同时翻倍
 
-#### 现象
+#### 现象：共享指标复制导致账单翻倍
 
 同一物理 GPU：
 
@@ -5516,14 +5650,14 @@ DCGM 95% 只表示设备忙，不说明忙的是哪个业务，也不说明 SLO�
 五个Pod都收到“使用80%GPU”的账单
 ```
 
-#### 常见误判
+#### 常见误判：把父设备指标重复归给每个 Pod
 
 ```text
 exporter给metric加了pod label
   -> metric一定是Pod独占值
 ```
 
-#### 证据链
+#### 证据链：核对指标身份键和基数
 
 1. metric HELP/type；
 2. 指标实体是 physical GPU、MIG 还是 process；
@@ -5537,7 +5671,7 @@ exporter给metric加了pod label
 10. 成本 ETL join；
 11. 时间窗与 staleness。
 
-#### 控制面与源码
+#### 控制面与源码：设备指标与 Pod 归因分层
 
 Pod label 是归属提示。
 
@@ -5547,7 +5681,7 @@ Pod label 是归属提示。
 
 PromQL `sum by (pod)` 可以把重复样本变成看似合理的错误结果。
 
-#### 安全处置
+#### 安全处置：停止重复聚合
 
 1. 暂停错误账单；
 2. 冻结相关 recording rule；
@@ -5558,7 +5692,7 @@ PromQL `sum by (pod)` 可以把重复样本变成看似合理的错误结果。
 7. 不删除原始 series；
 8. 通知受影响租户。
 
-#### 防复发
+#### 防复发：建立守恒校验
 
 - metric catalog 记录 entity scope；
 - 联表前唯一键约束；
@@ -5680,6 +5814,7 @@ PromQL `sum by (pod)` 可以把重复样本变成看似合理的错误结果。
 
 ---
 
+<a id="ch21-station-7"></a>
 ## 25. 值班一页纸
 
 ### 25.1 先问五句话
@@ -5911,9 +6046,22 @@ Fair Sharing排序？
 - 用复杂 PromQL 掩盖身份键缺失；
 - 在没有成本口径时做精细 chargeback。
 
-### 27.5 你的达标画像
+<a id="ch21-first-check"></a>
+### 27.5 首遍验收：会说清三件事就可以往后走
 
-完成本章后，应该能在白板上画：
+先合上文档，用大白话回答：
+
+1. 为什么 8 张卡配置 `replicas=10` 后显示 80，但物理卡还是 8？
+2. 为什么 Workload 已经 `Admitted=True`，Pod 仍可能因为资源名、taint 或真实节点容量而 `Pending`？
+3. ResourceQuota、Kueue quota、Node Capacity/Allocatable 分别是谁的账，各回答什么问题？
+4. 为什么 time-slicing 的成本不能直接用物理成本除以 replicas？
+5. 在线 vLLM 和批任务为什么不应该只因“GPU 利用率更高”就共用同一个共享池？
+
+前 3 题能独立说清，就算首遍通过，可以进入后续课程或回到工作现场验证；第 4～5 题说不顺，再复习 §18 和 §16。下面 30 道完整自测不是首遍门槛。
+
+### 27.6 二遍验收：能把控制面、设备和成本连成一张图
+
+二遍完成后，应该能在白板上画：
 
 ```text
 物理GPU
@@ -5935,6 +6083,8 @@ Fair Sharing排序？
 - 最小证据；
 - 常见误判；
 - 安全动作。
+
+还要能任选 §23 的一个事故，从对象状态一路追到源码判断和安全处置；这才算二遍通过。
 
 ---
 
@@ -6075,7 +6225,7 @@ DCGM Exporter:
   4.5.3-4.8.2
 
 Kueue:
-  v0.18.3 / afd60c3 / v1beta2
+  v0.18.3 / afd60c37e0c86de83dc0e708f76016b8debe1498 / v1beta2
 
 vLLM:
   v0.25.0
@@ -6347,7 +6497,7 @@ health
 ### 31.2 Kueue
 
 - [Kueue v0.18.3 release](https://github.com/kubernetes-sigs/kueue/releases/tag/v0.18.3)
-- [Kueue fixed commit afd60c3](https://github.com/kubernetes-sigs/kueue/tree/afd60c3)
+- [Kueue fixed commit `afd60c37e0c86de83dc0e708f76016b8debe1498`](https://github.com/kubernetes-sigs/kueue/tree/afd60c37e0c86de83dc0e708f76016b8debe1498)
 - [Kueue concepts](https://kueue.sigs.k8s.io/docs/concepts/)
 - [ClusterQueue](https://kueue.sigs.k8s.io/docs/concepts/cluster_queue/)
 - [Cohort](https://kueue.sigs.k8s.io/docs/concepts/cohort/)
