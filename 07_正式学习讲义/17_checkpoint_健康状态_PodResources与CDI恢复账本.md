@@ -1,10 +1,62 @@
-# 第 17 课：checkpoint、健康状态、PodResources 与 CDI 恢复账本
+# 第 17 课：kubelet 重启后为什么还记得 GPU 分给了谁——checkpoint、PodResources 与 CDI 恢复账
 
-> 主案例：GPU 训练 Pod 仍在运行，kubelet 重启后 Node 的 GPU 数量短暂归零，PodResources、Pod status 与容器内实际状态又给出了不同答案  
-> 主线源码：`pkg/kubelet/cm/devicemanager/{manager.go,pod_devices.go,checkpoint/*}`、`pkg/kubelet/checkpointmanager/*`、`pkg/kubelet/apis/podresources/*`、`pkg/kubelet/cm/container_manager*.go`、`pkg/kubelet/cm/dra/*`  
-> 源码基线：`301946d15e67a4a2e8a5fb8292eb836acd366d78`（`v1.37.0-alpha.0-280-g301946d15e6`）  
-> 本课深度：S3，读穿“内存分配账 -> 磁盘恢复账 -> 健康投影 -> PodResources 暴露 -> CDI/DRA 分流”  
-> 前置断点：第 16 课已经读到 `podDevices.insert` 保存 device IDs 与完整 `ContainerAllocateResponse`，本课从“为什么还必须落盘、重启后怎样恢复”继续
+> 主案例：GPU 训练 Pod仍在运行，kubelet重启后 Node上的 GPU数量短暂变成 0；可是 PodResources仍能查到旧分配，Pod status甚至还显示 Healthy。三份证据看起来打架，本课用源码把它们分开。
+
+第 16 课已经看到，kubelet把“哪个 Pod、哪个 container分到了哪些 device ID，以及插件要求怎样注入容器”先记在内存里的 `podDevices`。新问题是：**kubelet进程一重启，内存全没了，怎样避免把旧 GPU再次分给另一个 Pod？**
+
+先用大白话记住答案：
+
+1. **checkpoint 是 kubelet写在节点磁盘上的“GPU分配恢复单”。**它主要记旧分配，不保存模型权重、显存内容，也不证明 GPU现在健康。
+2. **kubelet启动时先读恢复单，再等待 Device Plugin重新注册。**恢复单能让它记得旧设备归属，但健康设备清单要等插件重新上报，所以 Node GPU数量可以短暂显示 0。
+3. **PodResources 是查询 kubelet当前内存账的窗口，不是第二个分配器。**查到一个 ID，只能证明 kubelet当前把它归给这个 container，不能证明容器内 CUDA一定能用。
+4. **CDI name只是“去哪里找设备注入说明”的名字。**恢复单里有这个名字，不等于节点上的 CDI spec文件还存在。
+
+标题里的几个词先翻成人话：
+
+| 词 | 大白话 | 本课里不能误解成什么 |
+|---|---|---|
+| checkpoint | kubelet放在本机磁盘上的设备分配恢复单 | 训练任务保存模型进度的 checkpoint |
+| 内存账 | kubelet当前进程里记着的设备、健康集合和 Pod归属 | kubelet重启后天然还在的数据 |
+| 磁盘恢复账 | `kubelet_internal_checkpoint` 等本地文件 | 一份实时、完整、永不损坏的数据库 |
+| PodResources | 通过 Node本地 Unix socket（同一台机器上的“插口文件”）查询 Pod/container资源归属的接口 | 重新进入容器检查 CUDA的工具 |
+| Device Plugin | 节点上的设备插件：向 kubelet报告有哪些GPU设备，并回答怎样把设备交给container | scheduler、container runtime或GPU驱动本身 |
+| ListAndWatch | Device Plugin持续发给kubelet的设备清单；第一包用于告诉kubelet“现在有哪些设备、各自是否健康” | API Server的资源watch，也不是Pod状态 |
+| ContainerAllocateResponse（下文简称AllocateResponse） | Device Plugin针对一个container回答kubelet的“注入清单”，里面可有环境变量、挂载、设备文件和CDI名字 | 容器已经创建成功的证明 |
+| CRI / runtime | CRI是kubelet调用容器运行时的接口；runtime（例如containerd）才真正创建container | Device Plugin或CUDA健康检查 |
+| CUDA | NVIDIA GPU应用常用的计算平台；CUDA调用成功才是更接近应用现场的运行证据 | Kubernetes已经正确记账的同义词 |
+| 投影 | 把内部状态整理成 API或查询接口能看到的样子 | 新的事实来源或新的分配决定 |
+| CDI | 用一个标准名字指向设备注入说明，供 runtime展开设备、挂载等配置 | GPU驱动本身，也不是 Device Plugin本身 |
+| DRA | Kubernetes较新的动态资源申请与分配机制 | 传统 Device Plugin换了一个名字 |
+| fail-open | 恢复文件读失败后记录错误，但这个 manager仍继续启动 | 故障没有风险、可以放心删文件 |
+| 原子替换 | 先写临时文件，再 rename成正式文件，尽量避免半个文件 | 完整数据库事务或绝不丢数据 |
+
+> **表格读法：** 本章表格先从上往下选一行，再在该行从左往右读“证据/对象 → 能证明什么 → 不能证明什么”。同一列上下内容通常是并列比较，不是一条调用链。
+>
+> **图的读法：** 除非图前另有说明，流程图都沿箭头读；箭头表示数据或处理机会向后传播，不代表每一步都是同步RPC（一个进程当场调用另一个进程并等待回答），也不保证几份状态同一时刻更新。
+
+本课仍要**深读到关键源码、异常分支和生产证据**，但不是背完全部函数。源码固定在：
+
+```text
+源码目录：D:\datou\devops\kubernetes-master\kubernetes
+commit：301946d15e67a4a2e8a5fb8292eb836acd366d78
+describe：v1.37.0-alpha.0-280-g301946d15e6
+源码 go.mod / go.work：go 1.26.0
+本机 Go：go1.19.4 windows/amd64
+```
+
+本机 Go低于当前源码要求，因此本课只声明静态源码和现有测试代码核对；不能写成“相关 Go测试已经在本机通过”。
+
+本章源码阅读约定：中文 `//` 是讲义新增的解释，不是 Kubernetes原注释；标成“完整函数”的代码保留原函数全部业务语句。后面用于说明单个判断的短 Go块，除非另有说明，都按**非连续检查点**读：只保留当前结论需要的语句，不能单独复制编译。`text`代码块是流程翻译，不冒充Go源码。
+
+建议分两遍：
+
+- **首遍只走六站：** ① `§0～§1` 看事故并分清三种checkpoint；② `§2` 认清四本账；③ `§3.1` 只读第一段核心源码；④ `§10` 看重启恢复；⑤ `§20` 划清PodResources证据边界；⑥ `§27` 按时间线复述，最后回答`§35`开头五题。首遍目标只是解释“Node 0/0、旧 Pod仍Running、PodResources仍有ID”为什么能同时成立。
+- **二遍再补边界：** `§4～§9 路径/格式/写盘 → §11～§19 失败与健康投影 → §22～§23 DRA/CDI分栏 → §24～§33 取证与故障推演 → §28～§29 Go和测试`。不用第一次就啃完 37 节。
+
+| 阅读遍次 | 通过标准 |
+|---|---|
+| 首遍 | 能画出“内存账、磁盘恢复账、API数量账、runtime事实”四本账，并说清各自不证明什么 |
+| 二遍 | 能沿源码判断恢复文件损坏、插件未重连、设备显式Unhealthy和ID直接消失分别会走哪条分支 |
 
 ---
 
@@ -111,13 +163,15 @@ GPU 场景里“checkpoint”至少可能指三件事。
 
 ### 2.2 四条证据链
 
+下面这张图**从上往下读**。方框表示一段处理链或一份状态，实线箭头表示数据被保存、恢复或继续交给下一层；`C → B`专门表示kubelet重启时从磁盘恢复到内存。箭头不是在说每一步都是同步RPC。
+
 ```mermaid
 flowchart TD
     A["分配链<br/>Pod limit -> scheduler -> DeviceManager -> Allocate"] --> B["podDevices内存账"]
     B --> C["checkpoint恢复链<br/>序列化 -> 原子替换 -> kubelet restart -> 反序列化"]
     D["ListAndWatch健康链<br/>插件清单 -> allDevices -> update channel"] --> E["syncLoop -> 重新生成Pod status"]
     B --> F["归属链<br/>PodResources List/Get"]
-    C --> B
+    C -->|重启时读回| B
     B --> G["RunContainerOptions -> CRI"]
     G --> H["runtime/CDI spec -> 容器进程"]
 ```
@@ -138,7 +192,7 @@ flowchart TD
 
 ## 3. 源码阅读地图：按状态流读，不从 JSON 开始猜
 
-建议按下面顺序跳读：
+这里的 schema 是“checkpoint文件有哪些字段、每个字段放什么”；protobuf 是 Kubernetes组件常用的一种二进制消息格式。建议按下面顺序跳读：
 
 ```text
 1. checkpoint schema
@@ -189,7 +243,39 @@ flowchart TD
 
 这条顺序先回答“数据从哪里来、怎样恢复”，再回答“怎样被看见”。如果先从 API 输出倒推，很容易误以为 PodResources 自己维护了一份设备数据库。
 
+### 3.1 第一眼先看核心源码：kubelet 启动时，先恢复旧分配，再开放插件注册
+
+标题问的是“kubelet重启后为什么还记得 GPU分给了谁”，所以第一段源码直接看 DeviceManager 的启动顺序，不先从 JSON格式和文件权限钻进去。
+
+源码：`pkg/kubelet/cm/devicemanager/manager.go:340-355`，`ManagerImpl.Start` **完整函数，教学注释版**。
+
+```go
+// 参数依次提供日志、活跃Pod查询、Pod来源就绪判断，以及kubelet启动时已知的container现场。
+func (m *ManagerImpl) Start(logger klog.Logger, activePods ActivePodsFunc, sourcesReady config.SourcesReady, initialContainers containermap.ContainerMap, initialContainerRunningSet sets.Set[string]) error {
+	logger.V(2).Info("Starting Device Plugin manager") // 记录管理器开始启动。
+
+	m.activePods = activePods // 保存“怎样取得活跃Pod”，后面清理旧分配会使用。
+	m.sourcesReady = sourcesReady // 保存Pod来源是否就绪的判断器。
+	m.containerMap = initialContainers // 接管已有container身份映射。
+	m.containerRunningSet = initialContainerRunningSet // 接管已有运行container集合。
+
+	// 先从节点磁盘读取旧GPU分配恢复单。
+	err := m.readCheckpoint(logger)
+	if err != nil { // 读取失败时不会在这里终止整个DeviceManager启动。
+		logger.Error(err, "Continue after failing to read checkpoint file. Device allocation info may NOT be up-to-date") // 明确告警：继续启动，但分配账可能不准。
+	}
+
+	return m.server.Start(logger) // 之后才启动kubelet的Device Plugin注册socket，等待插件重新注册。
+}
+```
+
+**大白话总结：** 顺序是“接管 kubelet已有状态 → 读 checkpoint恢复旧分配 → 启动注册服务等待插件”。所以恢复旧 Pod归属和重新获得健康设备清单是两件事。checkpoint读失败时，当前传统 DeviceManager选择记录错误后继续，这正是本课说的 fail-open；它不是“错误可以忽略”，而是可能带着不完整分配账继续运行。
+
+**顺手学 Go：** `func (m *ManagerImpl) Start` 里的 `m` 是指向 ManagerImpl的指针，函数可以修改它内部字段。`err :=` 声明变量；`if err != nil` 表示只在出错时进入；最后 `return m.server.Start(logger)` 会把注册服务的错误原样返回给调用者。
+
 ---
+
+> **首遍跳读：** 下面`§4～§9`是第二遍才看的路径、文件格式和落盘边界。第一次阅读可直接跳到`§10`，先看kubelet重启后状态怎样变化。
 
 ## 4. 三种本地路径不要写成同一个 `root-dir`
 
@@ -198,20 +284,20 @@ flowchart TD
 `NewManagerImpl` 先使用 Device Plugin API 常量：
 
 ```go
-socketPath := pluginapi.KubeletSocket
+socketPath := pluginapi.KubeletSocket // 传统DeviceManager直接采用Device Plugin API定义的固定kubelet socket路径。
 ```
 
 当前 Linux 常量是：
 
 ```go
-DevicePluginPath = "/var/lib/kubelet/device-plugins/"
-KubeletSocket    = DevicePluginPath + "kubelet.sock"
+DevicePluginPath = "/var/lib/kubelet/device-plugins/" // Device Plugin固定目录。
+KubeletSocket    = DevicePluginPath + "kubelet.sock" // 在固定目录下拼出kubelet注册socket。
 ```
 
 `newManagerImpl` 再从 socket path 拆出 `checkpointdir`：
 
 ```go
-manager.checkpointdir, _ = filepath.Split(server.SocketPath())
+manager.checkpointdir, _ = filepath.Split(server.SocketPath()) // 从socket完整路径拆出目录；文件名返回值被显式忽略。
 ```
 
 所以默认传统 checkpoint 是：
@@ -228,12 +314,16 @@ manager.checkpointdir, _ = filepath.Split(server.SocketPath())
 
 这是生产取证很容易找错目录的地方。
 
+**大白话总结：** 传统DeviceManager checkpoint目录是从固定Device Plugin socket路径拆出来的，因此它不跟着 kubelet `--root-dir`移动。
+
+**顺手学 Go：** `:=` 声明变量；字符串用 `+` 拼接；`a, _ = filepath.Split(...)` 中 `_` 表示明确不要第二个返回值。
+
 ### 4.2 PodResources 跟随 kubelet root
 
 `getPodResourcesDir` 使用：
 
 ```go
-filepath.Join(kl.getRootDir(), "pod-resources")
+filepath.Join(kl.getRootDir(), "pod-resources") // 在实际kubelet root下面安全拼出pod-resources子目录。
 ```
 
 socket 因此是：
@@ -248,12 +338,16 @@ KubeletRootDir/pod-resources/kubelet.sock
 /var/lib/kubelet/pod-resources/kubelet.sock
 ```
 
+**大白话总结：** PodResources路径先读取实际kubelet root，再拼子目录；非默认root时不能照抄 `/var/lib/kubelet`。
+
+**顺手学 Go：** `filepath.Join` 会按当前操作系统的路径规则拼接片段，比手写斜杠更稳妥；`kl.getRootDir()` 是方法调用。
+
 ### 4.3 DRA state 也跟随 kubelet root
 
 ContainerManager 构造 DRA manager 时直接传入：
 
 ```go
-dra.NewManager(logger, kubeClient, nodeConfig.KubeletRootDir)
+dra.NewManager(logger, kubeClient, nodeConfig.KubeletRootDir) // 构造DRA manager时直接把kubelet root传进去。
 ```
 
 当前主要文件是：
@@ -262,6 +356,10 @@ dra.NewManager(logger, kubeClient, nodeConfig.KubeletRootDir)
 KubeletRootDir/dra_manager_state
 KubeletRootDir/dra_health_state
 ```
+
+**大白话总结：** DRA的分配账和健康账都以 kubelet root为起点，和传统DeviceManager固定目录不是一套路径规则。
+
+**顺手学 Go：** `dra.NewManager(...)` 是调用 `dra`包的构造函数；点号前是包名，参数按函数签名顺序传入。
 
 最终路径表：
 
@@ -281,26 +379,30 @@ KubeletRootDir/dra_health_state
 当前 schema 的核心是：
 
 ```go
-type DevicesPerNUMA map[int64][]string
+type DevicesPerNUMA map[int64][]string // 一个NUMA编号对应一组device ID。
 
 type PodDevicesEntry struct {
-    PodUID        string
-    ContainerName string
-    ResourceName  string
-    DeviceIDs     DevicesPerNUMA
-    AllocResp     []byte
+    PodUID        string         // 这条分配属于哪一次Pod生命。
+    ContainerName string         // 属于Pod里的哪个container。
+    ResourceName  string         // 资源名，例如nvidia.com/gpu。
+    DeviceIDs     DevicesPerNUMA // 分到的device ID及其NUMA位置。
+    AllocResp     []byte         // Device Plugin完整AllocateResponse序列化后的二进制。
 }
 
 type checkpointData struct {
-    PodDeviceEntries  []PodDevicesEntry
-    RegisteredDevices map[string][]string
+    PodDeviceEntries  []PodDevicesEntry  // 所有已保存的Pod/container分配记录。
+    RegisteredDevices map[string][]string // 写盘时各资源的healthy ID列表；恢复时主要使用resource key。
 }
 
 type Data struct {
-    Data     checkpointData
-    Checksum checksum.Checksum
+    Data     checkpointData    // 真正的恢复数据。
+    Checksum checksum.Checksum // 用来发现内容意外损坏的校验值。
 }
 ```
+
+**大白话总结：** 一条记录的身份不是“第几张GPU”，而是“哪个Pod UID里的哪个container，申请了哪个资源名”。device ID和插件返回的注入说明都挂在这条身份下面，因此同名Pod重建后不能沿用旧UID的记录。
+
+**顺手学 Go：** `map[int64][]string` 表示 key是整数、value是一组字符串；`[]PodDevicesEntry` 表示由多条结构体记录组成的 slice；字段名首字母大写表示可以被包外代码和序列化逻辑访问。
 
 一条 `PodDevicesEntry` 的身份是：
 
@@ -310,7 +412,7 @@ PodUID
   + ResourceName
 ```
 
-它下面可以有多个 NUMA key，每个 key 又可以有多个 opaque device IDs。
+它下面可以有多个 NUMA key。NUMA 可以先理解成“CPU和内存离哪一组硬件更近”的节点拓扑编号；每个 key 又可以有多个 opaque device IDs，opaque表示 kubelet只把它当字符串身份使用，具体含义由 Device Plugin定义。
 
 例如概念上可能是：
 
@@ -329,8 +431,8 @@ AllocResp:
 
 - `DeviceIDs` 的 key 是 NUMA node ID，不是 GPU index；
 - 无 topology 的设备使用 DeviceManager 内部保留 key；
-- device ID 仍由插件定义，可能是 GPU UUID、MIG UUID 或其他逻辑 ID；
-- JSON 中 `[]byte` 会编码成字符串，不能把它当作可直接阅读的嵌套 JSON；
+- device ID 仍由插件定义，可能是 GPU UUID、MIG UUID（把一张支持MIG的物理GPU切出的隔离小实例身份）或其他逻辑 ID；
+- JSON 中 `[]byte` 通常会编码成 base64字符串（把二进制转成可写文本的一种编码），不能把它当作可直接阅读的嵌套 JSON；
 - schema 当前源码仍没有显式版本字段，兼容性依赖实现与测试。
 
 ### 5.1 `RegisteredDevices` 的名字容易让人误解
@@ -338,8 +440,8 @@ AllocResp:
 写 checkpoint 时：
 
 ```go
-for resource, devices := range m.healthyDevices {
-    registeredDevs[resource] = devices.UnsortedList()
+for resource, devices := range m.healthyDevices { // 逐个查看当前已注册资源的healthy集合。
+    registeredDevs[resource] = devices.UnsortedList() // 保存资源名和当时的healthy IDs；顺序不保证稳定。
 }
 ```
 
@@ -347,13 +449,15 @@ for resource, devices := range m.healthyDevices {
 
 但读取时：
 
+下面的 `endpoint` 是 kubelet记录某个 Device Plugin连接状态的对象，不是 Service/EndpointSlice里的后端地址。`stopped endpoint` 表示“记得这个资源名，但当前没有活跃插件连接”的占位对象。
+
 ```go
-for resource := range registeredDevs {
-    m.healthyDevices[resource] = sets.New[string]()
-    m.unhealthyDevices[resource] = sets.New[string]()
-    m.endpoints[resource] = endpointInfo{
-        e: newStoppedEndpointImpl(resource),
-        opts: nil,
+for resource := range registeredDevs { // 恢复时这里只遍历resource key，没有读取旧ID列表。
+    m.healthyDevices[resource] = sets.New[string]() // 先建空healthy集合，等待插件新上报。
+    m.unhealthyDevices[resource] = sets.New[string]() // unhealthy集合也从空开始。
+    m.endpoints[resource] = endpointInfo{ // 为这个旧资源名创建连接占位记录。
+        e: newStoppedEndpointImpl(resource), // 当前没有活跃插件连接，所以标成stopped endpoint。
+        opts: nil, // 旧插件的选项也没有从这里恢复。
     }
 }
 ```
@@ -372,6 +476,10 @@ checkpoint不敢声称：
 
 这就是 kubelet 重启后容量先归零、等待插件首包的源码原因。
 
+**大白话总结：** 写文件时虽然保存了旧healthy ID列表，读文件时却只用“以前有过这个资源名”。kubelet故意不把昨天的健康结论当成今天仍然有效；旧分配可以恢复，新健康清单必须等插件重报。
+
+**顺手学 Go：** `for resource := range registeredDevs` 只接收map的key；没有第二个变量，就没有读取value里的旧ID列表。`sets.New[string]()` 创建的是空字符串集合。
+
 ---
 
 ## 6. `AllocResp []byte`：恢复的不只是 device ID
@@ -381,7 +489,7 @@ checkpoint不敢声称：
 `podDevices.toCheckpointData` 对每个已确认分配执行：
 
 ```go
-allocResp, err := proto.Marshal(devices.allocResp)
+allocResp, err := proto.Marshal(devices.allocResp) // 把完整AllocateResponse编码成可写入checkpoint的bytes，同时返回可能的编码错误。
 ```
 
 保存的对象是完整 `ContainerAllocateResponse`，可能包含：
@@ -394,6 +502,10 @@ allocResp, err := proto.Marshal(devices.allocResp)
 
 第 16 课已经读过：创建或重建容器配置时，`deviceRunContainerOptions` 会重新聚合这些字段。因此只保存 ID 不够；如果 kubelet 重启后不再调用一次新的 Allocate RPC，它还需要知道原插件要求怎样注入容器。
 
+**大白话总结：** checkpoint不只记“分了哪块设备”，还记“以后重建这个container时该怎样把设备交进去”。但它保存的是当时插件的回答，不会自动检查宿主机上的挂载、CDI spec或驱动现在还在不在。
+
+**顺手学 Go：** `proto.Marshal` 返回两个值；`allocResp` 是 `[]byte`，`err` 表示编码有没有失败。拿到bytes不等于拿到可直接阅读的JSON。
+
 ### 6.2 CDI 恢复的精确边界
 
 假设 AllocateResponse 中有：
@@ -402,14 +514,14 @@ allocResp, err := proto.Marshal(devices.allocResp)
 nvidia.com/gpu=GPU-opaque-id-a
 ```
 
-checkpoint 会保留这个 fully-qualified CDI name。恢复后，DeviceManager 能再次把这个 name 放入 `RunContainerOptions.CDIDevices`，再交给 CRI。
+checkpoint 会保留这个 fully-qualified CDI name。这里的 fully-qualified就是“带厂商、设备类别和具体设备名的完整CDI名字”，不是一个随手写的GPU简称。恢复后，DeviceManager 能再次把这个 name 放入 `RunContainerOptions.CDIDevices`，再交给 CRI。
 
 但 checkpoint 不保存：
 
 - `/etc/cdi` 或 `/var/run/cdi` 中的 CDI spec；
 - spec 展开后的 mounts/devices/hooks；
 - containerd 当前 CDI cache；
-- runtime 已经创建的 OCI bundle；
+- runtime 已经生成的最终容器配置（OCI bundle）；
 - 容器内最终看到的 `/dev/nvidia*`。
 
 所以：
@@ -482,7 +594,7 @@ checkpoint中有CDI name
 磁盘账：仍保留终止Pod
 ```
 
-直到下一次 ListAndWatch、新分配或过期 resource 清理触发写盘，磁盘才收敛。
+直到下一次 ListAndWatch、新分配或过期 resource 清理触发写盘，内存和磁盘才重新对齐；后文把这种“状态后来逐步一致”简称为收敛。
 
 如果恰好在这个窗口 kubelet 再重启，旧条目会被重新读回；后续 active Pod 清理还能再次纠正，但不能把这个过程描述成实时强一致。
 
@@ -518,16 +630,16 @@ checkpoint 不是回滚日志，也不是两阶段提交记录。
 `writeCheckpoint` 先锁住 Manager：
 
 ```go
-m.mutex.Lock()
-registeredDevs := make(map[string][]string)
-for resource, devices := range m.healthyDevices {
-    registeredDevs[resource] = devices.UnsortedList()
+m.mutex.Lock() // 先锁住DeviceManager，避免复制过程中内存账被同时改写。
+registeredDevs := make(map[string][]string) // 创建本次准备写盘的资源清单副本。
+for resource, devices := range m.healthyDevices { // 复制每种资源当前的healthy IDs。
+    registeredDevs[resource] = devices.UnsortedList() // set转slice；内容有意义，顺序没有意义。
 }
 data := checkpoint.New(
-    m.podDevices.toCheckpointData(logger),
-    registeredDevs,
+    m.podDevices.toCheckpointData(logger), // 把Pod分配内存账转换成checkpoint记录。
+    registeredDevs, // 同时放入当时的资源清单。
 )
-m.mutex.Unlock()
+m.mutex.Unlock() // 内存快照完成就解锁，磁盘I/O不会一直占着这把大锁。
 ```
 
 然后才进入 checkpoint manager 写盘。这样避免持有 DeviceManager 大锁做磁盘 I/O。
@@ -536,35 +648,43 @@ m.mutex.Unlock()
 
 - 快照完成后，内存可能继续变化；
 - 文件代表某一个时刻的快照，不是持续同步镜像；
-- 快照没有 generation 或 timestamp；
+- 快照没有 generation（可用来判断先后版本的编号）或 timestamp（记录时间）；
 - 不能仅凭文件 mtime 精确还原每个内存事件的先后。
 
-进一步的源码推论：checkpoint manager 的 mutex 只串行化实际文件操作，没有给 DeviceManager 快照编号。并发写请求的落盘顺序取决于它们何时获得 checkpoint manager 的锁，不应把整个过程宣称为可线性化数据库事务。
+进一步的源码推论：checkpoint manager 的 mutex只让同一时刻有一个文件操作，没有给 DeviceManager快照编号。并发写请求的落盘顺序取决于它们何时拿到锁，因此不能说它是“所有并发读写看起来都像严格按一个先后顺序发生”的数据库事务。
+
+**大白话总结：** kubelet在锁内拍一张内存快照，随后拿着照片去写磁盘。这样不让磁盘慢拖住所有设备操作，但照片拍完以后现场还可以继续变化，所以文件永远代表“某一时刻”，不是实时镜像。
+
+**顺手学 Go：** `make(map[string][]string)` 新建一张空map；`Lock`和`Unlock`只保护两者之间的内存复制。`UnsortedList()`把集合变成slice，但不保证ID顺序稳定。
 
 ### 8.2 CheckpointManager 只提供进程内互斥
 
 `CreateCheckpoint`：
 
 ```go
-manager.mutex.Lock()
-defer manager.mutex.Unlock()
+manager.mutex.Lock() // 同一个CheckpointManager实例一次只处理一个文件操作。
+defer manager.mutex.Unlock() // 函数无论从哪条return离开，最后都会解锁。
 
-blob, err := checkpoint.MarshalCheckpoint()
-if err != nil {
-    return err
+blob, err := checkpoint.MarshalCheckpoint() // 让具体checkpoint类型把自身编码成bytes。
+if err != nil { // 编码失败时不能继续写盘。
+    return err // 原样把错误交给调用者。
 }
-return manager.store.Write(checkpointKey, blob)
+return manager.store.Write(checkpointKey, blob) // 编码成功后才交给通用文件store写入。
 ```
 
 这把锁能防止同一个 manager 实例同时写同一 store，但没有：
 
 - 跨 kubelet 进程文件锁；
 - 多主写入协议；
-- WAL；
+- WAL（数据库常见的预写日志，先记恢复日志再改正式数据）；
 - 版本冲突检测；
 - 自动 backup/rollback。
 
 同一 Node 不应有两个 kubelet 同时管理同一 Device Plugin 目录。
+
+**大白话总结：** 这把锁只管“当前这个 kubelet进程里的写文件动作别互相撞车”。它管不了另一个进程，也没有版本号和回滚日志，所以不能把它当成数据库并发控制。
+
+**顺手学 Go：** `defer` 会把解锁登记到函数返回前执行；`return manager.store.Write(...)` 会先调用 `Write`，再把它的 error直接返回。
 
 ### 8.3 FileStore 的替换顺序
 
@@ -578,14 +698,14 @@ return manager.store.Write(checkpointKey, blob)
   -> Rename到正式文件
 ```
 
-临时文件和正式文件在同一目录，因此 Linux/POSIX 常规语义下 `Rename` 能降低“读到半个正式文件”的概率。
+临时文件和正式文件在同一目录，因此在常见Linux本地文件系统上，`Rename`能降低“读到半个正式文件”的概率。
 
 但边界必须说完整：
 
-- 源码没有对父目录做 `fsync`；
+- 源码没有对父目录做 `fsync`（强制把“文件名已经替换”这项目录变化刷到磁盘）；
 - 没有保留上一版 checkpoint；
 - 没有跨进程锁；
-- 底层文件系统、磁盘、断电语义仍会影响 durability；
+- 底层文件系统、磁盘和断电行为仍会影响“断电后数据是否真正保住”；
 - `Rename` 成功不等于所有外部副作用已事务提交；
 - Windows 与非常规文件系统不能直接套用 Linux 本地 ext4/xfs 经验。
 
@@ -594,6 +714,8 @@ return manager.store.Write(checkpointKey, blob)
 ---
 
 ## 9. 权限与 checksum：不要把默认值说成安全保证
+
+`checksum` 可以先理解成“根据文件内容算出的校验指纹”：内容意外改变时，它常能发现不一致；但它没有密钥，所以不是防恶意篡改的安全签名。
 
 ### 9.1 文件 mode
 
@@ -627,20 +749,24 @@ stat -Lc '%A %a %U:%G %s %y %n' \
 `NewFileStore` 先调用：
 
 ```go
-fs.MkdirAll(path, 0755)
+fs.MkdirAll(path, 0755) // 目录不存在就按给定mode创建；已经存在时不会顺便把旧权限改成0755。
 ```
 
 Device Plugin server 后续创建目录时可能使用更严格 mode，但 `MkdirAll` 对已存在目录不会自动改权限。
 
 因此不能只看某一处 `0750` 就承诺最终目录一定是 `0750`。安全基线必须用 `stat`、`getfacl` 与 SELinux 工具核实实际节点。
 
+**大白话总结：** 源码里的创建权限只影响“当时新建”的情况，不能覆盖一个早已存在、权限不同的目录；最终权限必须现场看。
+
+**顺手学 Go：** `0755` 是八进制权限字面量；传给 `MkdirAll` 不代表函数会对已存在目录执行 `chmod`。
+
 ### 9.3 checksum 不是安全签名
 
-`checksum.New` 使用：
+`checksum.New` 使用 FNV-1a——一种很快、但不用于密码安全的哈希算法：
 
 ```go
-hash := fnv.New32a()
-hashutil.DeepHashObject(hash, data)
+hash := fnv.New32a() // 创建一个FNV-1a 32位哈希计算器。
+hashutil.DeepHashObject(hash, data) // 按对象内容稳定地喂给哈希计算器，得到校验指纹。
 ```
 
 最后把 32 位结果放进 `uint64` 类型。
@@ -659,7 +785,11 @@ hashutil.DeepHashObject(hash, data)
 - 机密性；
 - 防重放。
 
-拥有文件写权限的人可以同时修改 data 与 checksum。真正的安全边界仍是 Node root、目录权限、hostPath、MAC 策略与运维流程。
+拥有文件写权限的人可以同时修改 data 与 checksum。真正的安全边界仍是 Node root、目录权限、hostPath、SELinux/AppArmor访问控制与运维流程。
+
+**大白话总结：** checksum适合发现意外损坏，不适合证明文件是谁写的、有没有被恶意改。能写文件的人也能重算一个匹配的checksum。
+
+**顺手学 Go：** `fnv.New32a()` 返回实现哈希接口的对象；第二行把结构化data送进去。变量名叫 `hash` 不等于它具备密码学安全。
 
 ---
 
@@ -667,21 +797,7 @@ hashutil.DeepHashObject(hash, data)
 
 ### 10.1 启动顺序
 
-`ManagerImpl.Start` 的关键顺序：
-
-```go
-err := m.readCheckpoint(logger)
-if err != nil {
-    logger.Error(
-        err,
-        "Continue after failing to read checkpoint file. Device allocation info may NOT be up-to-date",
-    )
-}
-
-return m.server.Start(logger)
-```
-
-也就是：
+完整源码已经在 §3.1 逐行读过，这里不重复粘贴。把它放回重启现场，就是：
 
 ```text
 先读checkpoint
@@ -694,9 +810,9 @@ return m.server.Start(logger)
 `readCheckpoint`：
 
 ```go
-podDevices, registeredDevs := cp.GetData()
-m.podDevices.fromCheckpointData(logger, podDevices)
-m.allocatedDevices = m.podDevices.devices()
+podDevices, registeredDevs := cp.GetData() // 一次取出旧Pod分配记录和旧注册资源记录。
+m.podDevices.fromCheckpointData(logger, podDevices) // 把可解码的分配记录恢复进当前内存账。
+m.allocatedDevices = m.podDevices.devices() // 再从Pod归属账重新汇总“哪些ID已经被占用”。
 ```
 
 恢复结果：
@@ -711,6 +827,10 @@ m.allocatedDevices = m.podDevices.devices()
 | `unhealthyDevices` 的旧 IDs | 否，只建空 set |
 | `allDevices` 与 topology/health | 否 |
 | 活跃 plugin client | 否，使用 stopped endpoint 占位 |
+
+**大白话总结：** 能恢复的是“谁占了哪些ID”和“插件当时要求怎样注入”；不能恢复的是当前硬件清单、健康状态和活跃连接。这就是恢复后旧Pod归属仍在、Node可调度GPU却先变0的根本原因。
+
+**顺手学 Go：** `cp.GetData()` 一次返回两份数据；左边两个变量按位置接收。第三行不是再读一次文件，而是从刚恢复的 `podDevices` 重新计算集合。
 
 ### 10.3 为什么 Node 数量暂时为 0
 
@@ -736,6 +856,20 @@ endpoint                   = stopped placeholder
 旧Pod的已分配ID继续被记住
 新Pod暂时不要按旧健康数量进入Node
 ```
+
+下面这张变化图**从左往右读**。方框是某个时间点的状态，实线是kubelet重启恢复步骤；虚线表示旧runtime container可能跨过这几个阶段继续存在，但是否还能正常使用GPU需要另查。
+
+```mermaid
+flowchart LR
+    A["重启前<br/>podDevices记A→ID-a<br/>healthy=8<br/>Node=8/8"] --> B["kubelet进程停止<br/>内存账消失<br/>磁盘checkpoint仍在"]
+    B --> C["新kubelet读取checkpoint<br/>恢复A→ID-a<br/>health集合为空<br/>Node暂时0/0"]
+    C --> D["Device Plugin重新注册<br/>首份ListAndWatch到达<br/>重建health集合"]
+    D --> E["Node数量随后收敛<br/>例如恢复8/8"]
+    R["旧训练container"] -.->|"可能继续运行"| C
+    R -.->|"运行事实需CUDA/DCGM另证"| E
+```
+
+图里最重要的变化是：`A -> ID-a` 这条旧归属从磁盘恢复，而 `healthy=8` 必须由新插件重新上报。两者不是同一份数据，也不要求同一时刻恢复。
 
 ### 10.4 旧 Pod 为什么仍可能继续通过本地准入
 
@@ -764,6 +898,8 @@ endpoint记录stopTime
 所以“断连五分钟整就一定删完”不精确。五分钟是阈值，清理还需要后续容量收敛调用。
 
 ---
+
+> **首遍跳读：** 下面`§11～§19`是第二遍才看的损坏分支、健康通知和PodResources接口细节。第一次阅读可直接跳到`§20`看“它到底能证明什么”。
 
 ## 11. checkpoint 读取和写入失败矩阵
 
@@ -803,16 +939,17 @@ checkpoint读取错误
 当前实现只是：
 
 ```go
-checkpoints, err := m.checkpointManager.ListCheckpoints()
-if err != nil {
-    return false
+checkpoints, err := m.checkpointManager.ListCheckpoints() // 这里只列目录里的checkpoint名字，不读取内容。
+if err != nil { // 连目录清单都取不到时，不能据此要求重置资源。
+    return false // 返回“不重置”；错误细节也没有由这个bool携带出去。
 }
-return len(checkpoints) == 0
+return len(checkpoints) == 0 // 目录里一个checkpoint都没有时才返回true。
 ```
 
-它检查“store 中是否一个 checkpoint 文件都没有”，并不会：
+这里的`ListCheckpoints`名字很容易骗人：它最终只是列出Device Plugin目录中**所有不带临时文件前缀的目录项**，并不先确认这些条目真是checkpoint普通文件。因此这个函数实际只在“目录清单为空”时返回`true`，它不会：
 
 - 确认特定文件名存在；
+- 排除socket、子目录或其他普通文件；
 - 读取并验证 checksum；
 - 判断内容能否恢复；
 - 比较 Node UID；
@@ -824,9 +961,13 @@ return len(checkpoints) == 0
 目录中有一个损坏文件
   != checkpoint有效
 
-目录中有其他checkpoint
+目录中有其他条目（例如socket或别的文件）
   != DeviceManager恢复账存在
 ```
+
+**大白话总结：** 这个函数只问“目录清单是不是空的”，连条目是不是checkpoint都不确认，更不会读取目标文件。所以返回`false`不能当成传统DeviceManager恢复账存在或健康的证明。
+
+**顺手学 Go：** `len(checkpoints)` 只取得slice长度；变量名叫`checkpoints`不代表slice里的每个目录项已经通过文件类型或内容校验。`== 0`直接生成bool；函数只有bool返回值，因此调用者拿不到这里被吞掉的`ListCheckpoints`错误细节。
 
 ### 11.3 生产恢复顺序
 
@@ -876,7 +1017,7 @@ status:
 
 - 1.31 Alpha，默认关闭；
 - 1.36 Beta，默认开启；
-- feature dependency 当前还要求 `DynamicResourceAllocation`；
+- feature dependency（功能开关之间的依赖）当前还要求 `DynamicResourceAllocation`；
 - 还不是“发现 Unhealthy 就自动修复 Pod”的控制器。
 
 API 类型允许：
@@ -898,24 +1039,28 @@ Unknown
 `UpdateAllocatedResourcesStatus` 当前循环：
 
 ```go
-for i, containerStatus := range status.ContainerStatuses {
-    // 当前实现只遍历普通container status
+for i, containerStatus := range status.ContainerStatuses { // 只遍历普通app container的状态slice。
+    // 当前实现没有同时遍历init和ephemeral container status。
 }
 ```
 
 它没有同时遍历：
 
 - `status.InitContainerStatuses`；
-- `status.EphemeralContainerStatuses`。
+- `status.EphemeralContainerStatuses`，也就是临时调试容器的状态。
 
 所以不能笼统说“所有 container 的设备健康都进入 Pod status”。
+
+**大白话总结：** 当前循环只碰普通业务container的状态；init和ephemeral container不能从这段代码推导出同样的健康投影。
+
+**顺手学 Go：** `range status.ContainerStatuses` 逐项遍历slice；`i`是下标，`containerStatus`是本轮元素副本。循环目标写哪一个slice，决定覆盖范围。
 
 ### 13.2 未找到当前设备时默认 Healthy
 
 对 checkpoint 恢复出来的 ID，代码先设：
 
 ```go
-health := pluginapi.Healthy
+health := pluginapi.Healthy // 查设备之前先把默认值设成Healthy；后面没找到ID时会保留这个值。
 ```
 
 只有 `m.allDevices[resourceName][id]` 当前存在时，才用插件上报的 Health 覆盖。
@@ -930,14 +1075,18 @@ allDevices暂时没有这个ID
 
 这与很多人的直觉“查不到就 Unknown”相反。
 
+**大白话总结：** 代码先写默认Healthy，再尝试用当前设备清单覆盖；ID不存在时覆盖分支不执行，所以最后保留Healthy，而不是自动变Unknown。
+
+**顺手学 Go：** 局部变量的初始值会在分支没进入时继续保留。读 `value, ok := map[key]` 时，必须连同查找前的默认值一起看。
+
 ### 13.3 任何非精确 Healthy 都变成 Unhealthy
 
 后续转换：
 
 ```go
-health := v1.ResourceHealthStatusHealthy
-if d.Health != pluginapi.Healthy {
-    health = v1.ResourceHealthStatusUnhealthy
+health := v1.ResourceHealthStatusHealthy // API输出先默认Healthy。
+if d.Health != pluginapi.Healthy { // 插件值只要不是精确字符串Healthy，
+    health = v1.ResourceHealthStatusUnhealthy // API就折成Unhealthy，没有在这里保留Unknown。
 }
 ```
 
@@ -949,6 +1098,10 @@ if d.Health != pluginapi.Healthy {
 ```
 
 它不会产生 `Unknown`，也没有在这里填健康 message。
+
+**大白话总结：** 传统Device Plugin的这段投影不是完整三态健康模型：查不到旧ID时前一步可能保留默认Healthy；查到了但值不是精确Healthy时，又统一变成Unhealthy。运维不能把API字段当成直接硬件检测结果。
+
+**顺手学 Go：** `!=` 是“不等于”；这里没有 `else if Unknown` 分支，因此所有非Healthy值都落入同一个赋值。
 
 ### 13.4 插件断连不会刷新 `allDevices` 或通知 Pod
 
@@ -973,6 +1126,21 @@ Pod allocatedResourcesStatus仍显示旧Healthy
 ```
 
 Capacity 在宽限期内仍可能保留总设备数，因为 unhealthy 仍计入 Capacity；Allocatable 只数 healthy，所以归零。
+
+下面这张分叉图**从左往右读**，展示“显式上报Unhealthy”和“插件直接断连”为什么不能混成同一件事。方框是当时的状态或动作，实线是当前函数里直接发生的变化；虚线表示Pod status是否及时更新还取决于通知和后续SyncPod，不是断连函数里的同步写API。
+
+```mermaid
+flowchart LR
+    A["原来：插件连接<br/>ID-a=Healthy<br/>Node Allocatable包含ID-a"]
+    A --> B["分支1：ListAndWatch仍带ID-a<br/>Health明确变Unhealthy"]
+    B --> C["比较old/new Health<br/>尝试发送受影响Pod UID"]
+    C -.-> D["后续SyncPod<br/>Pod status可变Unhealthy"]
+    A --> E["分支2：插件socket断连"]
+    E --> F["healthy集合移到unhealthy<br/>Node Allocatable可归0"]
+    F -.-> G["旧allDevices Health未改<br/>未主动发送Pod更新<br/>Pod status可暂留Healthy"]
+```
+
+因此，`Node Allocatable=0`和`Pod allocatedResourcesStatus=Healthy`可以同时出现；它们分别来自不同内存结构和不同传播链，不能互相否定。
 
 ### 13.5 设备从完整清单中“消失”也有缺口
 
@@ -1000,7 +1168,7 @@ Capacity 在宽限期内仍可能保留总设备数，因为 unhealthy 仍计入
 健康变化定位 Pod 时调用：
 
 ```go
-m.podDevices.getPodAndContainerForDevice(deviceID)
+m.podDevices.getPodAndContainerForDevice(deviceID) // 只拿raw device ID反查，没有同时传resource name。
 ```
 
 参数没有 resource name。函数会遍历所有 resource，找到第一个包含相同 raw ID 的条目就返回。
@@ -1008,6 +1176,10 @@ m.podDevices.getPodAndContainerForDevice(deviceID)
 如果两个不同 Device Plugin resource 恰好都使用 `device-0` 这种 ID，理论上可能把健康通知归到错误 Pod。GPU UUID 通常降低碰撞概率，但 kubelet 协议允许 opaque string，平台不能依赖“肯定全局唯一”。
 
 这是当前实现的边界，不是建议人为构造碰撞做生产实验。
+
+**大白话总结：** 反查函数只收到raw ID，没有resource name这层命名空间；不同插件若碰巧使用同一字符串，理论上会产生歧义。GPU UUID通常降低概率，但协议没有替平台保证全局唯一。
+
+**顺手学 Go：** 方法调用只传了一个 `deviceID` 参数；函数签名里缺少resource name，调用点也就无法用它消除歧义。
 
 ---
 
@@ -1031,21 +1203,23 @@ Device Plugin ListAndWatchResponse
 
 ### 14.1 DeviceManager channel 是 best effort 通知
 
+`best effort`直译就是“尽力通知”：能立刻塞进队列就发，队列满了就记日志并放弃这一次提醒，不承诺每条提醒必达。
+
 DeviceManager 初始化：
 
 ```go
-update: make(chan resourceupdates.Update, 100)
+update: make(chan resourceupdates.Update, 100) // 创建最多暂存100条设备更新通知的channel。
 ```
 
 发送使用：
 
 ```go
-select {
-case m.update <- resourceupdates.Update{PodUIDs: podsToUpdate.UnsortedList()}:
-default:
-    logger.Error(
-        errors.New("device update channel is full"),
-        "discard pods info",
+select { // 尝试把受影响Pod UID列表送给下游。
+case m.update <- resourceupdates.Update{PodUIDs: podsToUpdate.UnsortedList()}: // channel能立即接收时发送成功。
+default: // channel已满时不等待，直接走丢弃分支。
+    logger.Error( // 留日志说明丢的是“立即同步哪些Pod”的通知。
+        errors.New("device update channel is full"), // 结构化错误原因。
+        "discard pods info", // 日志文字明确Pod信息被丢弃。
     )
 }
 ```
@@ -1059,9 +1233,13 @@ channel 满时不会阻塞 ListAndWatch 处理，而是丢弃本次 Pod UID 通�
 
 后续其他 Pod sync 可能再次生成正确状态，所以它不一定永久错误；但即时性没有保证。
 
+**大白话总结：** 设备新Health已经写进内存账，可能丢的是“马上叫哪些Pod重算status”的门铃。这样保护ListAndWatch处理不被堵死，代价是Pod API状态可能晚到下一次同步才更新。
+
+**顺手学 Go：** `make(chan T, 100)` 创建带缓冲channel；`select`里有 `default` 就表示不能立即发送时不阻塞。`UnsortedList()` 也说明UID顺序不能当身份。
+
 ### 14.2 ContainerManager 还有一层 fan-in
 
-ContainerManager 把 DeviceManager、DRA manager 等更新合并到一个 buffer 为 10 的 channel。fan-in goroutine 向该 channel 发送时没有 `default`，下游慢会形成背压。
+`fan-in` 就是“把多个来源的消息汇进同一个出口”。ContainerManager把 DeviceManager、DRA manager等更新合并到一个容量为10的 channel。负责汇总的 goroutine（Go里的轻量后台任务）向该 channel发送时没有 `default`，所以下游一直不接收时，发送者也会被迫等着；这就是背压，也就是“下游处理慢，上游跟着被卡住”。
 
 这与 DeviceManager 自己“buffer 100、满则丢”的语义不同。排障日志要区分：
 
@@ -1100,6 +1278,8 @@ ContainerManager 把 DeviceManager、DRA manager 等更新合并到一个 buffer
 
 ### 15.1 socket 与服务注册
 
+Unix socket 是同一台 Node上进程间通信使用的本地“插口文件”；gRPC是双方约定请求方法和消息格式的一套调用协议。PodResources不经过 Kubernetes Service网络，而是让获准的 Node本地程序连接这个 socket。
+
 当前 kubelet 启动：
 
 ```text
@@ -1111,7 +1291,7 @@ KubeletRootDir/pod-resources/kubelet.sock
 - `v1alpha1.PodResourcesLister`；
 - `v1.PodResourcesLister`。
 
-限流默认值：
+限流默认值：QPS表示平均每秒允许多少次请求，Burst表示短时间突发时最多先放行多少次。
 
 ```text
 QPS   = 100
@@ -1201,19 +1381,25 @@ PodResources socket 是节点资源拓扑的信任边界，不是“反正只读
 
 ## 17. v1 `List`：一个查询为什么会改内存账
 
+下面以v1为主线；v1alpha1的`List`当前也会调用同一个`UpdateAllocatedDevices`，所以“查询前可能清理传统设备内存账”不是v1独有行为。
+
 关键顺序：
 
 ```go
-if p.useActivePods {
-    pods = p.podsProvider.GetActivePods()
-} else {
-    pods = p.podsProvider.GetPods()
+if p.useActivePods { // 当前功能开关要求只展示仍活跃的Pod时，
+    pods = p.podsProvider.GetActivePods() // 先取得过滤后的活跃Pod集合。
+} else { // 兼容旧行为时，
+    pods = p.podsProvider.GetPods() // 取得Pod manager里的更完整集合。
 }
 
-p.devicesProvider.UpdateAllocatedDevices()
+p.devicesProvider.UpdateAllocatedDevices() // 在生成响应前顺便用活跃Pod清理传统设备内存账。
 ```
 
 然后才逐 Pod、container 读取资源。
+
+**大白话总结：** `List`不是纯粹“照相”：它先决定列哪些Pod，又触发一次传统DeviceManager内存清理，再生成响应。但这个清理不立刻写checkpoint，所以一次查询后，内存账和磁盘账可以暂时不同。
+
+**顺手学 Go：** `if ... else` 只选择一套Pod集合；无论选哪一套，后面的 `UpdateAllocatedDevices()` 都会执行，因为它写在分支外面。
 
 ### 17.1 当前默认 active Pods
 
@@ -1233,7 +1419,7 @@ p.devicesProvider.UpdateAllocatedDevices()
 
 ```text
 调用PodResources List
-  -> 可能触发传统DeviceManager内存GC
+  -> 可能触发传统DeviceManager内存清理
 ```
 
 但它不立即写 checkpoint，于是 List 之后可能形成：
@@ -1315,13 +1501,17 @@ kubelet provider：
 
 ```go
 return nil, fmt.Errorf(
-    "pod %s in namespace %s not found",
-    req.PodName,
-    req.PodNamespace,
+    "pod %s in namespace %s not found", // 组装普通Go error文字。
+    req.PodName, // 第一个%s填Pod名。
+    req.PodNamespace, // 第二个%s填namespace。
 )
 ```
 
 它没有在这里显式构造 gRPC `codes.NotFound`。客户端应以实际返回行为兼容，不能硬编码“必然收到 NotFound status code”。
+
+**大白话总结：** 服务端确实说“没找到”，但这段返回的是普通Go error，不是这里显式标注过的gRPC NotFound状态码。客户端应按目标版本实测处理，不能只凭错误文字猜协议码。
+
+**顺手学 Go：** `fmt.Errorf` 按格式串生成一个error；`return nil, err` 的第一个位置表示没有正常响应对象，第二个位置携带错误。
 
 ### 18.3 名字定位，UID 取账
 
@@ -1345,15 +1535,15 @@ API 请求没有 Pod UID，但内部最终以 Pod manager 返回对象的真实 
 当前 v1 返回：
 
 ```go
-Devices: p.devicesProvider.GetAllocatableDevices()
-CpuIds:  p.cpusProvider.GetAllocatableCPUs()
-Memory:  p.memoryProvider.GetAllocatableMemory()
+Devices: p.devicesProvider.GetAllocatableDevices() // 取传统DeviceManager当前认为Healthy的设备集合。
+CpuIds:  p.cpusProvider.GetAllocatableCPUs() // 取CPUManager定义的可分配CPU集合。
+Memory:  p.memoryProvider.GetAllocatableMemory() // 取MemoryManager定义的可分配内存块。
 ```
 
 对于传统 DeviceManager：
 
 ```go
-allDevices.Filter(healthyDevices)
+allDevices.Filter(healthyDevices) // 从全部设备中保留当前Healthy的ID；这里没有减去已分配ID。
 ```
 
 它没有减去 `allocatedDevices`。
@@ -1385,7 +1575,13 @@ DeviceManager本地可新分配候选:
 
 这和 CPUManager 的 `GetAllocatableCPUs` 语义不能简单类比为同一个“free”概念。
 
+**大白话总结：** RPC名字里的 Allocatable 不等于“尚未分配”。对传统设备，这里返回Healthy全集；想算还能新分几个，DeviceManager内部还要再扣除 `allocatedDevices`。
+
+**顺手学 Go：** 结构体字面量里的 `Field: value` 给指定字段赋值；`Filter` 返回集合筛选结果，但筛选条件里没有 `allocatedDevices`，所以不能自行脑补扣减。
+
 ### 19.1 MIG 与 time-slicing
+
+MIG是把支持该能力的一张物理GPU切成多个有硬件隔离的实例；time-slicing是让多个逻辑份额轮流共享同一张物理GPU，通常不提供MIG那种硬件隔离。两者都会让“接口里有几条device entry”不再等于“有几张物理卡”。
 
 返回的是插件广告的逻辑 device entries：
 
@@ -1422,7 +1618,7 @@ DRA claim/device 归属出现在每个 container 的 `DynamicResources`，不是
 | Get 返回 CPU IDs | CPUManager 当前有 exclusive CPU 归属 | 容器 CPU 利用率 |
 | GetAllocatable 返回 8 个设备 | 当前 DeviceManager 认为 8 个 ID Healthy | 还有 8 个空闲 |
 | DynamicResources 有 claim | DRA manager 当前能映射该 container 与 claim/device | driver 已成功完成所有运行时动作 |
-| List 没有某 terminal Pod | active-Pod 过滤或内存 GC 已生效 | checkpoint 磁盘中一定没有旧条目 |
+| List 没有某 terminal Pod | active-Pod 过滤或内存清理已生效 | checkpoint 磁盘中一定没有旧条目 |
 
 PodResources 不返回传统设备的：
 
@@ -1438,6 +1634,8 @@ PodResources 不返回传统设备的：
 因此它适合做“GPU 指标归属的一个输入”，不能独立做最终健康判定。
 
 ---
+
+> **首遍跳读：** 下面`§21～§26`是版本差异、DRA/CDI和取证脚本，留到第二遍。第一次阅读可直接跳到`§27`做四账时间线练习。
 
 ## 21. 一个旧材料校准：DynamicResources 现在由谁控制
 
@@ -1470,14 +1668,14 @@ PodResources是否出现DynamicResources
 
 ## 22. 传统 Device Plugin 与 DRA：两套恢复与暴露链
 
-| 维度 | 传统 Device Plugin | DRA |
+| 比较项 | 传统 Device Plugin | DRA |
 |---|---|---|
 | Pod 请求模型 | extended resource limit，例如 `nvidia.com/gpu: 1` | ResourceClaim、ResourceClaimTemplate，或受控的 extended-resource 转换 |
 | 节点内分配主账 | `podDevices`、`allocatedDevices` | claim info cache、driver/device state |
 | 分配 checkpoint | 固定 Device Plugin 目录下 `kubelet_internal_checkpoint` | `KubeletRootDir/dra_manager_state` |
 | health state | Device Plugin ListAndWatch 的 Device.Health | DRA health stream 与 `dra_health_state` |
-| 分配 state 读取损坏 | DeviceManager `Start` 记录后继续空账 | `NewManager` 返回错误，ContainerManager 构造失败 |
-| health state 读取损坏 | 不单独持久化最新传统 Health | 记录错误并以空 health cache 继续 |
+| 整个分配 state 无法读取或校验 | DeviceManager `Start` 记录后继续，启动时的`podDevices`保持空 | `NewManager` 返回错误，ContainerManager 构造失败 |
+| health state 读取损坏 | 不单独持久化最新传统 Health | 记录错误后继续；解码失败后的cache不能直接断言为空 |
 | 是否依赖 Node extended-resource Capacity | 是，传统 scheduler 数量路径 | 原生 DRA 不要求用同名 Node Capacity 表示设备 |
 | CDI 持久化 | CDI names 在序列化 AllocateResponse 中 | CDI device IDs 在 claim/driver/device state 中 |
 | PodResources 暴露 | `ContainerDevices`：resource name、IDs、NUMA | `DynamicResources`：claim、driver、pool、device、share ID、CDI names |
@@ -1490,11 +1688,13 @@ PodResources是否出现DynamicResources
 传统 DeviceManager：
 
 ```text
-checkpoint损坏
+传统checkpoint外层JSON或checksum无法通过
   -> log
   -> 继续启动Device Plugin server
   -> 空分配账
 ```
+
+这行只说“整个文件没读进来”。若只是某一条`AllocResp` protobuf解码失败，传统路径会跳过那一条、继续恢复其他条目，前面的`§11`失败矩阵已经单独列出。
 
 DRA allocation state：
 
@@ -1510,7 +1710,7 @@ newClaimInfoCache
 DRA 自己又分成两本文件：
 
 - `dra_manager_state`：分配/claim 恢复，读取失败会阻断 manager 构造；
-- `dra_health_state`：健康缓存，读取失败记录后空缓存继续。
+- `dra_health_state`：健康缓存。文件不存在时以空cache开始；其他读取或JSON解码错误会被记录，但manager继续构造。代码没有在解码报错后显式再清空对象，所以损坏内容应判为“不可信”，不能一律断言“必然是空cache”。
 
 同样是 DRA，也不是一个统一策略。
 
@@ -1518,7 +1718,7 @@ DRA 自己又分成两本文件：
 
 传统路径必须把 resource 数量写进 Node Capacity/Allocatable，scheduler 才能按 extended resource 过滤。
 
-原生 DRA 以 ResourceClaim、DeviceClass 和 ResourceSlice 等对象描述供给与请求。它的设备归属不需要再额外制造一个 `nvidia.com/gpu=8` 才能成立。
+原生 DRA 以三类对象描述供给与请求：ResourceClaim是Pod的“设备申请单”，DeviceClass是“要匹配哪一类设备”的规则，ResourceSlice是driver发布的可用设备清单。它的设备归属不需要再额外制造一个 `nvidia.com/gpu=8` 才能成立。
 
 `DRAExtendedResource` 是兼容与迁移边界，不能反过来得出“所有 DRA 都仍靠传统 DeviceManager checkpoint”。
 
@@ -1557,7 +1757,7 @@ DRA 的 claim info state 直接保存：
 - driver name；
 - pool name；
 - device name；
-- optional share ID；
+- optional share ID（同一device允许共享时，用来区分具体份额的标识）；
 - CDI device IDs。
 
 `GetDynamicResources` 再转换为：
@@ -1584,24 +1784,23 @@ containers[].dynamicResources[].claimResources[].cdiDevices[]
 
 ### 23.3 当前 DRA 转换还有一个累计边界
 
-当前 `container_manager_linux.go` 的循环大意是：
+源码：`pkg/kubelet/cm/container_manager_linux.go:1067-1082`，**连续摘录**；保留了组装每条`ClaimResource`的完整driver/device循环，中文注释为讲义新增。
 
 ```go
-for driverName, driverState := range containerClaimInfo.DriverState {
-    var cdiDevices []*podresourcesapi.CDIDevice
-    for _, device := range driverState.Devices {
-        for _, cdiDeviceID := range device.CDIDeviceIDs {
-            cdiDevices = append(cdiDevices, &podresourcesapi.CDIDevice{
-                Name: cdiDeviceID,
-            })
+for driverName, driverState := range containerClaimInfo.DriverState { // 逐个处理DRA driver及其设备状态。
+    var cdiDevices []*podresourcesapi.CDIDevice // 注意：这个slice在同一driver的设备循环外创建。
+    for _, device := range driverState.Devices { // 再逐个处理该driver分给container的device。
+        for _, cdiDeviceID := range device.CDIDeviceIDs { // 把当前device声明的CDI ID逐个转换。
+            cdiDevices = append(cdiDevices, &podresourcesapi.CDIDevice{Name: cdiDeviceID}) // 把完整CDI name追加到同一个累计slice。
         }
-        resources := &podresourcesapi.ClaimResource{
-            CdiDevices: cdiDevices,
-            DriverName: driverName,
-            PoolName:   device.PoolName,
-            DeviceName: device.DeviceName,
+        resources := &podresourcesapi.ClaimResource{ // 为当前device组装一条PodResources记录。
+            CdiDevices: cdiDevices, // 当前写入的是截至此刻累计的slice，不只当前device新增部分。
+            DriverName: driverName, // DRA driver身份。
+            PoolName:   device.PoolName, // driver里的设备池身份。
+            DeviceName: device.DeviceName, // 池内device身份。
+            ShareId:    (*string)(device.ShareID), // 保留当前device的可选共享份额身份。
         }
-        claimResources = append(claimResources, resources)
+        claimResources = append(claimResources, resources) // 把本条记录加入claim结果。
     }
 }
 ```
@@ -1610,17 +1809,19 @@ for driverName, driverState := range containerClaimInfo.DriverState {
 
 这是根据当前代码结构得出的实现边界；现有定向测试没有单独锁定“多个 device 的 CDI 列表必须逐 device 隔离”。消费者不要仅凭数组位置把每个 CDI name 反向归因到唯一 device，应同时保留 driver/pool/device 三元组并校准目标版本。
 
+**大白话总结：** 同一driver下有多个device时，`cdiDevices`没有在每个device开始前清空，后一个记录可能带上前面已经累计的CDI name。这里是在描述当前实现边界，不是说所有DRA driver一定都会触发错误。
+
+**顺手学 Go：** `var cdiDevices []*T` 声明一个起初为nil的slice；`append` 会累计元素。变量声明在哪一层循环外，决定它是“每个driver重置”还是“每个device重置”。
+
 ### 23.4 Pod status 的 DRA ResourceID 也不总是 device name
 
-当前 `buildResourceHealth`：
+源码：`pkg/kubelet/cm/dra/manager.go:967-971`，`buildResourceHealth`中的**连续摘录**；这里只回答ResourceID怎样选择。
 
 ```go
-if len(device.CDIDeviceIDs) > 0 {
-    resourceHealth.ResourceID = v1.ResourceID(device.CDIDeviceIDs[0])
-} else {
-    resourceHealth.ResourceID = v1.ResourceID(
-        fmt.Sprintf("%s/%s/%s", driverName, device.PoolName, device.DeviceName),
-    )
+if len(device.CDIDeviceIDs) > 0 { // 当前device至少有一个CDI ID时，
+    resourceHealth.ResourceID = v1.ResourceID(device.CDIDeviceIDs[0]) // 只取第一个CDI ID作为API ResourceID。
+} else { // 没有任何CDI ID时，
+    resourceHealth.ResourceID = v1.ResourceID(fmt.Sprintf("%s/%s/%s", driverName, device.PoolName, device.DeviceName)) // 用driver/pool/device拼一个回退身份。
 }
 ```
 
@@ -1631,9 +1832,15 @@ if len(device.CDIDeviceIDs) > 0 {
 
 做跨 API join 时不能默认 `resourceID == deviceName`。
 
+**大白话总结：** DRA健康字段里的 `resourceID`不是固定等于device name：有CDI ID就优先用第一条，没有才拼driver/pool/device。跨系统对账前必须先确认这一条身份生成规则。
+
+**顺手学 Go：** `len(slice) > 0` 先确认slice不为空，之后才能安全读取 `[0]`；`v1.ResourceID(...)` 是把字符串转换成API定义的ResourceID类型。
+
 ---
 
 ## 24. 全链证据矩阵：每份证据只证明一层
+
+先翻译三个后面反复出现的GPU词：DCGM是NVIDIA提供的GPU监控与健康工具；Xid是NVIDIA驱动记录的一类错误编号；ECC是显存纠错相关的计数。它们回答硬件和驱动现场，不回答kubelet把设备记给了谁。
 
 | 证据 | 主要事实源 | 能证明 | 不能直接证明 |
 |---|---|---|---|
@@ -2051,6 +2258,8 @@ metadata 可以回答：
 
 ---
 
+> **首遍到这里先做`§35`开头五题。** `§28～§34`是Go语法索引、测试证据和生产推演，作为第二遍加深，不是进入下一课的门槛。
+
 ## 28. 本课针对性的 Go 语法
 
 你不需要先学完整 Go，再读本章。只补下面七个语法点。
@@ -2085,6 +2294,8 @@ container name
 
 源码里 map 迭代顺序不稳定，所以 checkpoint 条目、PodResources entry 和 health resource 的数组顺序都不能被当作稳定身份。
 
+**大白话总结：** 嵌套map要一层层读“外层key指向什么”；遍历顺序随时可能变化，真正身份要看key和字段，不能看数组第几个。
+
 ### 28.2 `[]byte` 不是字符串
 
 ```go
@@ -2105,6 +2316,8 @@ proto.Unmarshal(entry.AllocResp, allocResp)
 
 `string(entry.AllocResp)` 不会自动把 protobuf 变成可读 JSON。生产上也不应为了“看懂”就把敏感 bytes 在线解码外发。
 
+**大白话总结：** `[]byte`只是原始字节；知道它由protobuf编码，才能用匹配的消息类型解码。强转string既不等于JSON，也可能泄露敏感内容。
+
 ### 28.3 interface：checkpoint manager 不关心具体 schema
 
 ```go
@@ -2118,6 +2331,8 @@ type Checkpoint interface {
 只要具体类型实现这三个方法，就能交给通用 CheckpointManager。
 
 DeviceManager 的 `checkpoint.Data` 自己知道字段；FileStore 只知道 bytes。这是“业务 schema”和“通用持久化”分层。
+
+**大白话总结：** interface让通用CheckpointManager只依赖三项能力，不必知道每种checkpoint的具体字段；具体类型负责把自己变成bytes并校验。
 
 ### 28.4 多返回值
 
@@ -2140,6 +2355,8 @@ podDevices, registeredDevs := cp.GetData()
 manager.checkpointdir, _ = filepath.Split(server.SocketPath())
 ```
 
+**大白话总结：** Go函数可以一次返回多个值，左边按位置接收；确实不需要的返回值用 `_` 明确丢掉。
+
 ### 28.5 `range` 值是副本，写回要靠下标
 
 ```go
@@ -2153,6 +2370,8 @@ for i, containerStatus := range status.ContainerStatuses {
 `containerStatus` 是本轮值副本。真正修改 slice 中元素时，代码用 `status.ContainerStatuses[i]`。
 
 这也是为什么阅读健康更新时要看最终写回对象，不能只看到局部变量就认为 API status 已改变。
+
+**大白话总结：** `range`得到的结构体值常是副本；要真正修改原slice里的元素，必须像源码一样通过下标写回。
 
 ### 28.6 非阻塞 channel send
 
@@ -2174,6 +2393,8 @@ target <- update
 
 就可能阻塞，直到下游接收或 goroutine 被终止。
 
+**大白话总结：** 有 `default` 的发送宁可丢通知也不等；没有 `default` 的发送会等下游。两种写法代表不同的可靠性和阻塞取舍。
+
 ### 28.7 map 查找的 `value, ok` 与默认 Healthy
 
 ```go
@@ -2191,6 +2412,8 @@ if r, ok := m.allDevices[resourceName]; ok {
 1. 查找前默认值；
 2. `ok` 分支；
 3. 分支不进入时保留什么。
+
+**大白话总结：** `ok=false`只说map里没有key，不会自动替你决定业务状态；最终结果取决于查找前给变量设置了什么默认值。
 
 ---
 
@@ -2236,7 +2459,7 @@ if r, ok := m.allDevices[resourceName]; ok {
 在匹配当前仓库 Go toolchain 的隔离开发环境中，可执行：
 
 ```powershell
-Set-Location '<KUBERNETES_SRC>'
+Set-Location 'D:\datou\devops\kubernetes-master\kubernetes'
 
 go test ./pkg/kubelet/cm/devicemanager `
     -run 'TestCheckpoint|TestUpdateCapacityAllocatable|TestResetExtendedResource|TestUpdateAllocatedResourcesStatus|TestFeatureGateResourceHealthStatus|TestEndpointSyncOnDisconnect' `
@@ -2256,6 +2479,8 @@ go test ./pkg/kubelet/apis/podresources `
 ---
 
 ## 30. GPU 指标归属：PodResources 是 join 输入，不是监控终点
+
+这里的 `join` 是“拿共同身份把两份数据对上”：一边说某个 device ID归哪个 Pod，另一边说这个 device ID的利用率、Xid或ECC怎样。身份和时间窗对不上，就不能硬拼。
 
 你熟悉的 Java 平台要把请求指标归到 Pod，常用：
 
@@ -2356,7 +2581,7 @@ PodResources 没有传统 device Health。指标归属成功只说明：
 “应该自动迁移”
 ```
 
-健康判断仍要组合 Pod status、Device Plugin/DRA health、DCGM/Xid/ECC、runtime 与应用 SLO。
+健康判断仍要组合 Pod status、Device Plugin/DRA health、DCGM/Xid/ECC、runtime 与应用 SLO（业务设定的可用性和性能目标）。
 
 ---
 
@@ -2561,10 +2786,11 @@ dra_manager_state损坏
 
 dra_health_state损坏
   -> 记录health checkpoint读取错误
-  -> 空health cache继续
+  -> DRA manager继续构造
+  -> 当前health cache不能当作可信完整数据
 ```
 
-不能照搬传统 DeviceManager 的“日志后继续等待插件”处理 DRA allocation state，也不能把 DRA health 文件损坏说成一定阻止 kubelet 初始化。
+不能照搬传统 DeviceManager 的“日志后继续等待插件”处理 DRA allocation state，也不能把 DRA health 文件损坏说成一定阻止 kubelet 初始化。若文件只是不存在，cache会明确从空开始；若是JSON损坏，源码没有在解码失败后再次清空对象，因此不要猜它一定为空，也不要使用其中可能残留的部分内容做健康结论。
 
 恢复时先明确：
 
@@ -2765,7 +2991,7 @@ GPU好像恢复了，应该是kubelet缓存问题。
 
 ## 34. 这章哪些必须学深，哪些只读边界
 
-### 34.1 必须学深：S3/O3
+### 34.1 最终必须学深：第二遍达到能独立排障
 
 你以后做 GPU 平台值班，必须能独立解释：
 
@@ -2780,14 +3006,14 @@ GPU好像恢复了，应该是kubelet缓存问题。
 - ResourceHealthStatus 的通知链和实现缺口；
 - disconnect、missing ID、channel full 三种不同问题；
 - PodResources v1 List/Get/GetAllocatable；
-- List 的内存 GC 副作用；
+- List 的内存清理副作用；
 - socket 无 RBAC 的安全模型；
 - traditional DP 与 DRA checkpoint/CDI/health 分栏；
 - PodResources 到 DCGM 的归属 join。
 
 达到这个深度，才能在事故中决定“观察、cordon、drain、节点重建”哪一个动作合理。
 
-### 34.2 只需掌握边界：S1/S2
+### 34.2 只需知道职责和故障边界，不必逐行深挖
 
 本阶段不需要逐行深挖：
 
@@ -2826,7 +3052,17 @@ GPU好像恢复了，应该是kubelet缓存问题。
 
 ## 35. 本章自测
 
-### 35.1 二十四个必须口述的问题
+首遍不需要回答下面全部深层边界，只检查五件事：
+
+1. checkpoint为什么不是训练任务checkpoint？
+2. kubelet重启后，哪本账恢复了旧分配，哪份健康清单没有恢复？
+3. 为什么 Node GPU可以短暂0/0，而旧 Pod仍在运行？
+4. PodResources查到device ID能证明什么、不能证明什么？
+5. checkpoint里有CDI name，为什么新容器仍可能因为找不到CDI spec而失败？
+
+这五题能独立讲清，就可以先进入第18课；下面是二遍加深，不应成为首遍卡点。
+
+### 35.1 二遍加深：二十四个源码与运维问题
 
 1. DeviceManager checkpoint 与训练任务 checkpoint 有什么区别？
 2. Linux 上传统 checkpoint 当前精确路径是什么，是否跟随 `--root-dir`？
@@ -2946,7 +3182,7 @@ Node C:
 
 - manager 是否继续构造；
 - 分配账是否为空；
-- 健康账是否为空；
+- 健康账能否确认是空，还是只能判定为不可信；
 - 是否需要立即隔离 Node；
 - 为什么不能使用同一个“删文件重建”脚本？
 
@@ -2981,7 +3217,11 @@ for i, containerStatus := range status.ContainerStatuses {
 }
 ```
 
-### 35.8 通过标准
+**大白话总结：** 三道题分别检查三个最容易看反的控制点：通知是否会丢、map查不到时保留哪个默认值、range副本有没有真正写回原slice。
+
+**顺手学 Go：** 读这三段不要只翻译单个符号；先确认channel有没有 `default`，再找变量初值和 `ok` 分支，最后确认赋值目标是局部副本还是 `slice[i]`。
+
+### 35.8 二遍通过标准
 
 你能够：
 
@@ -2996,7 +3236,7 @@ for i, containerStatus := range status.ContainerStatuses {
 - 给出固定 context/Node 的只读证据计划；
 - 明确说出哪些测试本次没有运行；
 
-才算通过第 17 课。
+做到这些，才算完成第17课的二遍S3深读；首遍通过标准仍是本节开头五题。
 
 ---
 
@@ -3011,7 +3251,7 @@ for i, containerStatus := range status.ContainerStatuses {
 - [Dynamic Resource Allocation](https://kubernetes.io/docs/concepts/scheduling-eviction/dynamic-resource-allocation/)：ResourceClaim、ResourceSlice 与 DRA 总体模型。
 - [当前 commit 的 checkpoint schema](https://github.com/kubernetes/kubernetes/blob/301946d15e67a4a2e8a5fb8292eb836acd366d78/pkg/kubelet/cm/devicemanager/checkpoint/checkpoint.go)：`PodDevicesEntry`、`RegisteredDevices`、checksum 外层。
 - [当前 commit 的 DeviceManager](https://github.com/kubernetes/kubernetes/blob/301946d15e67a4a2e8a5fb8292eb836acd366d78/pkg/kubelet/cm/devicemanager/manager.go)：写读触发、restart、Capacity 与 health status。
-- [当前 commit 的 podDevices](https://github.com/kubernetes/kubernetes/blob/301946d15e67a4a2e8a5fb8292eb836acd366d78/pkg/kubelet/cm/devicemanager/pod_devices.go)：protobuf round trip、CDI 恢复、PodResources 设备投影。
+- [当前 commit 的 podDevices](https://github.com/kubernetes/kubernetes/blob/301946d15e67a4a2e8a5fb8292eb836acd366d78/pkg/kubelet/cm/devicemanager/pod_devices.go)：protobuf写入再读回、CDI 恢复、PodResources 设备投影。
 - [当前 commit 的 FileStore](https://github.com/kubernetes/kubernetes/blob/301946d15e67a4a2e8a5fb8292eb836acd366d78/pkg/kubelet/util/store/filestore.go)：临时文件、Sync、Close、Rename。
 - [当前 commit 的 PodResources v1 server](https://github.com/kubernetes/kubernetes/blob/301946d15e67a4a2e8a5fb8292eb836acd366d78/pkg/kubelet/apis/podresources/server_v1.go)：List/Get/GetAllocatable 实现。
 - [当前 commit 的 PodResources v1 proto](https://github.com/kubernetes/kubernetes/blob/301946d15e67a4a2e8a5fb8292eb836acd366d78/staging/src/k8s.io/kubelet/pkg/apis/podresources/v1/api.proto)：正式 RPC 与字段。
@@ -3114,7 +3354,7 @@ PodResources：
 local Unix gRPC
   QPS=100, burst=10
   no TLS/auth/Kubernetes RBAC
-  access controlled by directory/socket/mount/MAC
+  access controlled by directory/socket/mount/SELinux或AppArmor
 
 v1 List:
   active Pods
@@ -3142,7 +3382,7 @@ DRA:
   claim state持久化CDI IDs
   PodResources DynamicResources暴露CDI names
   allocation state损坏阻断manager构造
-  health state损坏以空cache继续
+  health state损坏会记错后继续，但cache内容不能直接信任
 ```
 
 六个最后必须记住的“不等于”：

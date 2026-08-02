@@ -1,3688 +1,1680 @@
-# 第 16 课：DeviceManager——具体 device ID、Allocate 与容器注入
+# 第 16 课：scheduler 只选了节点，具体 GPU 到底是谁交给 Java 容器的
 
-> 主案例：GPU Pod已经被scheduler放到一台GPU Node，Node也显示 `nvidia.com/gpu=8`，但容器到底拿到哪个device ID、为什么启动失败，不能再靠Node数量猜  
-> 主线源码：`pkg/kubelet/cm/topologymanager/*`、`pkg/kubelet/cm/devicemanager/{manager.go,endpoint.go,pod_devices.go}`、`pkg/kubelet/cm/container_manager_linux.go`、`pkg/kubelet/kuberuntime/*`  
-> 源码基线：`301946d15e67a4a2e8a5fb8292eb836acd366d78`（`v1.37.0-alpha.0-280-g301946d15e6`）  
-> 本课深度：S3，读穿“数量请求 -> 具体opaque ID -> AllocateResponse -> RunContainerOptions -> CRI ContainerConfig”  
-> 前置断点：第 15 课已经证明Device Plugin怎样把逻辑设备条目变成Node Capacity/Allocatable；本课从Pod已到目标Node继续
-
----
-
-## 0. 生产现场：Node有8个GPU资源单位，容器却没创建出来
-
-先看这组生产证据：
-
-```text
-Pod:
-  nodeName: gpu-node-07
-  phase: Pending
-  container state:
-    waiting:
-      reason: CreateContainerError
-
-Pod spec:
-  limits:
-    nvidia.com/gpu: 1
-
-Node:
-  status.capacity:
-    nvidia.com/gpu: "8"
-  status.allocatable:
-    nvidia.com/gpu: "8"
-
-Event:
-  FailedToCreateContainer
-
-host:
-  nvidia-smi -L正常
-
-Device Plugin:
-  Pod Running/Ready
-```
-
-平台值班同学最容易给出三个判断：
-
-1. “Node还有8张卡，所以不是资源问题。”
-2. “Pod已经调度成功，所以GPU已经分配成功。”
-3. “应该是containerd没有把 `/dev/nvidia0` 挂进去。”
-
-这三句都可能错。
-
-第 15 课已经说明：
-
-```text
-Node Allocatable=8
-  != 还剩8个未分配单位
-  != 这次容器已经拿到具体device ID
-  != runtime注入已经成功
-```
-
-本课要把故障继续切成六道闸门：
-
-| 闸门 | 要回答的问题 | 主要证据 |
-|---|---|---|
-| scheduler数量账 | 为什么选中这个Node | Pod requests、Node资源、FailedScheduling历史 |
-| kubelet本地准入 | TopologyManager是否接纳 | Pod Event、status reason、kubelet准入日志 |
-| ID选择 | kubelet选了哪些opaque ID | DeviceManager日志、checkpoint/PodResources边界 |
-| Allocate RPC | 插件是否接受这些ID并返回配置 | kubelet与插件同时间窗日志、RPC耗时指标 |
-| 运行参数汇总 | env/mount/device/annotation/CDI是否进入缓存 | 源码、受控调试证据 |
-| CRI创建 | runtime是否接受最终ContainerConfig | kubelet/runtime日志、已创建对象的脱敏inspect |
-
-只证明前一闸门，不等于后一闸门成功。
+> 主案例：Spring Boot 推理服务 `recommend-infer` 已经被调度到 `gpu-node-07`，却停在 `CreateContainerError`。  
+> 本章只追一条主线：**scheduler 选 Node 之后，kubelet 怎样选具体 device ID、调用 Device Plugin 的 Allocate，并把设备配置交给 container runtime。**  
+> 源码基线：`301946d15e67a4a2e8a5fb8292eb836acd366d78`（`v1.37.0-alpha.0-280-g301946d15e6`）。  
+> 学习方式：分两遍。首遍只看懂生产主线；第二遍再读恢复、NUMA、复用和非原子边界。
 
 ---
 
-## 1. 本课先钉死十二个结论
+## 0. 先说最终答案：调度成功，不等于 GPU 已经进了容器
 
-1. scheduler默认只为扩展资源做**数量级节点选择**，不会给Pod挑节点内的GPU UUID。
-2. `nvidia.com/gpu: 1` 表示一个插件广告的**逻辑设备单位**，不必然等于一张物理卡。
-3. 默认主路径下，具体device ID由目标Node上的kubelet DeviceManager在**本地Pod准入阶段**选择；当前commit还有一个默认关闭的 `PodLevelResourceManagers` 例外，见 8.2。
-4. device ID是插件定义的opaque string；kubelet不把它解释成固定物理卡号。
-5. ID选择先识别当前container的旧分配；除“kubelet初始化且runtime确认container仍在运行”的提前返回外，会校验resource重新注册和旧ID健康。需要新增时，先尝试普通init复用，不足部分再从 `healthy - allocated` 中挑候选。
-6. TopologyManager只把候选按NUMA亲和约束；它不理解NVLink/NVSwitch拓扑。
-7. `GetPreferredAllocation` 是插件建议，不是最终裁决。
-8. 当前选择大量使用set/map和 `UnsortedList`，没有“默认GPU0”或稳定字典序保证。
-9. 当某个container/resource确实需要新增ID时，kubelet为这一对组合单独发一次 `Allocate` RPC；已有正式分配、kubelet初始化恢复等“不需要新增ID”的分支会跳过RPC。多资源分配不是原子事务。
-10. AllocateResponse不只是“分配成功”，还携带env、mount、device、annotation、CDI等容器注入意图。
-11. kubelet对AllocateResponse的验证比较浅，插件属于节点高信任组件。
-12. Device Plugin的 `PreStartContainer` 与kubelet内部同名hook不是同一个调用，而且前者发生在CRI `CreateContainer` 之前。
+假设公司的 Java 推理服务是下面这样：
 
-如果还不能独立解释这十二句，遇到GPU容器启动失败时就很容易把scheduler、kubelet、插件和runtime混成一个组件。
-
----
-
-## 2. 旧材料怎样复用，哪些结论必须按当前commit纠正
-
-仓库已有这些拆分材料：
-
-- `study/90_主线复盘与进阶/158_进阶专题_kubelet_DeviceManager与设备插件分配链路.md`
-- `study/90_主线复盘与进阶/460_进阶专题_devicemanager_devicesToAllocate与GetPreferredAllocation设备选择链路.md`
-- `study/90_主线复盘与进阶/461_进阶专题_devicemanager_PreStartContainer与RunContainerOptions设备注入链路.md`
-- `study/90_主线复盘与进阶/1000_进阶专题_DeviceManager_allocate设备分配与podDevices状态链路.md`
-
-这些材料仍值得复用的部分：
-
-- `healthyDevices`、`allocatedDevices`、`podDevices` 三本账的类比；
-- init container复用；
-- `sets.Set[string]` 的集合运算；
-- NUMA hint与PreferredAllocation的职责分层；
-- AllocateResponse进入RunContainerOptions；
-- checkpoint不仅保存ID，也保存AllocateResponse。
-
-但正式讲义不能原样拼接，当前commit需要纠正：
-
-| 旧材料容易形成的说法 | 当前源码校准 |
-|---|---|
-| “DeviceManager在容器启动前选ID并Allocate” | 主路径发生在kubelet本地Pod准入；创建容器时通常只是读缓存 |
-| “PreStart就是容器即将Start前调用” | Device Plugin RPC在生成ContainerConfig时调用，早于CRI CreateContainer |
-| “Allocate失败都会回滚临时占用” | 只有部分分支显式整表重算；partial reuse后数量不足、Preferred error、空response和并发in-flight都要单独看 |
-| “response会做冲突检查” | 多数冲突只记日志并保留先进入项，不会让准入失败 |
-| “同样数量下会稳定选同一个ID” | set/map/UnsortedList无稳定顺序保证 |
-| “没缓存返回空结构或error” | 当前实现可能返回 `nil, nil`；注释和旧测试注释还有不一致 |
-| “CDI与传统Devices二选一” | kubelet允许两者同时继续传给CRI |
-| “NUMA topology就是GPU互联拓扑” | 标准字段只有NUMA node ID，不表达NVLink/NVSwitch |
-
-因此本课会复用旧材料的教学类比，但源码事实全部重新落到当前commit。
-
----
-
-## 3. 先用Java平台经验建立正确类比
-
-你熟悉的Java平台应用通常会经历：
-
-```text
-Deployment写cpu/memory request
-  -> scheduler选Node
-  -> kubelet准入
-  -> 生成容器配置
-  -> CRI创建容器
-  -> JVM启动
+```yaml
+apiVersion: v1
+kind: Pod
+metadata:
+  namespace: ai-prod
+  name: recommend-infer
+spec:
+  containers:
+    - name: inference
+      image: registry.example.com/recommend-infer:2026.08
+      resources:
+        limits:
+          nvidia.com/gpu: 1
 ```
 
-GPU Pod多了一本“具体设备账”：
+它使用 Spring Boot 提供接口，在进程里通过 ONNX Runtime 的 GPU 后端调用 GPU。**ONNX Runtime** 是执行机器学习模型的运行库；**CUDA** 是 NVIDIA 提供的 GPU 计算平台和编程接口。现在看到的现场是：
 
 ```text
-Pod写nvidia.com/gpu数量
-  -> scheduler只按数量选Node
-  -> Node kubelet选具体device ID
-  -> Device Plugin按ID返回注入要求
-  -> kubelet拼成CRI ContainerConfig
-  -> runtime执行device/CDI注入
-  -> CUDA进程才可能看到设备
+Pod.spec.nodeName = gpu-node-07
+Pod.phase = Pending
+inference 容器 = CreateContainerError
+Node.status.allocatable[nvidia.com/gpu] = 8
+设备插件 Pod = Running
+宿主机 nvidia-smi -L = 正常
 ```
 
-可以类比为：
-
-| Java平台概念 | GPU设备链概念 |
-|---|---|
-| request 2 CPU | request 1个逻辑GPU资源单位 |
-| scheduler选Node | scheduler仍只选Node |
-| CPUManager选cpuset | DeviceManager选opaque device ID |
-| JVM env/volume | 插件返回env/mount/device/CDI |
-| CRI ContainerConfig | 两类应用最终都交给CRI |
-
-类比只帮助理解控制链，不表示GPU能像CPU那样随意切分或超卖。MIG、time-slicing和DRA分别有自己的资源模型，留到第 21 课继续。
-
----
-
-## 4. 完整源码地图：不要从manager.go第一行硬读
-
-建议按下面顺序跳读：
+新手最容易把它理解成：
 
 ```text
-Pod进入kubelet
-  pkg/kubelet/kubelet.go
-    HandlePodAdditions
-
-本地准入
-  pkg/kubelet/cm/topologymanager/topology_manager.go
-    manager.Admit
-
-计算并保存hint
-  pkg/kubelet/cm/topologymanager/scope_container.go
-  pkg/kubelet/cm/topologymanager/scope_pod.go
-
-调用各provider分配
-  pkg/kubelet/cm/topologymanager/scope.go
-    allocateAlignedResources
-
-DeviceManager入口
-  pkg/kubelet/cm/devicemanager/manager.go
-    Allocate
-    allocateContainerResources
-    devicesToAllocate
-    filterByAffinity
-    callGetPreferredAllocationIfAvailable
-
-插件RPC
-  pkg/kubelet/cm/devicemanager/endpoint.go
-    allocate
-    getPreferredAllocation
-    preStartContainer
-
-保存正式账
-  pkg/kubelet/cm/devicemanager/pod_devices.go
-    insert
-    deviceRunContainerOptions
-
-容器创建阶段
-  pkg/kubelet/cm/container_manager_linux.go
-    GetResources
-
-  pkg/kubelet/kubelet_pods.go
-    GenerateRunContainerOptions
-
-  pkg/kubelet/kuberuntime/kuberuntime_container.go
-    generateContainerConfig
-    makeDevices
-    makeCDIDevices
+Node 显示 8
+  -> scheduler 已经选中 Node
+  -> 容器一定拿到了 GPU
 ```
 
-一张时序图：
+真正的链路是：
+
+```text
+Node 显示可调度上限为 8
+  -> scheduler 只判断“这个 Node 数量上能不能再放 1 个”
+  -> kubelet 再从本机设备账里选具体 ID
+  -> Device Plugin 再返回怎样把设备交给容器
+  -> container runtime 真正创建容器并执行注入
+  -> 最后才轮到 JVM 启动
+```
+
+所以，本章最重要的一句话是：
+
+> **scheduler 只负责把 Pod 送到哪台 Node；目标 Node 上的 kubelet DeviceManager 才负责选具体 device ID。插件负责给出设备注入说明，container runtime 负责真正创建容器。**
+
+这里的 `Allocatable=8` 也不是“眼下还空着 8 张卡”。**Allocatable（可分配上限）**是这台 Node 最多允许 Pod 申请多少个该资源单位。scheduler 还要减去已经被其他 Pod 请求的数量，才能判断本次请求是否放得下。
+
+`Capacity` 是 Node 上报的资源总量；`Allocatable` 是扣除系统预留等部分后，允许 Pod 使用的上限。两者都不是实时空闲数。对 `nvidia.com/gpu` 这类扩展资源，只写 `limits` 时，调度请求按同样数量处理。
+
+### 0.1 第一遍只走六站
+
+下面这张表按行从上往下读。每一行是一站，不要横向跳着背术语。
+
+| 站点 | 谁在做 | 大白话动作 | 成功只证明什么 |
+|---|---|---|---|
+| 1. 选 Node | scheduler | 看数量，把 Pod 放到一台机器 | 机器在调度账上放得下 |
+| 2. 本地准入 | kubelet | 开工前做本机检查 | kubelet愿意继续准备这个 Pod |
+| 3. 选具体 ID | DeviceManager | 从健康且未占用的 ID 中挑够数量 | 具体设备候选已选出 |
+| 4. 要注入说明 | Device Plugin | 接收 ID，返回 env、mount、device 或 CDI | 插件同意并返回了配置意图 |
+| 5. 拼创建单 | kubelet | 把插件结果装进 `ContainerConfig` | 创建容器所需参数已准备好 |
+| 6. 真正创建 | container runtime | 按创建单注入设备并创建容器 | 成功后才可能启动 Java 进程 |
+
+这一遍先略过这些词：NUMA、PreferredAllocation（插件选ID建议）、DRA（另一套动态设备分配框架）、restartable init container（可重启的初始化容器）、并发回收。它们都放到第二遍，因为不影响你先回答“谁选卡、谁注入、错在哪一站”。
+
+### 0.2 一张图看清状态怎么变化
+
+读图方向：从左往右。实线箭头表示正常交接；虚线箭头表示本章案例可能失败的位置。
 
 ```mermaid
-sequenceDiagram
-    participant S as scheduler
-    participant K as kubelet
-    participant T as TopologyManager
-    participant D as DeviceManager
-    participant P as Device Plugin
-    participant R as CRI runtime
-
-    S->>K: Pod已绑定到目标Node
-    K->>T: 本地Admit(Pod)
-    T->>D: GetTopologyHints
-    T->>T: Merge并保存NUMA hint
-    T->>D: Allocate(Pod, Container)
-    D->>D: 选择具体opaque IDs
-    D->>P: Allocate(IDs)
-    P-->>D: env/mount/device/annotation/CDI
-    D->>D: 写podDevices与checkpoint
-
-    K->>D: GetDeviceRunContainerOptions
-    opt PreStartRequired
-        D->>P: PreStartContainer(IDs)
-        P-->>D: success/error
-    end
-    D-->>K: RunContainerOptions
-    K->>R: CreateContainer(ContainerConfig)
-    K->>R: StartContainer
+flowchart LR
+    A["Pod 请求<br/>nvidia.com/gpu: 1"] --> B["scheduler<br/>只选 gpu-node-07"]
+    B --> C["kubelet 本地准入<br/>准备执行 Pod"]
+    C --> D["DeviceManager<br/>选具体 ID：示例 G"]
+    D --> E["Device Plugin Allocate<br/>返回设备注入说明"]
+    E --> F["kubelet<br/>生成 CRI ContainerConfig"]
+    F -.->|"CDI 配置找不到"| X["CreateContainerError<br/>JVM 尚未启动"]
+    F --> G["container runtime<br/>创建容器"]
+    G --> H["Spring Boot / JVM<br/>开始启动"]
 ```
 
-这张图最重要的时间边界：
+图例：
 
-```text
-选ID和Allocate：默认主路径主要在kubelet本地准入
-取回注入参数和Device Plugin PreStart：生成CRI配置时
-CRI Create/Start：更后面
-```
-
-这张图画的是当前默认 `PodLevelResourceManagers=false` 的container级路径；8.2会单列默认关闭的Alpha例外，避免把主路径误写成所有feature组合的绝对时序。
+- `A --> B`：上一步的结果成为下一步的输入。
+- `F -.-> X`：创建阶段失败，后面的 JVM 和 readinessProbe 都不会发生。
+- 图里的 `G` 是教学案例中被选中的 ID，不代表 Kubernetes 总会优先选择叫 G 的设备。
 
 ---
 
-## 5. scheduler为什么不需要知道GPU UUID
+## 1. 先认清角色：每个人只负责哪一段
 
-scheduler处理的是Pod request与Node资源数量。
+下面出现的专业词，先只记住“它是谁、在本章有什么用”。
 
-比如：
-
-```text
-Node A:
-  nvidia.com/gpu allocatable=8
-  已有Pod request总账=6
-
-新Pod:
-  request nvidia.com/gpu=1
-```
-
-scheduler只需判断：
-
-```text
-8 - 6 >= 1
-```
-
-它不需要把：
-
-```text
-GPU-aaaaaaaa
-GPU-bbbbbbbb
-GPU-cccccccc
-```
-
-中的某一个写回Pod spec。
-
-原因包括：
-
-- 具体设备健康是Node本地快速变化事实；
-- device ID由插件定义；
-- NUMA信息由目标Node的TopologyManager掌握；
-- ID分配与本地checkpoint需要和kubelet容器生命周期一致；
-- scheduler缓存看到的是Node对象，不是DeviceManager全部内存账。
-
-所以生产排障必须区分：
-
-```text
-FailedScheduling
-  -> 数量/约束阶段
-
-UnexpectedAdmissionError
-  -> Node本地准入/Allocate阶段
-
-FailedToCreateContainer
-  -> 生成配置、PreStart或CRI创建阶段
-```
-
----
-
-## 6. device ID是opaque string，不等于物理卡编号
-
-API定义：
-
-```text
-staging/src/k8s.io/kubelet/pkg/apis/deviceplugin/v1beta1/api.proto:91-99
-```
-
-```protobuf
-message Device {
-    // A unique ID assigned by the device plugin.
-    // Max length of this field is 63 characters.
-    string ID = 1;
-    string health = 2;
-    TopologyInfo topology = 3;
-}
-```
-
-大白话：
-
-> kubelet只把ID当成某种resource下面的唯一字符串。这个字符串实际代表整卡、MIG实例还是其他逻辑entry，由插件策略定义。
-
-因此以下推理都不安全：
-
-```text
-ID里含0 -> 一定是/dev/nvidia0
-resource request=1 -> 一定独占整张物理卡
-Node Capacity=8 -> 一定有8块物理卡
-ID相同 -> 所有插件版本下物理含义都不变
-```
-
-升级NVIDIA Device Plugin、切换MIG strategy、修改runtime侧device ID传递策略或sharing策略时，要同时记录：
-
-- 插件image digest；
-- 插件配置；
-- resource name；
-- device ID；
-- MIG/sharing模式；
-- Node与时间窗。
-
-只把 `nvidia.com/gpu` 数字截图留下，无法还原ID语义。
-
----
-
-## 7. DeviceManager内部五张关键账
-
-`ManagerImpl`：
-
-```text
-pkg/kubelet/cm/devicemanager/manager.go:61-116
-```
-
-重点字段：
-
-```go
-type ManagerImpl struct {
-    allDevices       ResourceDeviceInstances
-    healthyDevices   map[string]sets.Set[string]
-    unhealthyDevices map[string]sets.Set[string]
-    allocatedDevices map[string]sets.Set[string]
-    podDevices       *podDevices
-    devicesToReuse   PodReusableDevices
-
-    topologyAffinityStore topologymanager.Store
-}
-```
-
-职责表：
-
-| 账本 | key/value | 用途 | 是否等于物理GPU |
+| 名词 | 大白话解释 | 本章职责 | 它不负责什么 |
 |---|---|---|---|
-| `allDevices` | resource -> ID -> Device | 当前插件清单与topology | 不一定 |
-| `healthyDevices` | resource -> Healthy ID set | 形成Allocatable、作为候选 | 不一定 |
-| `unhealthyDevices` | resource -> Unhealthy ID set | 容量与健康收敛 | 不一定 |
-| `allocatedDevices` | resource -> 已占用/预留ID set | 防止重复选择 | 不等于Node Allocatable |
-| `podDevices` | Pod/container/resource -> IDs+response | 正式分配账与运行参数 | 最关键 |
-| `devicesToReuse` | Pod/resource -> 可复用ID set | 普通init生命周期复用 | 不是共享池 |
+| scheduler | Kubernetes 的“选机器的人” | 按资源数量等条件给 Pod 选 Node | 不选 Node 内的 GPU UUID |
+| kubelet | 每台 Node 上的“现场负责人” | 接收已调度 Pod，准备并启动容器 | 不替厂商解释 GPU 的专有配置 |
+| 扩展资源 | 由设备插件等组件提供、名字通常带斜杠的自定义资源，例如 `nvidia.com/gpu` | 让Pod按整数申请逻辑设备单位 | 名字本身不保证一个单位就是一整张物理卡 |
+| TopologyManager | kubelet里协调CPU、内存和设备位置关系的模块 | 在本地准入时调用各资源提供者 | 不理解完整NVLink/NVSwitch拓扑 |
+| DeviceManager | kubelet 进程里的设备管理模块 | 维护设备账、选具体 ID、调用插件 | 不是单独的一套微服务 |
+| Device Plugin | 厂商或设备方案提供的节点插件 | 上报逻辑设备，按 ID 返回注入说明 | 不直接调用 CRI 创建业务容器 |
+| device ID | 插件给一个逻辑设备起的字符串名字 | 让 kubelet 和插件指向同一个设备单位 | 不一定等于 `/dev/nvidia0` 或物理卡序号 |
+| Allocate | kubelet 向插件发起的一次远程函数调用 | 把选中的 ID 交给插件，取回注入说明 | 不是“容器已经创建成功” |
+| RPC | “调用另一个进程里的函数并等结果” | kubelet 用它调用 Device Plugin | 不是 Kubernetes API 对象 |
+| CRI | kubelet 调用容器运行时的标准接口 | 把最终创建单交给 containerd、CRI-O 等 | 不决定选哪张 GPU |
+| container runtime | 真正创建和启动容器的程序 | 执行 mount、device、CDI 等注入 | 不替 scheduler 选择 Node |
+| CDI | 一种标准化设备注入方式 | kubelet传设备名字，runtime查本机 CDI 配置并完成注入 | 不是 Kubernetes 自己的设备清单 |
+| cache | 进程内存里的临时账本 | 快速保存“某 Pod/容器拿了什么” | 进程重启后不能单靠它恢复 |
+| checkpoint | 写在本机磁盘上的恢复账本 | kubelet重启时恢复分配记录 | 不是 API Server 里的对象 |
+| readinessProbe | kubelet用来判断容器是否可以接收流量的就绪探针 | JVM启动后检查服务是否Ready | 容器尚未创建时不会执行 |
 
-### 7.1 `allocatedDevices`不是持久化权威源
+`device ID` 常被称为 **opaque ID（不透明 ID）**。大白话就是：kubelet把它当标签使用，不猜它内部含义。它可能像 `GPU-3af...`，也可能是厂商自定义字符串。
 
-它是快速聚合和预留表。
+### 1.1 API Server 在这条链里做什么
 
-在多处代码中会从：
+API Server 像共享账本，保存 Pod、Node 等 API 对象。它能保存：
 
-```go
-m.podDevices.devices()
+- Pod 请求了 `nvidia.com/gpu: 1`；
+- scheduler 最终写入的 `spec.nodeName`；
+- kubelet回报的 Pod 状态和事件；
+- Device Plugin 通过 kubelet间接体现到 Node 上的 Capacity/Allocatable。
+
+但在传统 Device Plugin 主路径里，API Server **不负责**：
+
+- 从本机健康 ID 中选出 G；
+- 调用 Device Plugin 的 Allocate；
+- 保存完整 AllocateResponse；
+- 让 containerd 解析 CDI 配置。
+
+这些都是目标 Node 上的本地动作。
+
+### 1.2 这不是六个微服务互相绕着调用
+
+Kubernetes 把职责拆开，确实会形成较长链路。但这条链并不等于六次跨网络微服务调用：
+
+| 边界 | 实际形态 |
+|---|---|
+| kubelet -> DeviceManager | 同一个 kubelet 进程里的 Go 函数调用 |
+| DeviceManager -> Device Plugin | 同一台 Node 上通常通过 Unix socket 做 gRPC |
+| kubelet -> container runtime | 同一台 Node 上通过 CRI 调用独立 runtime 进程 |
+| scheduler -> kubelet | 不直接互调；通过 API Server 中的 Pod 状态完成交接 |
+
+**Unix socket** 是同一台机器上进程通信的一种本地“插座”；**gRPC** 是 RPC 的一种实现。第一次看源码时，只需把它理解为“kubelet通过本机连接向插件问问题”。
+
+读图方向：从上往下。实线表示同进程函数调用；虚线表示跨进程但通常仍在同一 Node。
+
+```mermaid
+flowchart TB
+    S["kube-scheduler<br/>控制面独立进程"]
+    A["API Server<br/>保存 Pod/Node 状态"]
+    subgraph K["gpu-node-07：kubelet 进程"]
+        KL["kubelet 主流程"]
+        DM["DeviceManager"]
+        CM["container manager / runtime manager"]
+        KL --> DM
+        DM --> CM
+    end
+    DP["Device Plugin<br/>节点上的独立进程或 Pod"]
+    RT["containerd / CRI-O<br/>节点上的独立进程"]
+
+    S --> A
+    A --> KL
+    DM -.->|"本地 gRPC"| DP
+    CM -.->|"本地 CRI"| RT
 ```
 
-重新生成。
+图例：
 
-### 7.2 `podDevices`为什么更重要
-
-结构：
-
-```text
-PodUID
-  -> containerName
-    -> resourceName
-      -> device IDs按NUMA保存
-      -> ContainerAllocateResponse
-```
-
-它同时回答：
-
-- 哪个container拿了哪些ID；
-- 这些ID属于哪个resource；
-- 插件当时要求注入哪些env/mount/device/annotation/CDI；
-- kubelet重启后怎样恢复。
-
-checkpoint细节在第 17 课展开，本课先把它看作“已确认分配的正式账”。
+- kubelet框内的箭头是进程内部调用，不是网络微服务链。
+- 虚线只表示跨进程边界，不代表一定跨机器。
+- API Server传递的是期望和状态，不参与本地 ID 选择。
 
 ---
 
-## 8. 真正分配发生在kubelet本地准入
+## 2. 为什么要拆成这几层：复杂度换来了什么
 
-新Pod进入：
+如果让 scheduler 一次完成“选 Node + 选 GPU ID + 生成厂商注入配置”，看起来调用链短了，实际上会带来三个问题。
 
-```text
-pkg/kubelet/kubelet.go:2861-2879
-```
+### 2.1 设备状态变化太快，Node 本地看得最准
 
-```go
-if ok, reason, message :=
-    kl.allocationManager.AddPod(
-        kl.GetActivePods(),
-        pod,
-    ); !ok {
-    kl.rejectPod(ctx, pod, reason, message)
-    continue
-}
-```
+GPU 健康状态、插件注册状态、容器实际占用情况都可能在秒级变化。scheduler在控制面看到的是汇总后的数量账，不适合持有每台 Node 的全部设备细节。
 
-TopologyManager：
+把具体 ID 选择放到 kubelet，本质上是：
 
 ```text
-pkg/kubelet/cm/topologymanager/topology_manager.go:262-275
+全局决策：哪台 Node 数量上放得下
+本地决策：这台 Node 此刻哪几个 ID 真能用
 ```
 
-```go
-func (m *manager) Admit(
-    attrs *lifecycle.PodAdmitAttributes,
-) lifecycle.PodAdmitResult {
-    ctx := context.TODO()
-    podAdmitResult := m.scope.Admit(
-        ctx,
-        attrs.Pod,
-    )
-    return podAdmitResult
-}
-```
+### 2.2 Kubernetes 不应该写死 NVIDIA 的注入规则
 
-container scope：
+NVIDIA GPU、FPGA、网卡、MIG 实例的注入方式不同。若 kubelet硬编码所有厂商规则，每增加一种设备都要修改 Kubernetes 核心代码。
+
+所以边界被定成：
 
 ```text
-pkg/kubelet/cm/topologymanager/scope_container.go:52-83
+kubelet：我选中了这些 ID
+插件：这些 ID 要用哪些 env、mount、device 或 CDI
+runtime：我按标准容器配置真正执行
 ```
 
-核心顺序：
+这里的 **env** 是环境变量，**mount** 是把宿主机路径放进容器，**device** 是把设备文件交给容器。
 
-```text
-收集所有HintProvider的hints
-  -> policy.Merge得到bestHint
-  -> 保存到topology affinity store
-  -> allocateAlignedResources
-```
+### 2.3 拆分也付出了代价
 
-`allocateAlignedResources`：
+好处是职责清楚、厂商可扩展、Node 本地状态更及时；代价是故障点变多：
 
-```text
-pkg/kubelet/cm/topologymanager/scope.go:155-162
-```
+- 调度成功，但本地没有健康 ID；
+- ID 选好了，但插件 Allocate 报错；
+- 插件返回成功，但 CDI 配置在 runtime 侧不存在；
+- 容器创建成功，但 Java 进程里的 CUDA 库仍加载失败。
 
-```go
-func (s *scope) allocateAlignedResources(
-    pod *v1.Pod,
-    container *v1.Container,
-) error {
-    for _, provider := range s.hintProviders {
-        err := provider.Allocate(pod, container)
-        if err != nil {
-            return err
-        }
-    }
-    return nil
-}
-```
-
-Linux当前注册HintProvider的顺序：
-
-```text
-pkg/kubelet/cm/container_manager_linux.go:309-358
-
-DeviceManager
-  -> CPUManager
-  -> MemoryManager
-```
-
-这解释两个现象：
-
-1. Pod已经被scheduler绑定，仍可能被目标kubelet本地拒绝。
-2. 各provider的分配不是一个跨组件事务；前一个成功后，后一个仍可能失败。
-
-第二点在当前注册顺序下尤其要具体化：DeviceManager可能已经选ID、调用插件、写入 `podDevices` 甚至完成checkpoint，随后CPUManager或MemoryManager才返回error。`allocateAlignedResources` 只是立即返回该error，没有反向逐个调用前序provider做rollback。Pod会被准入拒绝，DeviceManager状态后续再依赖active Pod清理/重算路径收敛。生产看到“最终是CPU/Memory准入error”时，仍要保留同时间窗GPU Allocate与checkpoint证据；不能因为最后一层error不叫GPU就删除设备账。
-
-### 8.1 policy none也仍会分配
-
-`TopologyManager policy=none` 不表示跳过DeviceManager。
-
-`noneScope.Admit`仍调用：
-
-```text
-admitPolicyNone
-  -> 对init/app containers
-  -> allocateAlignedResources
-```
-
-区别只是没有可用的NUMA affinity约束；设备仍需被选ID并Allocate。
-
-### 8.2 当前commit的例外：`PodLevelResourceManagers`
-
-“Allocate主要发生在本地准入”是当前默认配置的主路径，但不能删掉这个源码例外。
-
-当前feature表：
-
-```text
-pkg/features/kube_features.go
-  PodLevelResourceManagers
-  -> 1.36起Alpha
-  -> Default: false
-  -> 依赖PodLevelResources
-```
-
-当且仅当下面条件同时成立时：
-
-- 显式启用 `PodLevelResourceManagers`；
-- Pod设置了pod-level resources；
-- TopologyManager走pod scope的pod-level resource分支；
-
-`scope_pod.go` 不再逐container调用 `Allocate`，而是：
-
-```text
-admitUsingPodResources
-  -> allocatePodAlignedResources
-  -> 对每个HintProvider调用AllocatePod(pod)
-```
-
-而当前DeviceManager实现是：
-
-```go
-func (m *ManagerImpl) AllocatePod(
-    pod *v1.Pod,
-) error {
-    // Device Manager does not support
-    // pod level resource allocation.
-    return nil
-}
-```
-
-位置：
-
-```text
-pkg/kubelet/cm/topologymanager/scope_pod.go:52-112
-pkg/kubelet/cm/topologymanager/scope.go:165-172
-pkg/kubelet/cm/devicemanager/manager.go:1125-1129
-```
-
-因此在这个**默认关闭的Alpha组合**下，传统Device Plugin的container级ID分配不会在这次 `AllocatePod` 中完成。创建container时，`GetDeviceRunContainerOptions` 可能通过“缓存缺失 -> `m.Allocate`”补偿；但如果插件声明 `PreStartRequired`，当前顺序会先因本地ID缓存缺失而返回error，尚未走到reAllocate判断。
-
-运维含义：
-
-- 不要把默认主路径写成所有feature组合下的绝对时序；
-- 启用该Alpha feature前，要在与生产相同的TopologyManager scope下覆盖传统Device Plugin、restartable init和 `PreStartRequired` 回归；
-- 现场若发现Allocate落到创建配置阶段，先核feature gate和Pod的pod-level resources，不要立刻判断“准入代码没有执行”；
-- 本课后续若无特别说明，仍以当前默认 `PodLevelResourceManagers=false` 的传统container级主路径为准。
+设计的重点不是消灭复杂度，而是让每段复杂度有明确负责人和证据。排障时必须先判断失败在哪一站，不能只看最后一条错误就猜。
 
 ---
 
-## 9. `DRAExtendedResource`：同名扩展资源可能不走传统DeviceManager
+## 3. 用三本账把案例算一遍
 
-当前代码在遍历container limits时先检查：
+假设 `gpu-node-07` 的调度账和本地设备账如下。
 
-```text
-pkg/kubelet/cm/devicemanager/manager.go:849-860
-```
-
-当前commit的feature表把 `DRAExtendedResource` 标为1.36起Beta、默认开启，并声明依赖 `DynamicResourceAllocation`。但“gate默认开启”不等于某个resource已经自动分流；真正跳过仍要求Pod status中出现下面这组精确container/resource映射。
-
-```go
-if utilfeature.DefaultFeatureGate.Enabled(
-    features.DRAExtendedResource,
-) && isDRAExtendedResource(
-    pod,
-    container.Name,
-    resource,
-) {
-    logger.V(3).Info(
-        "Skipping allocation for DRA-backed extended resource",
-        "resourceName", resource,
-    )
-    continue
-}
-```
-
-`isDRAExtendedResource`读取：
-
-```go
-pod.Status.ExtendedResourceClaimStatus.
-    RequestMappings
-```
-
-并匹配：
+### 3.1 scheduler 看的是数量账
 
 ```text
-containerName
-resourceName
+Node 的 nvidia.com/gpu Allocatable = 8
+已有 Pod 请求总量                 = 6
+recommend-infer 本次请求          = 1
+
+8 - 6 >= 1
+所以 scheduler 认为数量上放得下
 ```
 
-还要注意检查放置的位置。当前整个 `pkg/kubelet/cm/devicemanager` 下，`isDRAExtendedResource(...)` 只在 `allocateContainerResources` 这一处分流；`GetTopologyHints` 和 `GetDeviceRunContainerOptions` 没有重复同一项status匹配。正常DRA迁移应避免同一个extended resource同时还被传统Device Plugin登记为active resource；否则后两条路径仍可能因为 `isDevicePluginResource(resource)==true` 把它当成传统resource观察或执行PreStart/reAllocate。这个边界要靠实际feature、Pod status和节点注册状态共同取证，不能只看resource name。
+这只说明 Node 通过了数量判断。
 
-边界：
-
-| 资源路径 | 分配权威 | 容器注入来源 |
-|---|---|---|
-| 传统Device Plugin extended resource | DeviceManager | AllocateResponse |
-| DRA原生claim | DRA Manager | claim allocation/CDI |
-| DRAExtendedResource映射 | 根据feature/status分流 | 不应再由传统DeviceManager重复分配 |
-
-因此排障 `nvidia.com/gpu` 不能永远假设它一定走传统Device Plugin。
-
-必须同时取证：
-
-- feature gate/版本；
-- 是否存在匹配的 `DeviceClass.spec.extendedResourceName`；
-- Pod `status.extendedResourceClaimStatus`；
-- kubelet DRA与DeviceManager日志。
-
-查询失败、API不存在或RBAC不足时，应写“未确认”，不能猜“集群肯定没启用DRA”。
-
-本课后续主线明确限定：
-
-> 传统Device Plugin extended-resource路径；若现场已分流到DRA，只复用CRI/CDI汇合部分，不套用传统ID选择账本。
-
----
-
-## 10. `ManagerImpl.Allocate`：先处理init生命周期，再进入资源循环
-
-源码：
+### 3.2 DeviceManager 看的是 ID 账
 
 ```text
-pkg/kubelet/cm/devicemanager/manager.go:364-403
+healthyDevices  = {A, B, C, D, E, F, G, H}
+allocatedDevices = {A, B, C, D, E, F}
+
+available = healthyDevices - allocatedDevices
+          = {G, H}
 ```
 
-缩小后：
+- `healthyDevices`：插件报告为健康的 ID 集合。
+- `allocatedDevices`：DeviceManager认为已经被占用的 ID 集合。
+- `available`：健康集合减去占用集合后，本次还能继续考虑的候选。
+
+**集合（set）**可以理解成“不重复的名单”。集合相减不是数字相减，而是从第一份名单里删掉第二份名单出现的成员。
+
+### 3.3 源码阅读约定
+
+从这里开始进入真实 Go 源码。
+
+- 固定提交：`301946d15e67a4a2e8a5fb8292eb836acd366d78`。
+- 标为 `go` 的代码保留当前提交中的真实业务语句；中文注释是教学新增。
+- 为了聚焦，会省去相邻日志或英文注释，但不会用省略号冒充真实 Go 代码。
+- 标为 `text` 的内容只是流程图、账本或伪代码，不能当成可编译源码。
+- 行号只对这个固定提交有效；升级 Kubernetes 后要重新定位。
+
+源码里的 `ctx context.Context` 是一次调用随身携带的“取消、截止时间和上下文信息”。首遍先把它看成调用链的通行证；第 12 节再看超时。
+
+### 3.4 第一段核心源码：候选 ID 到底怎样算
+
+文件：`pkg/kubelet/cm/devicemanager/manager.go:677-686`  
+函数：`devicesToAllocate`
+
+这是 `manager.go:677-686` 的**连续摘录**；函数前后的恢复、复用和最终挑选分支没有包含，所以它用于证明候选公式，不能单独编译。
 
 ```go
-func (m *ManagerImpl) Allocate(
-    pod *v1.Pod,
-    container *v1.Container,
-) error {
-    ctx := context.TODO()
-
-    if _, ok := m.devicesToReuse[
-        string(pod.UID)
-    ]; !ok {
-        m.devicesToReuse[string(pod.UID)] =
-            make(map[string]sets.Set[string])
-    }
-
-    for podUID := range m.devicesToReuse {
-        if podUID != string(pod.UID) {
-            delete(m.devicesToReuse, podUID)
-        }
-    }
-
-    // init/app container分支
-    ...
-}
-```
-
-`devicesToReuse` 虽然按Pod UID分层，但每次 `Allocate` 都会删除当前Pod之外的entry。它是服务于“当前Pod按init -> app顺序准入”的短期scratch state，不是所有Pod共享的长期复用池，也不是checkpoint权威账。真正已确认的container分配仍在 `podDevices`。
-
-### 10.1 普通init container
-
-分配完成后：
-
-```go
-m.podDevices.addContainerAllocatedResources(
-    string(pod.UID),
-    container.Name,
-    m.devicesToReuse[string(pod.UID)],
-)
-```
-
-大白话：
-
-> 普通init退出后，这批ID可以被同一个Pod后续容器再次使用。
-
-例如：
-
-```text
-init-a request 2个GPU逻辑单位
-  -> 拿到ID A、B
-  -> init-a结束
-
-app-a request 1
-  -> 可以从A、B中复用一个
-
-app-b request 1
-  -> 可以复用另一个
-```
-
-这不是两个同时运行的app container共享同一个ID。测试明确验证两个app的ID集合不相交：
-
-```text
-pkg/kubelet/cm/devicemanager/manager_test.go
-TestInitContainerDeviceAllocation
-```
-
-### 10.2 restartable init container
-
-restartable init相当于Pod sidecar，会继续运行。
-
-源码反而把它的ID从reuse集合移除：
-
-```go
-m.podDevices.removeContainerAllocatedResources(
-    string(pod.UID),
-    container.Name,
-    m.devicesToReuse[string(pod.UID)],
-)
-```
-
-含义：
-
-```text
-常驻init仍然占着设备
-  -> 后续app不能把它当成已释放设备
-```
-
-测试：
-
-```text
-TestRestartableInitContainerDeviceAllocation
-```
-
-### 10.3 app container
-
-app分配后也把自身ID从reuse集合移除，避免后续并发app再拿同一个ID。
-
-### 10.4 不能把reuse讲成GPU sharing
-
-| 机制 | 目的 | 谁决定 |
-|---|---|---|
-| init reuse | 生命周期不重叠时复用同一个ID | kubelet DeviceManager |
-| time-slicing | 多workload共享GPU时间 | NVIDIA插件/配置 |
-| MPS | 进程级并发与隔离策略 | NVIDIA MPS及平台治理 |
-| MIG | 硬件分区为逻辑实例 | GPU/MIG配置与插件 |
-
-`devicesToReuse`只解决第一行。
-
----
-
-## 11. `allocateContainerResources`：为什么遍历Limits
-
-源码：
-
-```text
-pkg/kubelet/cm/devicemanager/manager.go:835-940
-```
-
-```go
-for k, v := range container.Resources.Limits {
-    resource := string(k)
-    needed := int(v.Value())
-
-    if !m.isDevicePluginResource(resource) {
-        continue
-    }
-
-    if !allocatedDevicesUpdated {
-        m.UpdateAllocatedDevices()
-        allocatedDevicesUpdated = true
-    }
-
-    allocDevices, err := m.devicesToAllocate(
-        ctx,
-        podUID,
-        contName,
-        resource,
-        needed,
-        devicesToReuse[resource],
-    )
-    ...
-}
-```
-
-Device Plugin暴露的是extended resource。API规则使这类资源不能像普通CPU那样超卖；当只写limit时，request会按规则等于limit，若同时写request/limit则不能表达request小于limit的超卖关系。
-
-因此当前实现遍历Limits。
-
-不能机械推广成：
-
-```text
-所有资源都只看Limits
-```
-
-这里只有DeviceManager的extended-resource路径。
-
-### 11.1 map顺序是本章第一个Go陷阱
-
-`container.Resources.Limits` 是Go map。
-
-```go
-for k, v := range container.Resources.Limits
-```
-
-不保证：
-
-- YAML书写顺序；
-- resource name字典序；
-- 每次运行顺序相同。
-
-如果一个container同时请求：
-
-```yaml
-limits:
-  vendor-a.example/foo: 1
-  vendor-b.example/bar: 1
-```
-
-两个插件谁先Allocate不是稳定API。
-
-这也意味着多资源部分成功时，不能预设“永远先分GPU再分网卡”。
-
----
-
-## 12. `UpdateAllocatedDevices`：分配前先清理已终止Pod
-
-源码：
-
-```text
-pkg/kubelet/cm/devicemanager/manager.go:556-578
-```
-
-主逻辑：
-
-```go
-activePods := m.activePods()
-if !m.sourcesReady.AllReady() {
-    return
-}
-
-podsToBeRemoved := m.podDevices.pods()
-for _, pod := range activePods {
-    podsToBeRemoved.Delete(string(pod.UID))
-}
-
-m.podDevices.delete(
-    sets.List(podsToBeRemoved),
-)
-m.allocatedDevices = m.podDevices.devices()
-```
-
-两条保护：
-
-1. 配置源没ready时不贸然删除旧账；
-2. 只删除已经不在activePods里的Pod UID。
-
-运维含义：
-
-```text
-kubelet刚启动时看见旧checkpoint
-  != 可以立刻判断哪些Pod已经不存在
-```
-
-要等apiserver/static pod等来源准备好，才有资格清理。
-
-### 12.1 它不会按 `nvidia-smi` 利用率释放资源
-
-只要Pod仍在activePods，哪怕CUDA利用率是0，ID仍属于该Pod账本。
-
-资源分配依据是声明与生命周期，不是瞬时硬件利用率。
-
----
-
-## 13. `devicesToAllocate`：先处理恢复，再做新选择
-
-源码：
-
-```text
-pkg/kubelet/cm/devicemanager/manager.go:580-736
-```
-
-函数签名：
-
-```go
-func (m *ManagerImpl) devicesToAllocate(
-    ctx context.Context,
-    podUID,
-    contName,
-    resource string,
-    required int,
-    reusableDevices sets.Set[string],
-) (sets.Set[string], error)
-```
-
-### 13.1 已经分过：继续使用原ID
-
-```go
-devices := m.podDevices.containerDevices(
-    podUID,
-    contName,
-    resource,
-)
-if devices != nil {
-    needed = needed - devices.Len()
-    if needed != 0 {
-        return nil, fmt.Errorf(
-            "pod ... changed request ...",
-        )
-    }
-}
-```
-
-适用：
-
-- container重启；
-- kubelet从checkpoint恢复；
-- 重复进入分配路径但正式账仍在。
-
-如果已分配数量与当前required不同，当前代码直接报错，不偷偷补一块或释放一块。
-
-### 13.2 kubelet restart且runtime容器仍在跑
-
-```go
-if !m.sourcesReady.AllReady() &&
-    m.isContainerAlreadyRunning(
-        logger,
-        podUID,
-        contName,
-    ) {
-    return nil, nil
-}
-```
-
-意思：
-
-> runtime已经报告这个container在运行，它已经拥有创建时的设备配置；kubelet初始化期间不要重复调用Allocate。
-
-这里返回的 `nil, nil` 表示“不需要新增ID”，不是“没有设备”。
-
-### 13.3 先检查插件注册和旧ID健康
-
-```go
-healthyDevices, hasRegistered :=
-    m.healthyDevices[resource]
-
-if !hasRegistered {
-    return nil, fmt.Errorf(
-        "cannot allocate unregistered device %s",
-        resource,
-    )
-}
-
-if healthyDevices.Len() == 0 {
-    return nil, fmt.Errorf(
-        "no healthy devices present...",
-    )
-}
-
-if !healthyDevices.IsSuperset(devices) {
-    return nil, fmt.Errorf(
-        "previously allocated devices are no longer healthy...",
-    )
-}
-```
-
-为什么在**没有走13.2运行中container提前返回**的路径里，`needed==0` 前仍检查健康和注册？
-
-源码注释明确说明，这是为了覆盖节点重启与历史问题：只要没有被“初始化期间runtime确认仍在运行”这一保护分支短路，已有分配就不应绕过“resource已经重新注册、旧ID仍健康”的校验。
-
-### 13.4 最后才处理 `needed==0`
-
-```go
-if needed == 0 {
-    return nil, nil
-}
-```
-
-说明正式账已经完整，不必再次向插件Allocate。
-
----
-
-## 14. `allocateRemainingFrom`：真正RPC前先在内存占座
-
-缩小代码：
-
-```go
-allocated := sets.New[string]()
-
-allocateRemainingFrom :=
-    func(devices sets.Set[string]) bool {
-        if m.allocatedDevices[resource] == nil {
-            m.allocatedDevices[resource] =
-                sets.New[string]()
-        }
-
-        for device := range devices.Difference(
-            allocated,
-        ) {
-            m.allocatedDevices[resource].
-                Insert(device)
-            allocated.Insert(device)
-            needed--
-
-            if needed == 0 {
-                return true
-            }
-        }
-        return false
-    }
-```
-
-这个闭包同时修改：
-
-- 外层 `allocated`；
-- 外层 `needed`；
-- Manager共享状态 `m.allocatedDevices`。
-
-### 14.1 为什么RPC前就标记占用
-
-假设两个container并发请求最后一个GPU ID：
-
-```text
-container-a选ID X
-  -> 插件Allocate耗时2秒
-
-container-b同时进入
-```
-
-如果a等RPC成功后才占座，b也可能选到X。
-
-当前做法：
-
-```text
-锁内选X并插入allocatedDevices
-  -> 释放锁
-  -> 调插件RPC
-```
-
-b会看到X已经占用。
-
-### 14.2 为什么看到RPC时锁已经释放
-
-外部插件可能慢、异常或卡住。kubelet不能把DeviceManager全局mutex一直带进gRPC。
-
-这也是阅读并发代码的原则：
-
-```text
-锁内：读写共享账、做最小预留
-锁外：外部RPC、慢操作
-```
-
-### 14.3 `defer Unlock` 中间又手动解锁
-
-`devicesToAllocate`开始：
-
-```go
-m.mutex.Lock()
-defer m.mutex.Unlock()
-```
-
-`callGetPreferredAllocationIfAvailable`内部却会：
-
-```go
-m.mutex.Unlock()
-resp, err := eI.e.getPreferredAllocation(...)
-m.mutex.Lock()
-```
-
-这个helper依赖调用者已经持锁。它不是可以任意单独调用的普通函数。
-
-RPC期间其他goroutine可能重算map，所以闭包每次还检查：
-
-```go
-if m.allocatedDevices[resource] == nil {
-    m.allocatedDevices[resource] =
-        sets.New[string]()
-}
-```
-
-测试 `TestDevicesToAllocateConflictWithUpdateAllocatedDevices` 覆盖了“Preferred RPC期间 `UpdateAllocatedDevices` 删除map entry后，本次仍能返回所选ID”这一种情况。但它没有覆盖更深的一种组合：
-
-```text
-Preferred之前已经选择reusable/aligned ID
-  -> RPC期间allocatedDevices被podDevices.devices()整表重算
-  -> 外层allocated set仍记得旧选择
-  -> RPC后allocateRemainingFrom只遍历
-     devices.Difference(allocated)
-```
-
-已经存在于外层 `allocated` 的ID会被Difference跳过，不会因为map刚被重算而自动重新插回 `m.allocatedDevices`。若后续Allocate RPC成功且response非空，`podDevices.insert` 才会保存完整返回集合；从整表重算到正式insert之间存在reservation不可见窗口。若重算后只插入了Preferred新增部分，聚合表还可能暂时缺少前面那部分，直到后续其他重算收敛。当前测试只断言函数返回set，没有断言“带预选ID时共享reservation始终保留”。这应作为并发fake测试补齐，不能用现有测试名证明已经完整覆盖。
-
----
-
-## 15. 候选公式：`healthy - allocated`
-
-```go
+// 取出这个扩展资源已经被占用的设备 ID 集合。
 devicesInUse := m.allocatedDevices[resource]
-available := m.healthyDevices[resource].
-    Difference(devicesInUse)
-```
-
-若数量不够：
-
-```go
+// 用健康 ID 集合减去已占用集合，得到还能参与本次选择的候选。
+available := m.healthyDevices[resource].Difference(devicesInUse)
+// 候选数量小于还需要的数量时，不能硬凑，直接返回错误。
 if available.Len() < needed {
-    return nil, fmt.Errorf(
-        "requested number of devices unavailable...",
-    )
+	// 错误里同时记录资源名、需要数和可用数，方便定位数量缺口。
+	return nil, fmt.Errorf("requested number of devices unavailable for %s. Requested: %d, Available: %d", resource, needed, available.Len())
 }
+
+// 候选够用后，再按 NUMA 位置把它们分组；具体含义第二遍再学。
+aligned, unaligned, noAffinity := m.filterByAffinity(podUID, contName, resource, available)
 ```
 
-先钉死适用范围：
+**大白话总结：** scheduler没有把某个 GPU ID 塞给 kubelet。DeviceManager到了目标 Node 后，自己拿“健康名单”减去“占用名单”，先得到候选。只有候选数量够，才继续选具体 ID。
+
+把本章数字代进去：
 
 ```text
-普通init reusableDevices
-  早于
-available = healthy - allocated
+健康 = {A, B, C, D, E, F, G, H}
+占用 = {A, B, C, D, E, F}
+候选 = {G, H}
+需要 = 1
 ```
 
-所以 `healthy - allocated` 是**普通init复用仍不足之后的新ID候选公式**，不是整个函数所有ID来源的总公式。
+教学案例后面假设最终选中 G。但源码大量使用 set、map 和 `UnsortedList`，所以不能据此承诺“永远先选 G”或“永远先选 GPU0”。
 
-### 15.1 一个容易漏掉的健康边界：reuse没有先与Healthy取交集
+**顺手学 Go：**
 
-前面的健康检查是：
+- `:=` 表示“第一次声明变量并赋值”，可以先类比 Java 的局部变量初始化。
+- `m.allocatedDevices[resource]` 是从 map 里按 `resource` 取值，类似 Java 的 `map.get(resource)`。
+- `Difference` 是集合差集：左边有、右边没有的成员留下。
+- `if available.Len() < needed` 就是普通条件判断。
+- `return nil, err` 表示函数返回两个值：第一个结果没有，第二个结果是错误。这是 Go 常见的显式错误处理。
 
-```go
-if healthyDevices.Len() == 0 {
-    return nil, fmt.Errorf(...)
-}
-
-if !healthyDevices.IsSuperset(devices) {
-    return nil, fmt.Errorf(...)
-}
-```
-
-这里的 `devices` 是**当前目标container已经分配过的ID**，不是参数 `reusableDevices`。
-
-后面代码直接先做：
-
-```go
-if allocateRemainingFrom(reusableDevices) {
-    return allocated, nil
-}
-```
-
-当前函数没有先执行：
-
-```go
-reusableDevices.Intersection(healthyDevices)
-```
-
-因此要非常精确地说：
-
-- resource连一个Healthy ID都没有：前面的 `Len()==0` 会拒绝；
-- 当前目标container的旧ID不再Healthy：`IsSuperset(devices)` 会拒绝；
-- 普通init留下的某个reusable ID变为Unhealthy，但同resource仍有其他Healthy ID：当前选择代码没有在复用前把该ID过滤掉，后续插件Allocate仍可能报错。
-
-这不是建议生产制造Unhealthy来测试，而是一个值得用fake manager补单测的源码边界。不要把“检查了旧ID健康”扩大成“所有reuse ID都已经过Healthy交集”。
-
-四个数字不要混：
-
-| 数字 | 示例 | 含义 |
-|---|---:|---|
-| Node Allocatable | 8 | 插件当前Healthy逻辑entry总量 |
-| scheduler剩余账 | 2 | 8减去已调度Pod requests |
-| DeviceManager available | 2 | 本地healthy ID减allocated ID |
-| CUDA利用率 | 0% | 瞬时使用率，不参与这里的集合公式 |
-
-正常收敛时scheduler账与DeviceManager available应该相容，但它们来自不同时间、不同状态源：
-
-- scheduler用apiserver对象与Pod缓存；
-- DeviceManager用Node本地内存和checkpoint；
-- 传播延迟、重启恢复、绕过scheduler或插件健康变化都可能造成短暂分叉。
-
-因此本地准入仍需要自己的可用性校验。
+这一段只回答“新 ID 的候选从哪里来”。旧分配恢复、init container复用和 NUMA 顺序放在第二遍。
 
 ---
 
-## 16. NUMA：TopologyManager先定范围，DeviceManager再选ID
+## 4. 第二站从哪里开始：kubelet 本地准入触发分配
 
-Topology hints生成：
+**本地准入（local admission）**不是 API Server 的 Admission Webhook。这里指：Pod 已经分到这台 Node 后，kubelet在真正启动容器前做一次“本机能不能兑现这些资源”的检查。
 
-```text
-pkg/kubelet/cm/devicemanager/topology_hints.go
-  GetTopologyHints
-  GetPodTopologyHints
-  generateDeviceTopologyHints
-```
-
-container scope大致是：
+主路径可以先压缩成四个函数：
 
 ```text
-DeviceManager提供某resource可以满足request的NUMA masks
-CPUManager提供CPU masks
-MemoryManager提供内存masks
-  -> TopologyManager policy.Merge
-  -> 保存bestHint
+TopologyManager.Admit
+  -> scope.admitPolicyNone
+  -> scope.allocateAlignedResources
+  -> DeviceManager.Allocate
 ```
 
-到真正选择ID时：
+即使 TopologyManager 的策略叫 `none`，也不是“什么都不做”。它仍然会让各个资源提供者执行 Allocate；`none` 只是表示不因为 NUMA 对齐而拒绝 Pod。
+
+### 4.1 为什么要在 Node 上再检查一次
+
+scheduler做决定时看的是集群里的汇总状态。等 Pod 真到 Node 上时，插件可能刚好重启、某个 ID 可能刚变成不健康，本地账也可能正在恢复。因此 scheduler先完成全局粗筛，再由 kubelet用最新本地事实做最后检查。
+
+代价是：Pod 可能已经写入 `nodeName`，却仍在 Node 本地准备阶段失败。
+
+### 4.2 源码：谁调用了 DeviceManager 的 Allocate
+
+文件：`pkg/kubelet/cm/topologymanager/scope.go:143-162`
 
 ```go
-aligned, unaligned, noAffinity :=
-    m.filterByAffinity(
-        podUID,
-        contName,
-        resource,
-        available,
-    )
-```
+// policy 为 none 时，仍然逐个处理普通 init container 和业务 container。
+func (s *scope) admitPolicyNone(pod *v1.Pod) lifecycle.PodAdmitResult {
+	// 把两类 container 拼成一份列表，然后逐个准入。
+	for _, container := range append(pod.Spec.InitContainers, pod.Spec.Containers...) {
+		// 为当前 container 调用资源提供者的 Allocate。
+		err := s.allocateAlignedResources(pod, &container)
+		// 任意一个资源提供者失败，本次本地准入就失败。
+		if err != nil {
+			// 把普通错误转换成 kubelet 能回报的准入结果。
+			return admission.GetPodAdmitResult(err)
+		}
+	}
+	// 所有 container 都处理成功，返回接纳结果。
+	return admission.GetPodAdmitResult(nil)
+}
 
-`filterByAffinity`：
-
-```text
-pkg/kubelet/cm/devicemanager/manager.go:738-832
-```
-
-### 16.1 没有hint时
-
-```go
-hint := m.topologyAffinityStore.GetAffinity(
-    podUID,
-    contName,
-)
-
-if !m.deviceHasTopologyAlignment(resource) ||
-    hint.NUMANodeAffinity == nil {
-    return empty, empty, available
+// 这个函数负责逐个调用已经注册的资源提供者。
+func (s *scope) allocateAlignedResources(pod *v1.Pod, container *v1.Container) error {
+	// hintProviders 是资源提供者列表，DeviceManager 是其中之一。
+	for _, provider := range s.hintProviders {
+		// 通过接口调用具体提供者的 Allocate 实现。
+		err := provider.Allocate(pod, container)
+		// 某个提供者无法兑现资源时，立即把错误往上传。
+		if err != nil {
+			// 返回原错误，停止后面的准入流程。
+			return err
+		}
+	}
+	// 所有提供者都成功，当前 container 的资源分配结束。
+	return nil
 }
 ```
 
-所有候选落入 `noAffinity`。
+**大白话总结：** kubelet先遍历 Pod 里的 container，再遍历本机资源管理模块。轮到 DeviceManager 时，才进入设备 ID 分配。它不是 scheduler 直接远程调用 Device Plugin。
 
-这不表示设备不可用，只表示本次没有NUMA约束可应用。
+**顺手学 Go：**
 
-### 16.2 有hint时分三类
+- `func (s *scope)` 中的 `(s *scope)` 叫接收者，可先类比 Java 的 `this`。
+- `for _, container := range ...` 是遍历；下划线表示这一个返回值不需要。
+- `&container` 取得变量地址，传的是指针。
+- `if err != nil` 就是“如果发生错误”；Go习惯立刻返回。
+- `provider.Allocate` 是接口调用，运行时落到不同资源提供者的实现。
 
-| 集合 | 含义 |
-|---|---|
-| `aligned` | 设备至少匹配best hint内的NUMA node |
-| `unaligned` | 有topology，但落在hint外 |
-| `noAffinity` | Device没有NUMA信息 |
+### 4.3 主路线边界
 
-特殊常量：
-
-```go
-const nodeWithoutTopology = -1
-```
-
-它只是内部分类标记，不是真实机器NUMA node。
-
-### 16.3 一个Device可以关联多个NUMA node
-
-API的 `TopologyInfo.Nodes` 是repeated字段。
-
-当前过滤逻辑会避免把同一device重复加入多个结果集合。
-
-### 16.4 NUMA不是GPU fabric
-
-标准TopologyInfo不包含：
-
-- NVLink边；
-- NVSwitch域；
-- PCIe带宽；
-- P2P可达性；
-- HBM容量；
-- GPU代际。
-
-TopologyManager能做的是：
-
-```text
-CPU、内存、设备尽量落在一致NUMA范围
-```
-
-插件若懂更多GPU拓扑，要通过自身选择策略或 `GetPreferredAllocation` 提供建议。
+当前固定提交还有一个默认关闭的 `PodLevelResourceManagers` 功能开关。它会引出 Pod 级资源分配接口，而传统 DeviceManager 的 `AllocatePod` 当前直接返回成功。首遍不要让这个例外打断主线，第二遍第 12 节再看。
 
 ---
 
-## 17. `GetPreferredAllocation`：建议集合，不是强制结果
+## 5. 第四站：选出 ID 后，kubelet 怎样调用 Device Plugin
 
-API：
+上一节进入 `ManagerImpl.Allocate` 后，DeviceManager会检查旧分配、健康状态和占用状态，再挑出需要新增的 ID。
 
-```text
-staging/src/k8s.io/kubelet/pkg/apis/deviceplugin/v1beta1/api.proto:50-55
-```
-
-协议自己就写明：
-
-> resulting preferred allocation is not guaranteed to be the allocation ultimately performed by the devicemanager
-
-endpoint请求：
+在主案例中，我们假设：
 
 ```text
-pkg/kubelet/cm/devicemanager/endpoint.go:85-99
+候选 ID = {G, H}
+本次需要 = 1
+本次观察到最终选择 = {G}
 ```
+
+“观察到选择 G”只是这次结果，不是顺序保证。
+
+### 5.1 先解释三个新词
+
+- **endpoint**：DeviceManager里代表某个已注册插件连接的对象。大白话就是“拨号簿里这个插件的联系入口”。
+- **AllocateRequest**：kubelet交给插件的请求单，核心内容是选中的 device ID。
+- **AllocateResponse**：插件返回的设备使用说明，告诉 kubelet容器需要哪些环境变量、挂载、设备文件、注解或 CDI 名称。
+
+`Allocate` 是一次 gRPC 调用。这里的“分配”容易误导：它并不直接创建容器，而是让插件确认这些 ID，并返回怎样把设备交给容器。
+
+### 5.2 源码：请求里真正传了什么
+
+文件：`pkg/kubelet/cm/devicemanager/endpoint.go:102-111`
 
 ```go
-return e.api.GetPreferredAllocation(
-    ctx,
-    &pluginapi.PreferredAllocationRequest{
-        ContainerRequests: []*pluginapi.
-            ContainerPreferredAllocationRequest{
-            {
-                AvailableDeviceIDs: available,
-                MustIncludeDeviceIDs: mustInclude,
-                AllocationSize: int32(size),
-            },
-        },
-    },
-)
+// endpointImpl 的 allocate 方法接收已经选好的 ID 列表。
+func (e *endpointImpl) allocate(ctx context.Context, devs []string) (*pluginapi.AllocateResponse, error) {
+	// 插件连接已经停止时，不再继续调用。
+	if e.isStopped() {
+		// 返回空响应和明确错误。
+		return nil, fmt.Errorf(errEndpointStopped, e)
+	}
+	// 通过 gRPC 客户端调用插件的 Allocate。
+	return e.api.Allocate(ctx, &pluginapi.AllocateRequest{
+		// 当前请求只构造一个 container 的分配项。
+		ContainerRequests: []*pluginapi.ContainerAllocateRequest{
+			// 把 DeviceManager 选中的 ID 原样放进请求。
+			{DevicesIds: devs},
+		},
+	})
+}
 ```
 
-三个参数：
+**大白话总结：** DeviceManager已经选好 G 后，这段代码只是把 `["G"]` 装进请求并调用插件。插件不负责替 scheduler 换 Node；它只处理这台 Node 上这些 ID 的设备配置。
 
-| 参数 | 大白话 |
-|---|---|
-| `AvailableDeviceIDs` | 插件可从哪些合法候选中建议 |
-| `MustIncludeDeviceIDs` | kubelet已经选中、结果必须容纳的ID |
-| `AllocationSize` | 该container最终需要的总数量 |
+**顺手学 Go：**
 
-### 17.1 aligned足够
+- `devs []string` 表示字符串切片，可先类比 Java 的 `List<String>`。
+- `(*pluginapi.AllocateResponse, error)` 表示函数返回“响应指针 + 错误”两个值。
+- `&pluginapi.AllocateRequest{...}` 是创建结构体并取地址。
+- `[]*T{...}` 是“元素类型为 `*T` 的切片字面量”。
 
-若：
+### 5.3 请求与响应长什么样
 
-```go
-needed < aligned.Len()
+下面是教学化的结构，不是抓包原文：
+
+```json
+{
+  "request": {
+    "container": "inference",
+    "deviceIDs": ["G"]
+  },
+  "response": {
+    "envs": {},
+    "mounts": [],
+    "devices": [],
+    "annotations": {},
+    "cdiDevices": [
+      {"name": "nvidia.com/gpu=GPU-G"}
+    ]
+  }
+}
 ```
 
-kubelet先让插件只在aligned范围内给建议。
+这里用 CDI 模式举例。不同 NVIDIA Device Plugin 版本和配置可能返回传统 device/mount/env，也可能返回 CDI 名称，不能把示例字段当成所有环境的固定结果。
 
-为什么是小于，不是小于等于？
+| 响应字段 | 大白话作用 | 最后由谁执行 |
+|---|---|---|
+| `Envs` | 给容器增加环境变量 | kubelet装入配置，runtime应用 |
+| `Mounts` | 把宿主机路径挂进容器 | runtime |
+| `Devices` | 把宿主机设备文件映射到容器 | runtime |
+| `Annotations` | 给容器配置附加键值信息 | kubelet交给runtime |
+| `CdiDevices` | 给出标准设备名字，让runtime查本机CDI配置 | 支持CDI的runtime |
 
-如果剩余所需刚好等于aligned数量，就必须全拿，没有让插件二选一的空间。
+**annotation（注解）**就是一组键值对，供后续组件读取。它不是 Java 代码里的 `@Annotation`。
 
-### 17.2 aligned不够
+**CDI（Container Device Interface）**可以先理解成“设备注入说明书的索引”。插件返回名字，runtime再去本机 CDI 配置目录里找到这个名字对应的详细注入规则。
 
-kubelet先把aligned全部拿走，以满足TopologyManager承诺；再把：
+### 5.4 Allocate 成功，只证明插件返回了配置
 
-```text
-available + 已经选中的ID
-```
-
-交给插件建议剩余组合。
-
-### 17.3 插件结果仍要取交集
-
-```go
-preferred.Intersection(aligned)
-```
-
-或：
-
-```go
-preferred.Intersection(available)
-```
-
-所以：
-
-- 返回未知ID：被交集过滤；
-- 返回别的container已占用ID：不在available，过滤；
-- 返回数量不足：kubelet继续fallback；
-- 不实现Preferred：直接fallback；
-- RPC报错：本次分配失败。
-
-### 17.4 当前没有显式Preferred RPC截止时间
-
-`ManagerImpl.Allocate`使用 `context.TODO()`，`getPreferredAllocation`本身没有再包 `context.WithTimeout`。
-
-不要把插件连接时的10秒dial timeout误写成所有RPC timeout。
-
-生产上插件Preferred处理卡住可能拉长kubelet本地准入；需要同时看：
-
-- kubelet goroutine/日志；
-- Device Plugin服务端日志；
-- RPC开始时间；
-- Pod准入时间；
-- 节点上其他Pod是否也被同类请求阻塞。
-
-不要为了验证猜想在生产直接kill插件或删除socket。
-
-### 17.5 当前测试有一个断言缺口
-
-`TestGetPreferredAllocationParameters` 计划校验：
-
-- available；
-- mustInclude；
-- size。
-
-但当前：
-
-```text
-pkg/kubelet/cm/devicemanager/topology_hints_test.go:659-661
-```
-
-第二次仍比较 `actualAvailable`，没有真正比较 `actualMustInclude`。
-
-因此讲义结论来自生产代码本身，不能因为测试名存在就夸大mustInclude已经被完整单测锁死。
+Allocate成功不能证明 containerd已经找到 CDI 配置、设备文件真的进入容器、CUDA库兼容、JVM已经启动。它只证明第四站完成。
 
 ---
 
-## 18. 没有稳定ID顺序：为什么不能说“默认GPU0”
+## 6. 第五站前半段：为什么必须把 ID 和响应一起记住
 
-当前选择链反复使用：
-
-```go
-sets.Set[string]
-for device := range devices
-UnsortedList()
-```
-
-Go map/set遍历顺序不是稳定API。
-
-即使：
-
-- Pod request不变；
-- healthy IDs不变；
-- 没有NUMA约束；
-- 插件不实现Preferred；
-
-也不能从源码承诺总是选择：
-
-- 字典序最小ID；
-- ListAndWatch第一项；
-- `/dev/nvidia0`；
-- `nvidia-smi -L`第一行；
-- 上一次另一个Pod使用的ID。
-
-`GetPreferredAllocationResponse.DeviceIDs` 也会先转成set，返回顺序不会作为优先级保留。
-
-运维上如果业务要求：
+DeviceManager收到插件响应后，会把两类内容一起写进 `podDevices`：
 
 ```text
-必须选同一GPU型号
-必须在同一NVSwitch域
-必须避开某个GPU UUID
+定位键：Pod UID + container 名 + resource 名
+保存值：device IDs + ContainerAllocateResponse
 ```
 
-不能依赖默认集合顺序。需要：
+`podDevices` 是 kubelet内存中的正式分配账。它回答：“这个 Pod 的这个 container，对这个设备资源，已经拿过哪些 ID；插件当时要求怎样注入？”
 
-- 正确resource建模；
-- MIG/profile/resource name；
-- DRA或厂商策略；
-- Topology/Preferred实现；
-- Node label/taint等平台约束；
-- 经过验证的GPU调度扩展。
+如果只保存 ID，不保存响应，创建容器时就得再次调用插件才能找回 env、mount、device、CDI。那会让重启和恢复更脆弱。
+
+### 6.1 源码：正式账怎样写入
+
+文件：`pkg/kubelet/cm/devicemanager/pod_devices.go:76-89`
+
+```go
+// insert 按 Pod、container、resource 三层键保存一次正式分配。
+func (pdev *podDevices) insert(podUID, contName, resource string, devices checkpoint.DevicesPerNUMA, resp *pluginapi.ContainerAllocateResponse) {
+	// 写账前拿写锁，避免并发读写 map。
+	pdev.Lock()
+	// 函数结束时一定释放写锁。
+	defer pdev.Unlock()
+	// 第一层还没有这个 Pod 时，先创建 Pod 对应的 map。
+	if _, podExists := pdev.devs[podUID]; !podExists {
+		// 第一层键是 Pod UID。
+		pdev.devs[podUID] = make(containerDevices)
+	}
+	// 第二层还没有这个 container 时，再创建 container 对应的 map。
+	if _, contExists := pdev.devs[podUID][contName]; !contExists {
+		// 第二层键是 container 名。
+		pdev.devs[podUID][contName] = make(resourceAllocateInfo)
+	}
+	// 第三层以资源名为键，同时保存 ID 和插件响应。
+	pdev.devs[podUID][contName][resource] = deviceAllocateInfo{
+		// deviceIds 保存按 NUMA 分组的具体 ID。
+		deviceIds: devices,
+		// allocResp 保存这个资源对应的完整容器分配响应。
+		allocResp: resp,
+	}
+}
+```
+
+**大白话总结：** 这不是只写“G 已占用”。它还把插件对 G 返回的注入说明一起存下来，后面创建容器时再读。
+
+**顺手学 Go：**
+
+- `map[key]value` 是 Go 的映射；这里连续三层 map 类似 Java 的嵌套 `Map`。
+- `if _, ok := m[key]; !ok` 是“查 map 并判断键是否存在”。
+- `make(containerDevices)` 创建一个可写的 map。
+- `defer pdev.Unlock()` 表示函数返回前执行解锁。
+- 结构体字段 `deviceIds: devices` 是按字段名赋值。
+
+### 6.2 cache 和 checkpoint 不要混为一谈
+
+- **cache（内存缓存）**：`podDevices` 在 kubelet进程内，读取快。
+- **checkpoint（本地检查点）**：把关键分配账写到 Node 磁盘，供 kubelet重启后恢复。
+
+正常分配中，DeviceManager不是每成功一个资源就立刻写 checkpoint，而是在当前 container 的设备资源循环完成后再写。若中间失败，要结合内存重算和后续垃圾回收理解，第二遍第 11 节展开。
 
 ---
 
-## 19. 选出ID后，才真正调用Device Plugin `Allocate`
+## 7. 第五站后半段到第六站：怎样交给 container runtime
 
-回到：
+创建业务容器时，kubelet通常不会重新选 ID，而是读取 `podDevices` 中保存的响应，把它变成 `RunContainerOptions`，再拼成 CRI 的 `ContainerConfig`。
 
-```text
-pkg/kubelet/cm/devicemanager/manager.go:839-940
+- **RunContainerOptions**：kubelet内部的“容器运行参数篮子”。
+- **ContainerConfig**：交给 container runtime 的最终“创建申请单”。
+- **runtime**：这里指 containerd、CRI-O 等负责真正创建容器的进程。
+
+### 7.1 整体状态变化
+
+读图方向：从左往右。实线表示数据被保存或转换；虚线表示外部组件执行时可能失败。
+
+```mermaid
+flowchart LR
+    A["选中 device ID<br/>G"] --> B["Device Plugin<br/>ContainerAllocateResponse"]
+    B --> C["podDevices 内存账<br/>ID + 完整响应"]
+    C --> D["RunContainerOptions<br/>env/mount/device/CDI"]
+    D --> E["CRI ContainerConfig"]
+    E -.->|"runtime 无法解析 CDI 名称"| X["CreateContainerError"]
+    E --> F["runtime 创建容器"]
+    F --> G["JVM 启动"]
 ```
 
-核心片段：
+图例：
+
+- 每向右一步，信息的格式会变化，但设备注入意图会继续传递。
+- 虚线失败发生在 runtime 执行阶段，不应倒推成 scheduler 一定选错了 Node。
+
+### 7.2 源码：创建容器时先从 DeviceManager 取缓存
+
+文件：`pkg/kubelet/cm/container_manager_linux.go:765-778`
 
 ```go
-allocDevices, err := m.devicesToAllocate(
-    ctx,
-    podUID,
-    contName,
-    resource,
-    needed,
-    devicesToReuse[resource],
-)
+// 正常主路径中，Allocate 应该已在本地准入阶段完成；这里读取缓存。
+devOpts, err := cm.deviceManager.GetDeviceRunContainerOptions(ctx, pod, container)
+// 读取或恢复设备运行参数失败时，停止生成容器配置。
 if err != nil {
-    return err
+	// 把空结果和原错误返回给上层。
+	return nil, err
+// 当前 Pod/container 没有传统 DeviceManager 结果时，保留已有选项并返回。
+} else if devOpts == nil {
+	// 这里的 opts 仍可能含有 DRA 提供的 CDI 设备。
+	return opts, nil
 }
-
-if allocDevices == nil ||
-    len(allocDevices) <= 0 {
-    continue
-}
-
-devs := allocDevices.UnsortedList()
-
-resp, err := eI.e.allocate(ctx, devs)
+// 把传统设备文件映射追加到统一运行参数。
+opts.Devices = append(opts.Devices, devOpts.Devices...)
+// 把设备插件要求的挂载追加进去。
+opts.Mounts = append(opts.Mounts, devOpts.Mounts...)
+// 把设备插件要求的环境变量追加进去。
+opts.Envs = append(opts.Envs, devOpts.Envs...)
+// 把设备插件要求的注解追加进去。
+opts.Annotations = append(opts.Annotations, devOpts.Annotations...)
+// 把设备插件要求的 CDI 名称追加进去。
+opts.CDIDevices = append(opts.CDIDevices, devOpts.CDIDevices...)
+// 返回汇总完成的容器运行参数。
+return opts, nil
 ```
 
-endpoint：
+**大白话总结：** 创建容器时，kubelet把先前缓存的插件响应拆成几类运行参数，装进同一个篮子。正常情况下，这一步不是重新挑 GPU。
 
-```text
-pkg/kubelet/cm/devicemanager/endpoint.go:101-110
-```
+**顺手学 Go：**
+
+- `devOpts, err := ...` 一次接收函数的两个返回值。
+- `append(slice, other...)` 中的 `...` 是真实 Go 展开语法，不是省略源码。
+- `nil` 可先类比 Java 的 `null`，但它只能用于特定类型。
+
+### 7.3 源码：运行参数怎样进入 CRI 创建单
+
+文件：`pkg/kubelet/kuberuntime/kuberuntime_container.go:367-385`
 
 ```go
-func (e *endpointImpl) allocate(
-    ctx context.Context,
-    devs []string,
-) (*pluginapi.AllocateResponse, error) {
-    if e.isStopped() {
-        return nil, fmt.Errorf(
-            errEndpointStopped,
-            e,
-        )
-    }
-
-    return e.api.Allocate(
-        ctx,
-        &pluginapi.AllocateRequest{
-            ContainerRequests: []*pluginapi.
-                ContainerAllocateRequest{
-                {DevicesIds: devs},
-            },
-        },
-    )
-}
-```
-
-结论：
-
-```text
-某container的某种Device Plugin resource
-  + 本轮确实选出了需要Allocate的新/复用ID
-  = 一次独立Allocate RPC
-
-已有正式分配、初始化期runtime确认仍在运行、
-或其他“不需要新增ID”的返回
-  = 本轮不发Allocate RPC
-```
-
-不是：
-
-- 整个Pod只发一次；
-- 一个container的所有厂商资源合成一次；
-- scheduler直接调用插件；
-- runtime自己挑ID。
-
-### 19.1 Allocate做两件事
-
-API注释：
-
-```text
-staging/src/k8s.io/kubelet/pkg/apis/deviceplugin/v1beta1/api.proto:142-188
-```
-
-插件可以：
-
-1. 对请求ID执行设备特定准备；
-2. 告诉kubelet怎样让container访问设备。
-
-响应：
-
-```protobuf
-message ContainerAllocateResponse {
-    map<string, string> envs = 1;
-    repeated Mount mounts = 2;
-    repeated DeviceSpec devices = 3;
-    map<string, string> annotations = 4;
-    repeated CDIDevice cdi_devices = 5;
-}
-```
-
-所以：
-
-```text
-device ID
-  != /dev路径
-  != 最终env
-  != CDI name
-```
-
-ID是请求插件的输入；ContainerAllocateResponse才是运行时注入意图。
-
-### 19.2 当前Allocate也没有函数级显式timeout
-
-`endpoint.allocate`直接使用传入context。
-
-主路径来自：
-
-```go
-ctx := context.TODO()
-```
-
-没有像Device Plugin PreStart那样再包30秒deadline。
-
-如果服务端Allocate卡住，可能拉长kubelet本地准入。
-
-治理要求：
-
-- 为插件自身RPC实现与健康监控设预算；
-- 观察kubelet和插件同一时窗；
-- 使用canary Node先验证插件升级；
-- 不在生产用kill/delete socket作为常规“探活”；
-- 出现集体卡顿时先隔离新调度，再按变更流程处置节点。
-
-### 19.3 Allocate duration指标
-
-源码：
-
-```text
-pkg/kubelet/metrics/metrics.go
-```
-
-指标：
-
-```text
-kubelet_device_plugin_alloc_duration_seconds{
-  resource_name="nvidia.com/gpu"
-}
-```
-
-观察点在RPC返回后：
-
-```go
-metrics.DevicePluginAllocationDuration.
-    WithLabelValues(resource).
-    Observe(...)
-```
-
-这是一个只带 `resource_name` label的Alpha Histogram。若同一kubelet上该resource的 `_count` 在目标时间窗发生增量，它能证明：
-
-- 这个resource至少有一次Allocate调用已经返回；
-- 聚合bucket/sum/count记录了这类调用的耗时；
-- resource label是什么。
-
-它不能单独证明：
-
-- 增量对应目标Pod、container或device ID；
-- RPC成功；
-- response合法；
-- checkpoint成功；
-- CRI CreateContainer成功；
-- GPU workload能跑kernel。
-
-当前这段没有独立的Allocate error counter，也没有Pod UID/container name/device ID label。必须用目标Pod日志与插件请求日志建立身份关联；不能因为同一时间窗指标增加，就把另一个Pod的Allocate归给当前故障。
-
----
-
-## 20. AllocateResponse验证边界：远比很多人想象得浅
-
-RPC返回后，Manager只显式检查：
-
-```go
-if len(resp.ContainerResponses) == 0 {
-    return fmt.Errorf(
-        "no containers return in allocation response %v",
-        resp,
-    )
-}
-```
-
-随后直接使用：
-
-```go
-resp.ContainerResponses[0]
-```
-
-当前请求只有一份container request，但代码行为是：
-
-| response数量 | 当前处理 |
-|---:|---|
-| 0 | 返回error |
-| 1 | 使用第0份 |
-| 大于1 | 仍只使用第0份，额外项不进入缓存 |
-
-### 20.1 kubelet没有在这里验证的内容
-
-这段主链没有深度检查：
-
-- response必须恰好一份；
-- host path是否存在；
-- device permissions是否合法；
-- mount host path是否存在；
-- container path是否与Pod volume冲突；
-- env key/value是否合理；
-- annotation是否会碰kubelet内部key；
-- CDI fully-qualified name语法；
-- CDI spec文件是否存在；
-- runtime能否解析CDI；
-- 插件准备动作是否真的对应请求ID。
-
-API response本身也没有再次回显“这份配置对应哪些request IDs”的字段。
-
-这不是说系统完全没有任何下游验证，而是：
-
-> DeviceManager本层把注册该resource的Device Plugin当作高信任节点组件；很多无效内容要到CRI/runtime创建时才失败。
-
-### 20.2 Device Plugin为什么是高风险节点组件
-
-它能够为请求该resource的container提供：
-
-- host device路径；
-- host mount路径；
-- environment；
-- runtime annotation；
-- CDI device name。
-
-一个被篡改或错误配置的插件，影响的不只是自己的Pod日志，而是业务container的创建配置。
-
-治理边界：
-
-- 插件镜像锁digest并做供应链扫描；
-- 配置走审计和发布审批；
-- socket目录、CDI spec目录限制写权限；
-- 插件DaemonSet不允许普通租户修改；
-- canary Node验证后再滚动；
-- raw CRI inspect可能含env、args、认证信息，不能直接发到群聊或工单；
-- 不把“插件是开源项目”当作节点信任审查的替代。
-
-### 20.3 插件内部部分失败应该怎样表达
-
-API注释约定：
-
-```text
-若请求dev1和dev2
-  dev1准备成功
-  dev2准备失败
-
-插件应：
-  发送ListAndWatch健康更新
-  并让Allocate请求失败
-```
-
-kubelet不会替插件猜哪个设备准备了一半。
-
----
-
-## 21. 非原子边界：多resource可能部分成功
-
-`allocateContainerResources`逐resource循环。
-
-假设container同时请求：
-
-```yaml
-limits:
-  nvidia.com/gpu: 1
-  example.com/rdma: 1
-```
-
-可能时间线：
-
-```text
-resource A:
-  选ID gpu-a
-  Allocate成功
-  写入podDevices内存
-
-resource B:
-  选ID rdma-b
-  Allocate失败
-  函数返回error
-```
-
-源码注释明确承认：
-
-```text
-allocation failure may leave container resources
-partially allocated for the failed container
-```
-
-位置：
-
-```text
-pkg/kubelet/cm/devicemanager/manager.go:877-889
-```
-
-### 21.1 RPC error分支会重算 `allocatedDevices`
-
-```go
-if err != nil {
-    m.mutex.Lock()
-    m.allocatedDevices =
-        m.podDevices.devices()
-    m.mutex.Unlock()
-    return err
-}
-```
-
-大白话：
-
-```text
-撤销没有进入正式账的临时占座
-保留前面已经进入podDevices的成功分配
-```
-
-但这不是“只从set中删除本次失败的IDs”。代码把**整张** `allocatedDevices` 替换为当时 `podDevices` 的聚合。如果另一个container正处于：
-
-```text
-已经在allocatedDevices占座
-  -> Allocate RPC仍在flight
-  -> 尚未podDevices.insert
-```
-
-那么它的临时reservation也不在重建来源里，可能被这次整表替换一起抹掉。随后第三次选择就可能暂时看不到该in-flight占座。
-
-当前默认Pod新增准入通过 `pkg/kubelet/allocation/allocation_manager.go:521-527` 中 `Manager.AddPod` 的 `allocationMutex` 串行化，降低了普通AddPod之间的风险；但 `GetDeviceRunContainerOptions -> m.Allocate` 的恢复补偿并不由这里的全局准入mutex包住，DeviceManager自身也会在外部RPC期间释放mutex。因此不能把该整表重算描述成并发事务安全的“精确回滚”。
-
-所以旧材料中的“Allocate失败全部回滚”不够精确；更准确的是“回到当时已经进入 `podDevices` 的正式聚合”，同时要审计其他in-flight reservation。
-
-### 21.2 unknown endpoint也有显式重算
-
-endpoint不存在时：
-
-```go
-m.allocatedDevices = m.podDevices.devices()
-```
-
-然后返回：
-
-```text
-unknown Device Plugin <resource>
-```
-
-这里同样是整表替换，因此与21.1共享“可能抹掉其他in-flight reservation”的并发边界，不是只释放当前resource/当前container。
-
-### 21.3 没有同样立即回滚的不止两个分支
-
-必须从“第一次调用 `allocateRemainingFrom` 后是否已经占座”开始审计，而不能只数外层RPC return。当前需要单独看到：
-
-1. reusable数量不足时，函数已把这部分ID插入 `allocatedDevices`；若随后 `available.Len() < needed`，`devicesToAllocate` 直接返回error；
-2. `GetPreferredAllocation` 在前面已有reusable和/或aligned ID被预留后返回error；即使某次调用前尚未预留，Preferred error分支本身也没有统一重算；
-3. 两个“unexpectedly allocated less resources than required”防御性error若在已经选过ID后触发，也没有本地重算；
-4. Allocate RPC返回成功，但 `ContainerResponses` 长度为0。
-
-这些路径没有在紧邻error return前统一执行和RPC error分支一样的：
-
-```go
-m.allocatedDevices = m.podDevices.devices()
-```
-
-准确表述应该是：
-
-> 当前函数内没有立即显式重算，后续需要依赖状态更新、Pod清理或其他重算路径观察是否收敛；不能直接宣称所有错误都原地完整回滚。
-
-不要在生产人为让插件返回空response来验证这一点。正确方法是：
-
-- 源码/单测环境构造fake endpoint；
-- 隔离测试集群；
-- 插件维护方增加异常response测试；
-- 生产只做证据采集和止损。
-
-### 21.4 checkpoint不是每个resource成功后立刻写
-
-代码先：
-
-```go
-m.podDevices.insert(...)
-```
-
-全部资源循环结束后才：
-
-```go
-if needsUpdateCheckpoint {
-    return m.writeCheckpoint(logger)
-}
-```
-
-因此：
-
-- 前一个resource内存成功、后一个失败：本轮末尾checkpoint不会执行；
-- 全部RPC成功但checkpoint写失败：内存账已经更新，函数仍返回error；
-- “Allocate RPC成功”不等于“持久化成功”。
-
-第 17 课会专门读：
-
-- checkpoint schema；
-- checksum；
-- readCheckpoint；
-- kubelet restart；
-- allocated response恢复；
-- PodResources。
-
----
-
-## 22. `podDevices.insert`：正式缓存ID与完整注入response
-
-源码：
-
-```text
-pkg/kubelet/cm/devicemanager/pod_devices.go:32-89
-```
-
-```go
-type deviceAllocateInfo struct {
-    deviceIds checkpoint.DevicesPerNUMA
-    allocResp *pluginapi.ContainerAllocateResponse
-}
-```
-
-插入：
-
-```go
-pdev.devs[podUID][contName][resource] =
-    deviceAllocateInfo{
-        deviceIds: devices,
-        allocResp: resp,
-    }
-```
-
-### 22.1 为什么ID还要按NUMA保存
-
-选出的ID会根据 `allDevices[resource][id].Topology.Nodes` 形成：
-
-```text
-NUMA node -> []device ID
-```
-
-无topology时放到内部 `-1` 桶。
-
-这使：
-
-- checkpoint保留分配当时的device ID与NUMA关系；
-- PodResources可从这份 `DevicesPerNUMA` 暴露已分配设备topology；
-- kubelet重启后能从 `podDevices` 识别“这些ID已经分过”，再参与TopologyManager恢复判断。
-
-但不能进一步说“checkpoint里的NUMA桶会原样生成同一个hint”。当前 `generateDeviceTopologyHints` 对已分配ID仍查询重新注册后 `m.allDevices[resource][id].Topology`；`deviceHasTopologyAlignment` 也看当前 `allDevices`。只有插件重新上报并保持同样的ID/topology映射时，才可能重新得到同样的hint。checkpoint中的 `DevicesPerNUMA` 与插件当前清单是两份需要对齐的证据，这一恢复边界在第 17 课继续展开。
-
-### 22.2 为什么要缓存 `allocResp`
-
-容器真正创建时可能已经离准入阶段有一段时间，甚至kubelet重启过。
-
-如果只记：
-
-```text
-container拿了GPU ID X
-```
-
-但不记插件当时返回：
-
-```text
-env/mount/device/annotation/CDI
-```
-
-kubelet就无法重新构建相同ContainerConfig。
-
-因此checkpoint保存的不只是“谁拿了谁”，还保存插件的容器注入结果。
-
----
-
-## 23. 创建container时：`GetDeviceRunContainerOptions`
-
-Linux container manager：
-
-```text
-pkg/kubelet/cm/container_manager_linux.go:753-778
-```
-
-```go
-func (cm *containerManagerImpl) GetResources(
-    ctx context.Context,
-    pod *v1.Pod,
-    container *v1.Container,
-) (*kubecontainer.RunContainerOptions, error) {
-    opts := &kubecontainer.RunContainerOptions{}
-
-    // DRA CDI先汇入
-    ...
-
-    devOpts, err :=
-        cm.deviceManager.
-            GetDeviceRunContainerOptions(
-                ctx,
-                pod,
-                container,
-            )
-    ...
-
-    opts.Devices = append(
-        opts.Devices,
-        devOpts.Devices...,
-    )
-    opts.Mounts = append(...)
-    opts.Envs = append(...)
-    opts.Annotations = append(...)
-    opts.CDIDevices = append(...)
-
-    return opts, nil
-}
-```
-
-源码注释直接写：
-
-```text
-Allocate should already be called during predicateAdmitHandler.Admit()
-```
-
-这再次校准：
-
-```text
-正常主路径：
-  准入阶段已经Allocate
-  创建阶段只是取缓存
-```
-
-### 23.1 `GetDeviceRunContainerOptions`顺序
-
-```text
-pkg/kubelet/cm/devicemanager/manager.go:955-991
-```
-
-```text
-遍历container limits
-  -> 识别Device Plugin resource且数量非0
-  -> callPreStartContainerIfNeeded
-  -> 若Pod不active，不做reAllocate
-  -> 若active且本地无resource cache，标记needsReAllocate
-
-循环结束
-  -> 必要时m.Allocate
-  -> 从podDevices汇总DeviceRunContainerOptions
-```
-
-注意顺序：
-
-```text
-PreStart检查
-  在
-缺缓存reAllocate检查
-  之前
-```
-
-如果插件要求PreStart但缓存里根本没有IDs，会先返回：
-
-```text
-no devices found allocated in local cache
-```
-
-不会先走reAllocate。
-
-### 23.2 reAllocate是恢复补偿，不是日常重复分配
-
-只有：
-
-- resource属于Device Plugin；
-- request非0；
-- Pod仍active；
-- `podDevices`缺少该container/resource；
-
-才把 `needsReAllocate=true`。
-
-然后：
-
-```go
-if needsReAllocate {
-    if err := m.Allocate(
-        pod,
-        container,
-    ); err != nil {
-        return nil, err
-    }
-}
-```
-
-这条补偿的主注释指向节点重启竞态；当前commit还要加上8.2的feature组合：pod scope的 `AllocatePod` 对DeviceManager是no-op时，也可能在创建阶段看到传统container级缓存缺失。两者的日志解释不同，因此不能把每一次 `needsReAllocate` 都直接等同为“节点刚重启”。
-
-### 23.3 当前实际可能返回 `nil, nil`
-
-`podDevices.deviceRunContainerOptions`在：
-
-- Pod UID不存在；
-- container name不存在；
-
-时返回 `nil`。
-
-外层仍返回：
-
-```go
-return nil, nil
-```
-
-接口注释中的“empty struct”和 `manager_test.go` 中一条“should return error”旧注释都与实际断言不完全一致。
-
-生产代码调用方已经显式处理 `devOpts == nil`。
-
----
-
-## 24. 两个同名 `PreStartContainer` 必须彻底分开
-
-### 24.1 Device Plugin gRPC PreStart
-
-判断：
-
-```text
-pkg/kubelet/cm/devicemanager/manager.go:994-1025
-```
-
-```go
-if eI.opts == nil ||
-    !eI.opts.PreStartRequired {
-    return nil
-}
-
-devices := m.podDevices.containerDevices(
-    podUID,
-    contName,
-    resource,
-)
-if devices == nil {
-    return fmt.Errorf(
-        "no devices found allocated in local cache...",
-    )
-}
-
-_, err := eI.e.preStartContainer(
-    ctx,
-    devices.UnsortedList(),
-)
-```
-
-请求：
-
-```protobuf
-message PreStartContainerRequest {
-    repeated string devices_ids = 1;
-}
-```
-
-response为空结构，只用success/error表达结果。
-
-endpoint给它单独加30秒超时：
-
-```go
-ctx, cancel := context.WithTimeout(
-    ctx,
-    pluginapi.
-        KubeletPreStartContainerRPCTimeoutInSecs *
-        time.Second,
-)
-defer cancel()
-```
-
-当前常量：
-
-```text
-30 seconds
-```
-
-### 24.2 它发生在CRI CreateContainer之前
-
-真实顺序：
-
-```text
-pkg/kubelet/kuberuntime/kuberuntime_container.go
-
-generateContainerConfig
-  -> GenerateRunContainerOptions
-  -> GetResources
-  -> Device Plugin PreStartContainer
-
-runtimeService.CreateContainer
-
-internalLifecycle.PreStartContainer
-
-runtimeService.StartContainer
-```
-
-所以Device Plugin PreStart失败时，经常表现为：
-
-```text
-FailedToCreateContainer
-ErrCreateContainerConfig
-```
-
-不是因为containerd已经Create成功后才失败。
-
-### 24.3 kubelet内部同名hook
-
-CRI CreateContainer成功后：
-
-```go
-m.internalLifecycle.PreStartContainer(
-    logger,
-    pod,
-    container,
-    containerID,
-)
-```
-
-实现：
-
-```text
-pkg/kubelet/cm/internal_container_lifecycle.go:41-52
-```
-
-它主要：
-
-- CPUManager记录container ID；
-- MemoryManager记录container ID；
-- TopologyManager建立container映射。
-
-它不是Device Plugin gRPC，也不向NVIDIA插件发请求。
-
-### 24.4 为什么Device Plugin PreStart还叫“PreStart”
-
-API语义是“每次container启动前做设备特定准备”，但当前kubelet实现把它放进生成创建配置的阶段，因此时间上早于CRI Create。
-
-讲义应同时保留：
-
-- API目的：每次启动前准备；
-- 当前调用位置：CRI Create之前。
-
-不能只靠函数名猜精确时序。
-
-### 24.5 安全边界
-
-插件可能在PreStart里做设备reset等操作。具体实现由厂商插件决定。
-
-运维不要：
-
-- 在生产直接手工调用插件Unix socket；
-- 对已被业务占用的GPU执行reset验证；
-- 把30秒timeout当作允许重试30次；
-- 看到timeout就立即删除checkpoint；
-- 把internal lifecycle错误当成NVIDIA插件错误。
-
----
-
-## 25. `deviceRunContainerOptions`：合并多个resource response
-
-源码：
-
-```text
-pkg/kubelet/cm/devicemanager/pod_devices.go:246-371
-```
-
-目标结构：
-
-```go
-type DeviceRunContainerOptions struct {
-    Envs        []kubecontainer.EnvVar
-    Mounts      []kubecontainer.Mount
-    Devices     []kubecontainer.DeviceInfo
-    Annotations []kubecontainer.Annotation
-    CDIDevices  []kubecontainer.CDIDevice
-}
-```
-
-同一个container可能同时请求多种设备resource，函数遍历该container的resource map，把所有response汇总。
-
-### 25.1 Envs
-
-按env key去重：
-
-```go
-if existing, ok := envsMap[k]; ok {
-    if existing != v {
-        logger.Error(
-            nil,
-            "Environment variable has conflicting setting",
-            ...,
-        )
-    }
-    continue
-}
-```
-
-冲突：
-
-- 记录日志；
-- 不返回error；
-- 保留先进入汇总的值。
-
-但resource是map，谁“先进入”不应被当成稳定优先级。
-
-### 25.2 Devices
-
-按 `ContainerPath` 去重：
-
-```go
-devsMap[dev.ContainerPath] = dev.HostPath
-```
-
-转换：
-
-```text
-DeviceSpec.HostPath       -> DeviceInfo.PathOnHost
-DeviceSpec.ContainerPath  -> DeviceInfo.PathInContainer
-DeviceSpec.Permissions    -> DeviceInfo.Permissions
-```
-
-若同container path指向不同host path：
-
-- 记录冲突日志；
-- 保留先进入项；
-- 不让Allocate阶段失败。
-
-更深边界：
-
-> 去重map只保存host path。如果container path与host path都相同，但permissions不同，后来的项也会被跳过，却不会被识别成permissions冲突。
-
-### 25.3 Mounts
-
-同样按 `ContainerPath` 去重，只把host path放进冲突map。
-
-因此同container/host path但 `ReadOnly` 不同，也不会作为ReadOnly冲突单独报错。
-
-Device Plugin mount转换时：
-
-```go
-SELinuxRelabel: false
-```
-
-它不是普通Kubernetes volume完整语义的替代。
-
-### 25.4 Annotations
-
-按key去重；值冲突只记日志。
-
-这些annotations进入container runtime config，不会写回Pod API的 `metadata.annotations`。
-
-后续 `newContainerAnnotations` 会再写入kubelet自己的：
-
-- container hash；
-- restart count；
-- termination message；
-- Pod deletion相关字段。
-
-源码明确让kubelet内部annotation在key冲突时覆盖插件值。
-
-### 25.5 CDI devices
-
-按完整 `Name` 去重：
-
-```go
-if knownCDIDevices.Has(cdiDevice.Name) {
-    continue
-}
-```
-
-这里只做字符串精确去重，不校验：
-
-- fully-qualified name语法，例如 `vendor.example/class=device-name`；
-- spec是否存在；
-- spec内容；
-- runtime支持情况。
-
-### 25.6 DeviceManager内部去重不等于最终全局去重
-
-后续kubelet还会追加：
-
-- DRA CDI；
-- block volume devices；
-- Pod env；
-- 普通volume mounts；
-- termination message mount。
-
-当前所示链路没有在DeviceManager层统一检查这些跨来源冲突。
-
----
-
-## 26. RunContainerOptions怎样进入CRI ContainerConfig
-
-`Kubelet.GenerateRunContainerOptions`：
-
-```text
-pkg/kubelet/kubelet_pods.go:626-676
-```
-
-顺序：
-
-```text
-containerManager.GetResources
-  -> DRA与DeviceManager资源参数
-
-追加block volume devices
-追加Pod/Service env
-追加普通volume mounts
-追加termination message目录
-```
-
-`generateContainerConfig`：
-
-```text
-pkg/kubelet/kuberuntime/kuberuntime_container.go:341-406
-```
-
-```go
+// 创建 CRI 要接收的 ContainerConfig。
 config := &runtimeapi.ContainerConfig{
-    Annotations: newContainerAnnotations(
-        ctx,
-        container,
-        pod,
-        restartCount,
-        opts,
-    ),
-    Devices: makeDevices(opts),
-    CDIDevices: makeCDIDevices(opts),
-    Mounts: m.makeMounts(opts, container),
-    ...
+	// Metadata 保存 container 名和重试次数。
+	Metadata: &runtimeapi.ContainerMetadata{
+		// 使用 Pod spec 中的 container 名。
+		Name: container.Name,
+		// 记录这是第几次创建尝试。
+		Attempt: restartCountUint32,
+	},
+	// Image 告诉 runtime 使用哪个镜像。
+	Image: &runtimeapi.ImageSpec{Image: imageRef, UserSpecifiedImage: container.Image},
+	// Command 是容器入口命令。
+	Command: command,
+	// Args 是入口命令参数。
+	Args: args,
+	// WorkingDir 是容器工作目录。
+	WorkingDir: container.WorkingDir,
+	// Labels 是要交给 runtime 的标签。
+	Labels: newContainerLabels(container, pod),
+	// Annotations 会包含前面合并得到的设备注解。
+	Annotations: newContainerAnnotations(ctx, container, pod, restartCount, opts),
+	// Devices 把传统设备文件映射转换为 CRI 格式。
+	Devices: makeDevices(opts),
+	// CDIDevices 把 CDI 设备名称转换为 CRI 格式。
+	CDIDevices: makeCDIDevices(opts),
+	// Mounts 汇总普通挂载和设备插件挂载。
+	Mounts: m.makeMounts(opts, container),
+	// LogPath 指定容器日志路径。
+	LogPath: containerLogsPath,
+	// Stdin 决定是否保持标准输入。
+	Stdin: container.Stdin,
+	// StdinOnce 决定标准输入是否只附加一次。
+	StdinOnce: container.StdinOnce,
+	// Tty 决定是否分配终端。
+	Tty: container.TTY,
 }
+```
 
+环境变量在同一函数稍后被转换：
+
+```go
+// 预先创建和运行参数里环境变量数量相同的 CRI 切片。
+envs := make([]*runtimeapi.KeyValue, len(opts.Envs))
+// 按下标遍历 kubelet 内部环境变量。
+for idx := range opts.Envs {
+	// 取出当前位置的内部环境变量。
+	e := opts.Envs[idx]
+	// 转成 CRI 的 KeyValue 结构。
+	envs[idx] = &runtimeapi.KeyValue{
+		// Name 转成 Key。
+		Key: e.Name,
+		// Value 保持原值。
+		Value: e.Value,
+	}
+}
+// 把转换完成的环境变量放进最终创建单。
 config.Envs = envs
 ```
 
-最终映射：
+**大白话总结：** 到这里，device、CDI、mount、annotation、env 已经进入 runtime 能看懂的创建单。kubelet只是做格式转换和汇总，真正注入还没有发生。
 
-| kubelet内部 | CRI |
-|---|---|
-| `RunContainerOptions.Envs` | `ContainerConfig.Envs` |
-| `RunContainerOptions.Mounts` | `ContainerConfig.Mounts` |
-| `RunContainerOptions.Devices` | `ContainerConfig.Devices` |
-| `RunContainerOptions.Annotations` | `ContainerConfig.Annotations` |
-| `RunContainerOptions.CDIDevices` | `ContainerConfig.CDIDevices` |
+**顺手学 Go：**
 
-### 26.1 传统Device转换
+- `&runtimeapi.ContainerConfig{...}` 创建结构体并返回指针。
+- 大括号里的 `字段名: 值` 类似 Java builder 给各字段赋值。
+- `make([]*T, n)` 创建长度为 n 的切片。
+- `for idx := range opts.Envs` 只取下标，再用下标取元素。
 
-```go
-devices[idx] = &runtimeapi.Device{
-    HostPath: device.PathOnHost,
-    ContainerPath: device.PathInContainer,
-    Permissions: device.Permissions,
-}
-```
+### 7.4 源码：真正越过 CRI 边界
 
-runtime再把host device映射进container并配置设备访问。
-
-### 26.2 CDI只复制fully-qualified name
+文件：`pkg/kubelet/kuberuntime/kuberuntime_container.go:276-291`
 
 ```go
-devices[i] = &runtimeapi.CDIDevice{
-    Name: device.Name,
+// 把最终 ContainerConfig 交给 container runtime 创建容器。
+containerID, err := m.runtimeService.CreateContainer(ctx, podSandboxID, containerConfig, podSandboxConfig)
+// runtime 返回错误时，创建阶段失败。
+if err != nil {
+	// 把 gRPC 错误转换成便于记录的状态。
+	s, _ := grpcstatus.FromError(err)
+	// 为 Pod 记录 FailedToCreateContainer 事件。
+	m.recordContainerEvent(ctx, pod, container, containerID, v1.EventTypeWarning, events.FailedToCreateContainer, "Error: %v", s.Message())
+	// 返回创建失败；这时业务进程还没有启动。
+	return s.Message(), ErrCreateContainer
 }
+// 容器对象创建成功后，才调用 kubelet 内部的 PreStart hook。
+err = m.internalLifecycle.PreStartContainer(logger, pod, container, containerID)
+// 内部 PreStart hook 失败时，容器仍不能进入 Start。
+if err != nil {
+	// 把错误转换成 gRPC 状态。
+	s, _ := grpcstatus.FromError(err)
+	// 为 Pod 记录 FailedToStartContainer 事件。
+	m.recordContainerEvent(ctx, pod, container, containerID, v1.EventTypeWarning, events.FailedToStartContainer, "Internal PreStartContainer hook failed: %v", s.Message())
+	// 返回启动前 hook 失败。
+	return s.Message(), ErrPreStartHook
+}
+// 所有创建和内部 hook 都成功后，才调用 runtime StartContainer。
+err = m.runtimeService.StartContainer(ctx, containerID)
 ```
 
-kubelet不在这里：
+**大白话总结：** `CreateContainer` 成功之前，JVM没有机会运行。主案例若因为本机 CDI 配置缺失而在这里报错，Java 日志为空、readinessProbe没有执行都是正常现象。
 
-- 读取CDI spec；
-- 展开device nodes；
-- 展开mounts/env/hooks；
-- 判断NVIDIA_VISIBLE_DEVICES；
-- 验证spec与ID是否一致。
+**顺手学 Go：**
 
-这些由支持CDI的runtime按CDI spec处理。
+- `containerID, err :=` 同时接收创建结果和错误。
+- `s, _ :=` 中下划线表示忽略第二个返回值。
+- `err =` 是给已存在的变量重新赋值；它和首次声明用的 `:=` 不同。
 
-### 26.3 DRA与传统Device Plugin在这里汇合
+### 7.5 主案例闭环
 
-Linux `GetResources`：
+假设插件返回 `nvidia.com/gpu=GPU-G`，但 runtime 找不到对应 CDI 配置，那么事实链是：
 
 ```text
-先append DRA Manager的CDIDevices
-再append DeviceManager的CDIDevices
+scheduler 数量判断成功
+  -> kubelet 选 ID 成功
+  -> Device Plugin Allocate 成功
+  -> kubelet 缓存和转换成功
+  -> runtime CreateContainer 解析 CDI 失败
+  -> Pod 显示 CreateContainerError
+  -> JVM 从未启动
 ```
 
-传统Device Plugin也可以在AllocateResponse里返回CDI。CDI不是DRA专属。
-
-当前代码没有在这两次append之间做跨来源CDI去重。
-
-### 26.4 传统字段与CDI可以同时存在
-
-如果插件同时返回：
-
-```text
-Devices
-Mounts
-Envs
-CDIDevices
-```
-
-kubelet不会强制二选一，而是继续把它们都放进ContainerConfig。
-
-插件必须保证策略一致。否则可能：
-
-- 重复注入同一设备；
-- 出现路径冲突；
-- runtime报错；
-- 表面能启动但环境不一致。
-
-### 26.5 Windows边界
-
-当前Windows `container_manager_windows.go` 合并传统：
-
-- Devices；
-- Mounts；
-- Envs；
-- Annotations。
-
-没有像Linux路径一样追加DeviceManager/DRA CDI。
-
-本课程NVIDIA GPU生产主线限定Linux，不能把Linux CDI路径直接复制到Windows结论。
+因此，这时反复查看 Spring Boot 日志没有意义。应先看 kubelet和 container runtime 在同一时间窗的错误。
 
 ---
 
-## 27. 错误怎样变成Pod Status和Event
+## 8. 首遍排障：先判断停在哪一站，再看命令
 
-### 27.1 本地准入阶段Allocate失败
+到这里，第一遍源码主线已经完整。现在才开始看现场命令，因为你已经知道每条证据能证明什么。
 
-DeviceManager普通error会被：
+### 8.1 一条错误属于哪一站
 
-```text
-pkg/kubelet/cm/admission/errors.go
+| 看到的现象 | 更可能停在哪一站 | 优先看谁 | 不能直接推出什么 |
+|---|---|---|---|
+| `FailedScheduling` | scheduler数量判断 | Pod Event、Node请求账 | 不能推出某个GPU坏了 |
+| Pod已有 `nodeName`，本地准入失败 | kubelet本地检查或ID选择 | kubelet日志、插件注册与健康 | 不能推出容器已经创建 |
+| `Allocate` RPC error | 插件调用 | kubelet与Device Plugin同时间窗日志 | 不能推出runtime有问题 |
+| `CreateContainerError` 且提到CDI | CRI创建 | kubelet、containerd/CRI-O日志、CDI配置 | 不能推出scheduler选错Node |
+| `FailedToStartContainer` | 已创建但启动前后失败 | runtime和kubelet hook | 不等于Java已对外服务 |
+| 容器Running但Java报CUDA错误 | 业务进程/用户态库 | Java日志、驱动与CUDA兼容性 | 不等于DeviceManager没选到ID |
+
+**用户态库**就是容器进程使用的普通软件库，例如 CUDA runtime、cuDNN、ONNX Runtime GPU 版本。它们出错发生在 JVM 已经启动之后，和容器创建失败不是同一层。
+
+### 8.2 安全只读检查
+
+下面的命令只读取 Kubernetes 对象和节点日志，不修改工作负载。先把命名空间和 Pod 名换成现场值。
+
+```bash
+NS=ai-prod
+POD=recommend-infer
+
+kubectl -n "$NS" get pod "$POD" -o wide
+kubectl -n "$NS" describe pod "$POD"
+kubectl -n "$NS" get pod "$POD" -o jsonpath='{.spec.nodeName}{"\n"}'
+kubectl -n "$NS" get pod "$POD" -o jsonpath='{range .status.containerStatuses[*]}{.name}{"\t"}{.state.waiting.reason}{"\t"}{.state.waiting.message}{"\n"}{end}'
 ```
 
-包装成：
+先从输出回答三个问题：
 
-```text
-Reason:
-  UnexpectedAdmissionError
+1. `spec.nodeName` 是否已经存在？
+2. waiting reason 是 `CreateContainerError`、`RunContainerError`，还是别的值？
+3. message 里提到的是插件、device ID、mount、CDI，还是镜像和普通 volume？
 
-Message:
-  Allocate failed due to <具体错误>,
-  which is unexpected
+然后在目标 Node 上按同一时间窗读取日志。服务名和日志访问方式因发行版而异：
+
+```bash
+journalctl -u kubelet --since "20 minutes ago"
+journalctl -u containerd --since "20 minutes ago"
 ```
 
-`kubelet.rejectPod`：
+若使用 CRI-O，把第二条换成对应服务日志。日志可能含镜像地址、Pod UID 或节点路径，贴到外部前先脱敏。
 
-```text
-pkg/kubelet/kubelet.go:2587-2596
+### 8.3 怎样验证数量账，而不误读 Allocatable
+
+```bash
+NODE=gpu-node-07
+
+kubectl get node "$NODE" -o jsonpath='{.status.capacity.nvidia\.com/gpu}{"\n"}'
+kubectl get node "$NODE" -o jsonpath='{.status.allocatable.nvidia\.com/gpu}{"\n"}'
+kubectl get pods -A --field-selector "spec.nodeName=$NODE" -o wide
 ```
 
-会：
+前两条只能确认 Node 广告上限。第三条列出这台 Node 上的 Pod，但仍需汇总各 Pod 的 GPU requests/limits，才能接近 scheduler当时的数量账。不要把 `Allocatable=8` 直接翻译成“空闲8张”。
 
-- 发Warning Event；
-- 把Pod phase设为 `Failed`；
-- 写reason/message。
+宿主机 `nvidia-smi -L` 正常，只能证明驱动此刻能列出物理设备；它不能证明：
 
-这类Pod已经被scheduler绑定过，但被目标Node的kubelet拒绝。
+- Device Plugin已经向 kubelet注册；
+- 插件把这些设备报告为 Healthy；
+- DeviceManager没有把 ID 分给别的 Pod；
+- runtime能解析 CDI；
+- Java容器已经拿到设备。
 
-对于Deployment/ReplicaSet，controller可能再创建新Pod；不要只盯着已经Failed的旧Pod name。
+### 8.4 首遍验收：五个问题答不出来就先别进第二遍
 
-### 27.2 GetResources/PreStart/reAllocate失败
+1. **scheduler为什么不选具体GPU UUID？**  
+   因为它做的是全局数量级节点选择；本地ID和健康状态由目标Node上的kubelet掌握。
 
-创建container配置时：
+2. **具体ID从哪里来？**  
+   DeviceManager以插件报告的健康ID集合为基础，排除已占用ID，再结合后续本地约束选择。
 
-```text
-generateContainerConfig
-  -> GenerateRunContainerOptions
-  -> GetResources
-```
+3. **Allocate成功等于容器创建成功吗？**  
+   不等于。Allocate只取得插件的设备注入说明。
 
-若失败，当前路径记录：
+4. **插件响应保存在哪里，为什么要保存？**  
+   保存到 `podDevices`，包含ID和完整响应；创建容器时需要重新读取这些注入参数。
 
-```text
-FailedToCreateContainer
-ErrCreateContainerConfig
-```
+5. **`CreateContainerError` 时为什么可能没有Java日志？**  
+   因为runtime创建容器尚未成功，JVM根本没有启动。
 
-此时可能还没有CRI container ID。
-
-不要要求值班同学必须提供：
-
-```text
-crictl inspect <container-id>
-```
-
-因为CreateContainer之前失败时，container对象根本不存在。
-
-应改用：
-
-- Pod UID；
-- sandbox ID；
-- container name；
-- Node；
-- 同一时间窗kubelet日志；
-- Device Plugin日志；
-- Event。
-
-### 27.3 CRI CreateContainer失败
-
-若ContainerConfig已经生成，但runtime拒绝：
-
-```text
-runtimeService.CreateContainer
-  -> error
-  -> FailedToCreateContainer
-```
-
-常见方向：
-
-- host device不存在；
-- mount source不存在；
-- permissions/runtime校验失败；
-- CDI name无法解析；
-- CDI spec不存在或失效；
-- OCI runtime hook/NVIDIA runtime链失败；
-- 路径冲突。
-
-只有container已经创建出ID后，才有标准container status可inspect。
-
-### 27.4 raw inspect的安全边界
-
-runtime的verbose/raw inspect可能包含：
-
-- 展开的env；
-- command/args；
-- annotation；
-- registry/auth相关字段；
-- 内部路径；
-- Secret值或引用后的结果。
-
-生产默认：
-
-1. 不把raw inspect直接粘到聊天、工单或公开文档；
-2. 只在授权Node本地保存；
-3. 文件权限限制为owner；
-4. 只提取status、device/CDI/mount等必要字段；
-5. 删除env值、args、认证字段；
-6. 按证据保留策略销毁原始文件。
+只要能不用术语堆砌、用自己的话讲清这五题，首遍就通过。
 
 ---
 
-## 28. 生产证据矩阵：每条证据最多证明一层
+## 9. 第二遍：重启、旧分配和 init container 复用
 
-| 证据 | 能证明 | 不能证明 |
+第二遍开始读那些不会改变主线、但会影响生产边界的分支。
+
+### 9.1 旧分配为什么不能随便换 ID
+
+容器重启时，如果它原来已经拿到 G，Kubernetes希望继续使用 G，而不是每次都随机换一张设备。否则容器的设备环境可能和已保存状态不一致。
+
+文件：`pkg/kubelet/cm/devicemanager/manager.go:586-598`。下面连续保留这个区间的业务语句，只把上游英文说明注释换成中文教学注释。
+
+```go
+// needed 先等于容器声明需要的设备数量。
+needed := required
+// 从正式分配账里查询这个 Pod/container/resource 以前拿过的 ID。
+devices := m.podDevices.containerDevices(podUID, contName, resource)
+// 找到旧分配时，先扣掉已经拥有的数量。
+if devices != nil {
+	// 记录发现旧分配的调试信息。
+	logger.V(3).Info("Found pre-allocated devices for resource on pod", "resourceName", resource, "containerName", contName, "podUID", podUID, "devices", sets.List(devices))
+	// 用请求数减去旧 ID 数，得到还缺多少。
+	needed = needed - devices.Len()
+	// 已准入 Pod 的资源请求不应在原地改变。
+	if needed != 0 {
+		// 数量对不上时直接报错，避免静默换账。
+		return nil, fmt.Errorf("pod %q container %q changed request for resource %q from %d to %d", podUID, contName, resource, devices.Len(), required)
+	}
+}
+```
+
+**大白话总结：** 原来已经分过1个ID，现在仍请求1个，`needed` 会变成0；如果请求数量突然变了，源码宁愿报错，也不偷偷补卡或删卡。
+
+**顺手学 Go：**
+
+- `needed := required` 会复制整数值。
+- `devices != nil` 表示确实查到了旧集合。
+- `needed = needed - devices.Len()` 是重新赋值。
+- `fmt.Errorf` 生成带上下文的错误，类似 Java 中构造带详细消息的异常。
+
+### 9.2 为什么 `needed==0` 前仍检查注册和健康
+
+容易误解成：“既然不缺新ID，直接返回就行。”当前源码不是这样。正常或节点重启恢复路径会先检查：
+
+1. 这个资源的插件是否已经重新注册；
+2. 注册后是否至少有健康设备；
+3. 旧分配的所有ID是否仍属于健康集合；
+4. 最后才在 `needed == 0` 时返回。
+
+这样设计是为了避免拿着一份陈旧账就宣布恢复成功。
+
+但有一个更早的特殊分支：kubelet正在初始化，并且 runtime明确告诉 kubelet这个容器仍在运行。源码认为运行中的容器已经拥有所需设备，于是直接返回，不等待插件注册。
+
+文件：`pkg/kubelet/cm/devicemanager/manager.go:610-612`，连续摘录。
+
+```go
+// kubelet的数据源尚未全部就绪，但runtime确认这个容器仍在运行。
+if !m.sourcesReady.AllReady() && m.isContainerAlreadyRunning(logger, podUID, contName) {
+	// 运行中的旧容器不用重新选ID，也不用重新调用Allocate。
+	return nil, nil
+}
+```
+
+**大白话总结：** kubelet自己重启，不代表节点上的业务容器也重启。若容器还在跑，kubelet先承认现实，不重复折腾设备。
+
+**顺手学 Go：**
+
+- `!` 表示逻辑取反。
+- `&&` 表示两个条件都成立。
+- `return nil, nil` 在这里不是失败，而是“没有新增ID，也没有错误”；要结合函数契约理解。
+
+### 9.3 普通 init container 的 reuse 不是 GPU sharing
+
+普通 init container 顺序执行，结束后不再和业务 container同时运行。DeviceManager可以把它用过的设备放入同一 Pod 的可复用集合，供后续 container使用。
+
+这不是“两个运行中的容器共享一张卡”：
+
+```text
+允许复用：
+init-A 使用 G -> init-A 结束 -> app 使用 G
+
+不等同于：
+init-A 运行中 + app 运行中 -> 同时使用 G
+```
+
+**restartable init container（可重启的初始化容器）**可能和业务 container长期并存，所以它的设备不能按普通 init 的方式放回复用集合。
+
+### 9.4 三本账在恢复场景各做什么
+
+| 账本 | 大白话含义 | 主要来源 |
 |---|---|---|
-| Pod limit `nvidia.com/gpu:1` | 声明需要1个逻辑单位 | 具体ID |
-| Pod `spec.nodeName` | 已绑定目标Node | kubelet准入成功 |
-| Node Capacity/Allocatable | Capacity是插件已知逻辑entry总量，Allocatable是其中Healthy entry总量 | 当前剩余、本Pod分配 |
-| FailedScheduling | scheduler数量/约束失败 | Device Plugin Allocate失败 |
-| UnexpectedAdmissionError | kubelet本地准入失败 | 一定是硬件坏 |
-| `Making allocation request...` | kubelet准备向插件发某IDs | RPC成功 |
-| Allocate duration Histogram的时间窗增量 | 同resource至少有Allocate返回且耗时进入聚合 | 是否为目标Pod/ID、是否成功、response合法、CRI成功 |
-| 插件Allocate日志 | 服务端收到请求 | kubelet已写checkpoint |
-| `podDevices`/checkpoint | kubelet正式账有IDs与response | runtime当前仍使用相同状态 |
-| `Issuing a PreStartContainer...` | 插件要求并开始PreStart | CRI Create已经发生 |
-| CRI ContainerConfig中的Devices | kubelet传了传统device mapping | runtime成功创建 |
-| CRI ContainerConfig中的CDI name | kubelet传了CDI意图 | spec存在、runtime成功解析 |
-| 容器内 `nvidia-smi -L` | NVML可见设备 | CUDA workload正确 |
-| CUDA smoke kernel成功 | 当前容器能执行最小kernel | 模型性能/SLA一定正常 |
+| `healthyDevices` | 插件当前说哪些ID健康 | ListAndWatch |
+| `allocatedDevices` | 当前内存里哪些ID被占用或已预留 | 从正式账重算，并在选择中更新 |
+| `podDevices` | 哪个Pod/container/resource正式拿过哪些ID及响应 | Allocate成功后写入，checkpoint可恢复 |
 
-### 28.1 必须统一四个身份
+`allocatedDevices` 不是永久权威账。Pod终止后，`UpdateAllocatedDevices` 会删除不再活跃的 Pod 分配，再从 `podDevices` 重算占用集合。它按 Pod 生命周期回收，不看 `nvidia-smi` 的利用率是否为0。
 
-一次有效取证至少统一：
-
-```text
-cluster context
-Node name
-Pod UID/container name
-时间窗
-```
-
-DaemonSet每个Node都有插件Pod。拿错Node日志，即使内容看起来一样也不能形成因果链。
-
-### 28.2 device ID属于敏感基础设施信息
-
-GPU UUID、PCI bus、socket path、host mount path可能暴露节点资产结构。
-
-外发前：
-
-- 按组织策略脱敏；
-- 保留同一事件内的一致映射，例如 `GPU-A`；
-- 不破坏用于关联的唯一性；
-- 不连同Node内网地址、Secret和完整runtime config一起外发。
+**ListAndWatch** 是 Device Plugin 持续向 kubelet发送设备列表和健康变化的长连接，可以理解成“插件不停更新健康名单”。
 
 ---
 
-## 29. 只读取证实验：把一个现有GPU Pod定位到正确阶段
+## 10. 第二遍：NUMA、插件建议和“为什么不是固定 GPU0”
 
-> 仓库当前未连接GPU实验集群。以下脚本未执行，不写假PASS。  
-> 它只读取Kubernetes API对象，不创建、删除、重启或修改任何资源。  
-> 运行前必须由操作者填写并复核context、namespace、Pod和Node。
+首遍只需要记住 `healthy - allocated`。第二遍要补上：候选集合出来后，DeviceManager还会考虑同一 Pod 内可复用设备、NUMA位置和插件建议。
+
+### 10.1 NUMA 是什么，不是什么
+
+**NUMA（Non-Uniform Memory Access）**可以先理解成：一台服务器内部可能有多个 CPU/内存“区域”，某些 PCIe 设备离某个区域更近。**PCIe** 是服务器内部连接 GPU 等设备的高速总线。跨区域访问可能更慢。
+
+DeviceManager会把候选分成：
+
+- `aligned`：符合 TopologyManager给出的本地区域提示；
+- `unaligned`：有NUMA信息，但不符合提示；
+- `noAffinity`：插件没有提供可用NUMA信息。
+
+这里的NUMA只表达“设备靠近哪个NUMA节点”，不等于：
+
+- GPU之间是否有NVLink；
+- NVSwitch怎样连接；
+- 哪两张卡通信最快；
+- GPU fabric的完整拓扑。
+
+**NVLink/NVSwitch**是NVIDIA GPU互联技术；标准Device Plugin的NUMA字段没有表达这整套关系。
+
+### 10.2 选择顺序画成一张图
+
+读图方向：从上往下。实线是正常选择顺序；右侧说明是每一步的职责。
+
+```mermaid
+flowchart TB
+    A["还缺 needed 个 ID"] --> B["先尝试同一 Pod<br/>普通 init 可复用 ID"]
+    B --> C["计算新候选<br/>healthy - allocated"]
+    C --> D["按 NUMA 分成<br/>aligned / unaligned / noAffinity"]
+    D --> E["允许插件给出<br/>PreferredAllocation 建议"]
+    E --> F["建议与合法候选取交集"]
+    F --> G["仍不够时<br/>按 kubelet 回退顺序补齐"]
+```
+
+图例：
+
+- “取交集”表示只保留同时出现在两份名单里的 ID。
+- 插件只能在 kubelet给出的合法范围内影响选择，不能凭空塞入不健康或已占用 ID。
+- 可复用ID只发生在同一 Pod 的特定生命周期，不是跨 Pod 借卡。
+
+### 10.3 PreferredAllocation 为什么只是建议
+
+**GetPreferredAllocation** 是插件的可选接口。它允许插件说“如果可以，我更希望你选这些ID”，例如厂商可能掌握额外拓扑信息。
+
+但最终决定权仍在 kubelet：
+
+```text
+插件返回 preferred
+  -> kubelet 与 aligned 或 available 取交集
+  -> 交集够数才采用
+  -> 不够就从合法候选继续补
+```
+
+文件：`pkg/kubelet/cm/devicemanager/manager.go:690-705`，这是 aligned 候选多于需求时的连续摘录。
+
+```go
+// aligned 候选比还需要的数量更多时，插件才有挑选空间。
+if needed < aligned.Len() {
+	// 把合法候选、必须包含项和总需求交给插件，请它给建议。
+	preferred, err := m.callGetPreferredAllocationIfAvailable(ctx, podUID, contName, resource, aligned.Union(allocated), allocated, required)
+	// 插件建议调用失败时，当前分配失败。
+	if err != nil {
+		// 把插件错误直接往上传。
+		return nil, err
+	}
+	// 只采用同时属于 preferred 和 aligned 的 ID。
+	if allocateRemainingFrom(preferred.Intersection(aligned)) {
+		// 数量已经凑齐，返回本次选中的集合。
+		return allocated, nil
+	}
+	// 插件没给够合法建议时，从 aligned 集合继续补齐。
+	if allocateRemainingFrom(aligned) {
+		// 数量凑齐后返回。
+		return allocated, nil
+	}
+
+	// 走到这里说明算法没有按预期凑够数量，返回内部一致性错误。
+	return nil, fmt.Errorf("unexpectedly allocated less resources than required. Requested: %d, Got: %d", required, required-needed)
+}
+```
+
+**大白话总结：** 插件可以推荐“选谁”，但 kubelet会把推荐名单重新放进合法范围过滤。推荐不合法或数量不够时，kubelet不会照单全收。
+
+**顺手学 Go：**
+
+- `Union` 是并集，把两份集合成员合起来。
+- `Intersection` 是交集，只保留两份集合共有成员。
+- `if allocateRemainingFrom(...) {` 直接把函数返回的布尔值当判断条件。
+- `required-needed` 是原始需求减去仍缺数量，得到已经选中的数量。
+
+### 10.4 为什么不能承诺“默认选 GPU0”
+
+当前实现大量使用 `sets.Set[string]`、Go map 和 `UnsortedList`。Go语言不保证 map 每次遍历顺序固定，因此：
+
+```text
+候选 = {G, H}
+需要 = 1
+```
+
+只能得出“会从合法候选里取1个”，不能只凭源码承诺每次先取G。
+
+如果生产要求稳定、可预测的拓扑选择，应依赖明确策略、插件能力和可观测证据，不能把一次日志里出现的顺序当接口契约。
+
+### 10.5 第二遍此处应掌握的边界
+
+- `healthy - allocated` 是新增ID的基础候选，不包含前面已成功取到的可复用ID。
+- NUMA约束由kubelet掌握，插件建议不能越过合法集合。
+- `GetPreferredAllocation` 可选；没有建议时仍有kubelet回退选择。
+- 设备ID是字符串标签，默认顺序不是Kubernetes承诺。
+- NUMA不是NVLink/NVSwitch拓扑模型。
+
+---
+
+## 11. 第二遍：Allocate 失败、部分成功和 checkpoint 边界
+
+这一节回答一个生产上很重要的问题：如果一个 container请求多种设备资源，第一种成功、第二种失败，会不会自动全部回滚？
+
+答案是：**不能把它当成数据库事务。**
+
+**事务（transaction）**在这里指“要么全部成功，要么任何一步失败就恢复到开始前”。当前 DeviceManager 的多资源循环没有提供这种完整的全有或全无保证。
+
+### 11.1 为什么调用插件前先在内存占座
+
+`devicesToAllocate` 选中一个ID时，会先把它加入 `allocatedDevices`，再离开锁去调用插件。关键业务语句是：
+
+```go
+// 把当前 ID 先记为已占用，防止另一个并发分配也选中它。
+m.allocatedDevices[resource].Insert(device)
+// 把当前 ID 放进本次函数最终要返回的集合。
+allocated.Insert(device)
+// 本次还缺的数量减一。
+needed--
+```
+
+**大白话总结：** 这像窗口先把座位标成“处理中”，再去外部系统出票。否则两个同时来的请求可能都看到同一座位空闲。
+
+**顺手学 Go：**
+
+- `Insert` 修改集合内容。
+- `needed--` 表示整数减一。
+- 这三行在闭包 `allocateRemainingFrom` 内；**闭包**就是能使用外层变量的小函数。
+
+### 11.2 Allocate RPC error 会怎样重算
+
+文件：`pkg/kubelet/cm/devicemanager/manager.go:900-917`。这是连续业务区间，省去了其中两段上游英文说明注释，但保留了全部业务语句。
+
+```go
+// 把选中集合转成字符串切片；顺序没有稳定保证。
+devs := allocDevices.UnsortedList()
+// 记录本次准备调用插件的调试日志。
+logger.V(4).Info("Making allocation request for device plugin", "devices", devs, "resourceName", resource, "pod", klog.KObj(pod), "containerName", container.Name)
+// 调用当前资源对应的 Device Plugin Allocate。
+resp, err := eI.e.allocate(ctx, devs)
+// 记录 Allocate 调用耗时指标。
+metrics.DevicePluginAllocationDuration.WithLabelValues(resource).Observe(metrics.SinceInSeconds(startRPCTime))
+// 插件RPC返回错误时进入恢复分支。
+if err != nil {
+	// 加锁后重建内存占用账。
+	m.mutex.Lock()
+	// 以正式 podDevices 账重新计算 allocatedDevices，去掉尚未正式落账的占座。
+	m.allocatedDevices = m.podDevices.devices()
+	// 重算结束后释放锁。
+	m.mutex.Unlock()
+	// 把插件错误返回给上层。
+	return err
+}
+
+// 插件返回对象里没有任何 container response 时也算失败。
+if len(resp.ContainerResponses) == 0 {
+	// 返回“没有container响应”的错误。
+	return fmt.Errorf("no containers return in allocation response %v", resp)
+}
+```
+
+**大白话总结：** 明确的RPC error会让 DeviceManager用正式账重算内存占用；但“响应对象存在、内部列表却为空”的错误分支没有在这里做同样的立即重算，后续仍要靠清理路径收敛。
+
+**顺手学 Go：**
+
+- `UnsortedList()` 把集合转为切片，但名字已经提醒“未排序”。
+- `resp, err :=` 同时接收响应和错误。
+- `len(slice)` 取得切片长度。
+- `metrics...Observe(...) ` 是记录耗时，不改变分配结果。
+
+### 11.3 多资源为什么可能部分成功
+
+`allocateContainerResources` 会遍历当前 container 的 `Limits`。如果它同时请求资源 A 和资源 B：
+
+```text
+资源 A：
+  选ID -> Allocate成功 -> 写入podDevices
+
+资源 B：
+  选ID -> Allocate失败 -> 函数返回error
+```
+
+资源A已经完成的插件侧动作和内存正式账，不会被一个跨插件的统一事务自动撤销。源码注释也明确承认可能留下部分分配，后续依赖 `UpdateAllocatedDevices` 做垃圾回收。
+
+**垃圾回收（garbage collection）**在这里不是Java GC，而是清理已经不再属于活跃 Pod 的设备分配记录。
+
+### 11.4 checkpoint 为什么在资源循环后写
+
+成功的ID和响应先写 `podDevices`。只有当前 container 的设备资源循环走完，`needsUpdateCheckpoint` 为真时，才执行：
+
+文件：`pkg/kubelet/cm/devicemanager/manager.go:933-940`。下面并列展示“循环内写内存账”和“循环后写磁盘账”；没有包含外层循环，不能单独编译。
+
+```go
+// 把本次ID和插件响应写入正式内存账。
+m.podDevices.insert(podUID, contName, resource, allocDevicesWithNUMA, resp.ContainerResponses[0])
+// 所有资源遍历结束后，判断是否发生过新分配。
+if needsUpdateCheckpoint {
+	// 把当前设备分配状态写到本机checkpoint。
+	return m.writeCheckpoint(logger)
+}
+
+// 没有新分配时直接成功返回。
+return nil
+```
+
+**大白话总结：** checkpoint不是每个资源一成功就写一次。这样减少磁盘写入，但也意味着中间失败时要分清“插件做过什么、内存账写了什么、磁盘账写到哪里”。
+
+**顺手学 Go：**
+
+- `resp.ContainerResponses[0]` 取切片第一个元素；前面只检查了长度不为0。
+- `if needsUpdateCheckpoint` 判断布尔变量。
+- `return m.writeCheckpoint(logger)` 把写盘错误直接交给上层。
+
+### 11.5 kubelet 对 AllocateResponse 的信任边界
+
+当前这段主路径明确检查“`ContainerResponses` 是否为空”，但不会在这里完整验证每个：
+
+- host path 是否真的存在；
+- CDI名称是否能被runtime解析；
+- mount是否和别的资源冲突；
+- env值是否符合业务预期；
+- 插件内部准备动作是否完全成功。
+
+这不是说完全没有后续检查，而是说明 Device Plugin属于 Node 上的高信任组件。插件返回成功后，很多问题要到runtime执行时才暴露。
+
+因此生产上安装或升级 Device Plugin，应像变更 kubelet、runtime一样谨慎：控制版本、灰度Node、校验回滚和日志。
+
+---
+
+## 12. 第二遍：PreStart、DRA 和当前版本例外
+
+### 12.1 两个 PreStartContainer 不是一回事
+
+源码里有两个名字相近的动作：
+
+| 名称 | 谁调用谁 | 发生时间 | 作用 |
+|---|---|---|---|
+| Device Plugin `PreStartContainer` | kubelet -> Device Plugin | 生成容器配置时，因此早于CRI CreateContainer | 让插件做设备启动前准备 |
+| kubelet内部 `PreStartContainer` hook | kubelet内部生命周期模块 | CRI CreateContainer成功后、StartContainer前 | 做kubelet内部启动前动作 |
+
+**hook（钩子）**可以理解为主流程预留的一个调用点，让另一个模块在规定时机执行动作。
+
+不要被“PreStart”三个字误导成两个函数在同一时刻执行。时间线是：
+
+```text
+读取设备运行参数
+  -> 如果插件声明需要，调用 Device Plugin PreStartContainer
+  -> 生成 CRI ContainerConfig
+  -> runtime CreateContainer
+  -> kubelet内部 PreStartContainer hook
+  -> runtime StartContainer
+```
+
+### 12.2 Device Plugin PreStart 的源码
+
+文件：`pkg/kubelet/cm/devicemanager/endpoint.go:114-123`
+
+```go
+// 调用某个 Device Plugin 的 PreStartContainer。
+func (e *endpointImpl) preStartContainer(ctx context.Context, devs []string) (*pluginapi.PreStartContainerResponse, error) {
+	// 插件连接已经停止时直接失败。
+	if e.isStopped() {
+		// 返回空响应和endpoint停止错误。
+		return nil, fmt.Errorf(errEndpointStopped, e)
+	}
+	// 为这次PreStart调用设置固定超时时间，避免无限等待。
+	ctx, cancel := context.WithTimeout(ctx, pluginapi.KubeletPreStartContainerRPCTimeoutInSecs*time.Second)
+	// 函数结束时释放超时上下文相关资源。
+	defer cancel()
+	// 把这个container已经分到的ID交给插件做启动前准备。
+	return e.api.PreStartContainer(ctx, &pluginapi.PreStartContainerRequest{
+		// 请求只携带设备ID列表。
+		DevicesIds: devs,
+	})
+}
+```
+
+**大白话总结：** 只有插件注册时声明需要PreStart，kubelet才会调用它。它有明确超时，失败会阻止后续容器配置和创建。
+
+**顺手学 Go：**
+
+- `context.WithTimeout` 生成带截止时间的新上下文和取消函数。
+- `ctx, cancel :=` 左侧两个变量一起接收返回值。
+- `defer cancel()` 确保退出时释放计时器等资源。
+- `time.Second` 把数字换算成时间长度。
+
+相比之下，本章前面看到的 Allocate包装函数本身没有再创建一个 `WithTimeout`；它直接使用传入的context。当前 `ManagerImpl.Allocate` 主入口构造的是 `context.TODO()`。因此不要把PreStart的固定超时误套到Allocate上。
+
+### 12.3 DRA 是另一条资源管理路线
+
+**DRA（Dynamic Resource Allocation，动态资源分配）**是较新的 Kubernetes 设备资源框架。它使用 `ResourceClaim` 等对象表达分配需求；`ResourceClaim` 可以先理解成“Pod对某类设备提出的一张申请单”。DRA driver 是兑现这张申请单的设备侧组件。它和传统“扩展资源 + Device Plugin”不是同一套状态链。
+
+当前 `GetResources` 可以先加入 DRA 提供的 CDI 设备，再追加传统 DeviceManager缓存的设备参数。这说明两类结果可能在创建容器前汇合，并不是简单二选一。
+
+同时，`DRAExtendedResource` 功能可能让某个扩展资源由DRA管理。命中这个映射时，传统 `allocateContainerResources` 会跳过它。排障前必须先确认现场资源走哪条路线。
+
+### 12.4 PodLevelResourceManagers 为什么是首遍略过项
+
+**feature gate（功能开关）**是Kubernetes用来控制某项能力是否启用的开关。当前固定提交中，`PodLevelResourceManagers` 默认关闭。
+
+传统 DeviceManager 对 Pod 级分配入口的实现是：
+
+文件：`pkg/kubelet/cm/devicemanager/manager.go:1125-1129`
+
+```go
+// AllocatePod 是资源提供者的Pod级分配入口。
+func (m *ManagerImpl) AllocatePod(pod *v1.Pod) error {
+	// 传统DeviceManager当前不支持Pod级资源分配，所以直接成功返回。
+	return nil
+}
+```
+
+**大白话总结：** 默认主线仍是逐个container调用 `Allocate`。看到框架里出现 `AllocatePod`，不能凭函数名就推断传统DeviceManager会在这里选ID。
+
+**顺手学 Go：**
+
+- 函数虽然接收 `pod`，函数体可以暂时不用它。
+- 返回类型只有 `error`；`return nil` 表示没有错误。
+- 这是一个真实的空实现边界，不是省略的伪代码。
+
+### 12.5 传统 Device Plugin 与 DRA 的排障分岔
+
+```text
+Pod申请设备
+  -> 先确认资源由谁管理
+     -> 传统扩展资源：读 DeviceManager / Device Plugin / checkpoint
+     -> DRA：读 ResourceClaim / DRA driver / CDI 结果
+  -> 两条路线最终都可能把 CDI 名称交给 CRI runtime
+```
+
+首遍案例明确采用传统 Device Plugin 路线。若现场已经转到DRA，不能照搬 `healthyDevices - allocatedDevices` 解释整个分配过程。
+
+---
+
+## 13. 生产证据：每条证据最多证明一层
+
+排障最容易犯的错，是拿一条证据跨越三四层下结论。下面这张表专门限制证据的解释范围。
+
+| 证据 | 它能证明什么 | 它不能证明什么 |
+|---|---|---|
+| Pod有 `spec.nodeName` | scheduler绑定已经发生 | kubelet准入、Allocate、容器创建成功 |
+| Node `Allocatable=8` | Node广告的资源上限是8 | 当前还空闲8、具体ID健康 |
+| Device Plugin Pod Running | 插件容器在运行 | 已注册成功、ListAndWatch持续正常、Allocate响应正确 |
+| 宿主机 `nvidia-smi -L` 正常 | 驱动能列出物理GPU | 传统Device Plugin账和CDI配置正确 |
+| kubelet日志显示选中ID | DeviceManager完成了本地选择 | 插件响应和runtime注入成功 |
+| Allocate RPC无错误 | 插件返回了响应 | CDI可解析、设备已进入容器 |
+| runtime CreateContainer成功 | 容器对象已创建 | StartContainer成功、JVM健康 |
+| Pod Running | 至少主容器处于运行态 | 推理接口正常、GPU计算一定成功 |
+| Java打印CUDA provider加载成功 | 用户态库完成了对应初始化 | 调度与设备链未来一直健康 |
+
+### 13.1 主案例应该怎样写事故时间线
+
+不要写成：
+
+```text
+GPU调度失败，containerd报CDI错误
+```
+
+这把不同阶段混在了一句话里。更准确的时间线是：
+
+```text
+10:01:02  scheduler 把 recommend-infer 绑定到 gpu-node-07
+10:01:03  kubelet 本地准入，DeviceManager 为 inference 选择 ID G
+10:01:03  Device Plugin Allocate 返回 CDI 名称 nvidia.com/gpu=GPU-G
+10:01:03  kubelet 将 CDI 名称写入 CRI ContainerConfig
+10:01:03  containerd 解析 CDI 名称失败，CreateContainer 返回错误
+10:01:03  kubelet 记录创建失败事件；JVM没有启动
+```
+
+这是教学化时间线。真实现场必须用同一时区、同一 Pod UID 和相近时间窗把 scheduler、kubelet、插件、runtime日志对齐，不能只凭一条日志补全故事。
+
+### 13.2 为什么 Java 日志在不同阶段含义不同
+
+| 失败阶段 | Java日志通常是什么样 | 原因 |
+|---|---|---|
+| scheduler之前 | 没有新容器日志 | Pod还没到Node |
+| kubelet准入/Allocate | 没有新JVM日志 | 容器创建尚未开始 |
+| runtime CreateContainer | 没有新JVM日志 | 容器对象没创建成功 |
+| runtime StartContainer | 可能没有或极少 | 进程未成功启动 |
+| JVM加载CUDA库 | 有Spring/JVM日志 | 进程已经启动，失败转到用户态 |
+| readinessProbe | 应用日志与探针事件都可能有 | 容器已运行，服务尚未Ready |
+
+这能帮助你判断“该不该去应用日志平台找答案”。如果故障停在CreateContainer，Java侧没有日志不是采集系统一定坏了，而是进程根本没出现。
+
+### 13.3 现场记录最少包含什么
+
+一次可复盘的GPU启动故障，至少记录：
+
+- namespace、Pod名、Pod UID；
+- Node名；
+- container名和镜像摘要；
+- 资源名与请求数量；
+- waiting reason、message、Pod Event；
+- kubelet、Device Plugin、runtime 的同时间窗日志；
+- 插件版本、runtime版本、CDI相关配置模式；
+- 是否为传统 Device Plugin 路线或 DRA 路线；
+- 时间戳和时区。
+
+不要直接贴完整 `inspect`、环境变量或私有镜像凭据到公共渠道。先保留排障必要字段，再脱敏。
+
+### 13.4 一条最小决策树
+
+```text
+Pod有没有nodeName？
+  没有 -> 先查scheduler数量账
+  有
+    waiting是否发生在CreateContainer之前？
+      是 -> 查kubelet本地准入、插件注册、健康ID、Allocate
+      否
+        runtime是否返回device/CDI/mount错误？
+          是 -> 查ContainerConfig交接与runtime本机配置
+          否
+            JVM是否已经有日志？
+              没有 -> 查Create/Start边界
+              有 -> 查驱动、CUDA库、应用初始化和探针
+```
+
+它不是自动诊断脚本，而是防止你越层猜测的问诊顺序。
+
+---
+
+## 14. 怎样按仓库源码继续读，而不是只记本章结论
+
+建议按“问题 -> 文件 -> 函数”跳读，不要从 `manager.go` 第一行顺序啃到最后。
+
+| 你要回答的问题 | 文件 | 先看函数 |
+|---|---|---|
+| 本地准入怎样调用资源提供者 | `pkg/kubelet/cm/topologymanager/scope.go` | `admitPolicyNone`、`allocateAlignedResources` |
+| DeviceManager总入口 | `pkg/kubelet/cm/devicemanager/manager.go` | `Allocate` |
+| 具体候选怎样计算 | 同上 | `devicesToAllocate` |
+| 每个资源怎样调用插件并落账 | 同上 | `allocateContainerResources` |
+| gRPC请求怎样构造 | `pkg/kubelet/cm/devicemanager/endpoint.go` | `allocate`、`preStartContainer` |
+| ID和响应怎样缓存 | `pkg/kubelet/cm/devicemanager/pod_devices.go` | `insert`、`deviceRunContainerOptions` |
+| 创建容器时怎样取设备参数 | `pkg/kubelet/cm/container_manager_linux.go` | `GetResources` |
+| 参数怎样进入CRI | `pkg/kubelet/kuberuntime/kuberuntime_container.go` | `generateContainerConfig`、`makeDevices`、`makeCDIDevices` |
+| runtime调用发生在哪里 | 同上 | `CreateContainer` 和 `StartContainer` 附近 |
+
+### 14.1 固定版本再读
+
+本章所有源代码事实基于：
+
+```text
+commit: 301946d15e67a4a2e8a5fb8292eb836acd366d78
+describe: v1.37.0-alpha.0-280-g301946d15e6
+```
+
+`alpha` 表示这是开发阶段版本标签附近的源码，不应自动当成你们生产集群版本的行为保证。学习设计和调用链可以使用本章；落到生产判断时，仍要对照实际集群版本。
+
+下面是只读定位命令：
 
 ```powershell
-$ErrorActionPreference = 'Stop'
-
-$ApprovedContext = '__KUBE_CONTEXT__'
-$Namespace = '__NAMESPACE__'
-$PodName = '__GPU_POD__'
-$ApprovedNode = '__GPU_NODE__'
-$ResourceName = 'nvidia.com/gpu'
-
-$Inputs = @(
-  $ApprovedContext,
-  $Namespace,
-  $PodName,
-  $ApprovedNode
-)
-
-foreach ($Value in $Inputs) {
-  if (
-    [string]::IsNullOrWhiteSpace($Value) -or
-    $Value -like '__*' -or
-    [regex]::IsMatch($Value, '\s')
-  ) {
-    throw '输入为空、仍是占位符或包含空白字符'
-  }
-}
-
-$CurrentContext = kubectl config current-context
-if (
-  $LASTEXITCODE -ne 0 -or
-  [string]::IsNullOrWhiteSpace($CurrentContext)
-) {
-  throw '读取current-context失败'
-}
-
-if ($CurrentContext.Trim() -cne $ApprovedContext) {
-  throw "context不匹配：$($CurrentContext.Trim())"
-}
-
-function Invoke-KubectlJson {
-  param(
-    [Parameter(Mandatory = $true)]
-    [string[]]$Arguments
-  )
-
-  $Output = & kubectl --context $ApprovedContext @Arguments
-  if ($LASTEXITCODE -ne 0) {
-    throw "kubectl失败：$($Arguments -join ' ')"
-  }
-
-  $Text = [string]::Join(
-    [Environment]::NewLine,
-    @($Output)
-  )
-  if ([string]::IsNullOrWhiteSpace($Text)) {
-    throw "kubectl输出为空：$($Arguments -join ' ')"
-  }
-
-  try {
-    return $Text | ConvertFrom-Json
-  }
-  catch {
-    throw "JSON解析失败：$($Arguments -join ' ')"
-  }
-}
-
-$Pod = Invoke-KubectlJson -Arguments @(
-  'get',
-  'pod',
-  $PodName,
-  '-n',
-  $Namespace,
-  '-o',
-  'json'
-)
-
-if ($Pod.spec.nodeName -cne $ApprovedNode) {
-  throw "Pod实际Node不是批准Node：$($Pod.spec.nodeName)"
-}
-
-$Node = Invoke-KubectlJson -Arguments @(
-  'get',
-  'node',
-  $ApprovedNode,
-  '-o',
-  'json'
-)
-
-$CapacityProperty =
-  $Node.status.capacity.PSObject.Properties[
-    $ResourceName
-  ]
-$AllocatableProperty =
-  $Node.status.allocatable.PSObject.Properties[
-    $ResourceName
-  ]
-
-$ContainersToInspect = @()
-
-if ($Pod.spec.initContainers) {
-  foreach ($Container in @($Pod.spec.initContainers)) {
-    $ContainersToInspect += [pscustomobject]@{
-      Kind = 'init'
-      Spec = $Container
-    }
-  }
-}
-
-foreach ($Container in @($Pod.spec.containers)) {
-  $ContainersToInspect += [pscustomobject]@{
-    Kind = 'app'
-    Spec = $Container
-  }
-}
-
-$Requests = foreach ($Entry in $ContainersToInspect) {
-  $Container = $Entry.Spec
-  $LimitProperty = $null
-
-  if (
-    $null -ne $Container.resources -and
-    $null -ne $Container.resources.limits
-  ) {
-    $LimitProperty =
-      $Container.resources.limits.PSObject.Properties[
-        $ResourceName
-      ]
-  }
-
-  [pscustomobject]@{
-    Kind = $Entry.Kind
-    Container = $Container.name
-    Limit = if ($LimitProperty) {
-      $LimitProperty.Value
-    }
-    else {
-      '<absent>'
-    }
-  }
-}
-
-$StatusEntries = @()
-
-if ($Pod.status.initContainerStatuses) {
-  foreach (
-    $Status in @($Pod.status.initContainerStatuses)
-  ) {
-    $StatusEntries += [pscustomobject]@{
-      Kind = 'init'
-      Status = $Status
-    }
-  }
-}
-
-if ($Pod.status.containerStatuses) {
-  foreach ($Status in @($Pod.status.containerStatuses)) {
-    $StatusEntries += [pscustomobject]@{
-      Kind = 'app'
-      Status = $Status
-    }
-  }
-}
-
-$Waiting = foreach ($Entry in $StatusEntries) {
-  $Status = $Entry.Status
-
-  [pscustomobject]@{
-    Kind = $Entry.Kind
-    Container = $Status.name
-    Ready = $Status.ready
-    RestartCount = $Status.restartCount
-    WaitingReason = if ($Status.state.waiting) {
-      $Status.state.waiting.reason
-    }
-    else {
-      '<not-waiting>'
-    }
-    WaitingMessage = if ($Status.state.waiting) {
-      $Status.state.waiting.message
-    }
-    else {
-      '<not-waiting>'
-    }
-  }
-}
-
-$Events = Invoke-KubectlJson -Arguments @(
-  'get',
-  'events',
-  '-n',
-  $Namespace,
-  '--field-selector',
-  "involvedObject.uid=$($Pod.metadata.uid)",
-  '-o',
-  'json'
-)
-
-[pscustomobject]@{
-  Context = $ApprovedContext
-  Namespace = $Pod.metadata.namespace
-  Pod = $Pod.metadata.name
-  UID = $Pod.metadata.uid
-  Node = $Pod.spec.nodeName
-  Phase = $Pod.status.phase
-  NodeCapacity = if ($CapacityProperty) {
-    $CapacityProperty.Value
-  }
-  else {
-    '<absent>'
-  }
-  NodeAllocatable = if ($AllocatableProperty) {
-    $AllocatableProperty.Value
-  }
-  else {
-    '<absent>'
-  }
-} | Format-List
-
-$Requests | Format-Table -AutoSize
-$Waiting | Format-Table -AutoSize
-
-$EventRows = foreach ($Event in $Events.items) {
-  [pscustomobject]@{
-    Type = $Event.type
-    Reason = $Event.reason
-    Message = $Event.message
-    EventTime = $Event.eventTime
-    LastTimestamp = $Event.lastTimestamp
-  }
-}
-
-$EventRows |
-  Sort-Object EventTime, LastTimestamp |
-  Format-Table -Wrap
+git -C kubernetes rev-parse HEAD
+git -C kubernetes describe --tags --always
+rg -n "func \(m \*ManagerImpl\) devicesToAllocate" kubernetes/pkg/kubelet/cm/devicemanager/manager.go
+rg -n "func \(e \*endpointImpl\) allocate" kubernetes/pkg/kubelet/cm/devicemanager/endpoint.go
+rg -n "func \(cm \*containerManagerImpl\) GetResources" kubernetes/pkg/kubelet/cm/container_manager_linux.go
+rg -n "func \(m \*kubeGenericRuntimeManager\) generateContainerConfig" kubernetes/pkg/kubelet/kuberuntime/kuberuntime_container.go
 ```
 
-脚本输出后按顺序判断：
+这些命令只确认版本和函数位置，不会修改源码或集群。
 
-1. 是否曾有 `FailedScheduling`；
-2. 是否已绑定正确Node；
-3. 是否出现 `UnexpectedAdmissionError`；
-4. 是否是 `FailedToCreateContainer`；
-5. container是否已经产生ID；
-6. Node字段是否只证明总量而非剩余。
+### 14.2 本章验证到什么程度
 
-它不能证明具体device ID。要获得ID，需要：
+本章完成了：
 
-- 目标Node上已批准的kubelet高verbosity日志；
-- 第 17 课PodResources API；
-- 受控读取checkpoint；
-- runtime已创建对象的脱敏证据。
+- 当前HEAD与标签核对；
+- 关键函数和行段逐项回读；
+- 候选公式、Allocate请求、缓存写入、CRI交接与创建顺序交叉核对；
+- 讲义中的Go业务语句与固定提交对照；
+- Markdown结构和代码围栏机械校验。
 
-不要通过在业务container中打印全部env来“找GPU ID”，因为那可能同时泄露业务Secret。
+本机现有Go工具链是 `go1.19.4`，而当前仓库 `go.mod` 声明 `go 1.26.0`。因此本章**没有声称已运行Kubernetes单元测试**。源码阅读材料不应把“看过测试名”写成“测试已通过”。
 
----
-
-## 30. 安全本地实验：手算三本账，不接触集群
-
-下面脚本只是帮助理解集合，不模拟Go map的真实无序选择，也不会访问cluster。
-
-> 未在本轮执行；不要把输出写成源码测试PASS。
-
-场景故意让 `gpu-b` 仍在allocated/reuse账里、但已经不在Healthy账里；同时放入3个reuse ID而只请求2个，用来暴露“未先做Healthy交集”和“set选择无稳定顺序”这两个边界。
-
-```powershell
-$Healthy = @(
-  'gpu-a',
-  'gpu-c',
-  'gpu-d',
-  'gpu-e'
-)
-
-$AllocatedLedger = @(
-  'gpu-a',
-  'gpu-b',
-  'gpu-e'
-)
-
-$ReusableFromCompletedInit = @(
-  'gpu-a',
-  'gpu-b',
-  'gpu-e'
-)
-
-$Required = 2
-
-$ReusableChosen = @(
-  $ReusableFromCompletedInit |
-    Select-Object -First $Required
-)
-
-$UnhealthyReusableRisk = @(
-  $ReusableChosen |
-    Where-Object {
-      $_ -notin $Healthy
-    }
-)
-
-$StillNeeded = $Required - $ReusableChosen.Count
-
-$Available = @(
-  $Healthy |
-    Where-Object {
-      $_ -notin $AllocatedLedger
-    }
-)
-
-$NewCandidates = @(
-  $Available |
-    Where-Object {
-      $_ -notin $ReusableChosen
-    }
-)
-
-[pscustomobject]@{
-  Healthy = $Healthy -join ','
-  AllocatedLedger = (
-    $AllocatedLedger -join ','
-  )
-  Reusable = (
-    $ReusableFromCompletedInit -join ','
-  )
-  Required = $Required
-  ReusableChosenForIllustration = (
-    $ReusableChosen -join ','
-  )
-  StillNeeded = $StillNeeded
-  UnhealthyReusableRisk = (
-    $UnhealthyReusableRisk -join ','
-  )
-  RemainingCandidates = (
-    $NewCandidates -join ','
-  )
-  Warning = (
-    'SIMULATION_ONLY: ' +
-    'PowerShell顺序不是Go set选择保证；' +
-    'reuse分支按当前源码未先与Healthy取交集'
-  )
-} | Format-List
-```
-
-要回答：
-
-1. 为什么 `gpu-a` 已在allocated里却可能也出现在普通init reuse语义中？
-2. 为什么app之间不能继续共享同一个ID？
-3. 为什么脚本的数组顺序不能证明kubelet会选 `gpu-b`？
-4. 若 `gpu-b` 已变Unhealthy，但同resource仍有其他Healthy ID，当前代码会不会先自动把它从reuse候选过滤掉？
-
-第4题答案：不会。当前健康超集检查针对目标container已有的 `devices`，而不是 `reusableDevices`；reuse分支也没有先与Healthy取交集。插件后续Allocate可能拒绝该ID，这个边界应在fake manager单测验证。
-
----
-
-## 31. 源码实验：建议跑哪些单测
-
-当前工作区：
+如果以后使用匹配的官方构建环境，再针对这些包运行测试：
 
 ```text
-go.mod要求Go 1.26
-本地已知Go工具链为1.19.4
+./pkg/kubelet/cm/devicemanager
+./pkg/kubelet/cm/topologymanager
+./pkg/kubelet/kuberuntime
 ```
 
-因此本轮没有执行以下测试，也不写虚假成功结论。
-
-在匹配工具链、依赖已准备的隔离开发环境中，先进入包含 `go.mod` 的 `kubernetes/` 源码根目录，再运行：
-
-```powershell
-go test ./pkg/kubelet/cm/devicemanager -run 'TestPodContainerDeviceAllocation' -count=1
-go test ./pkg/kubelet/cm/devicemanager -run 'TestPodContainerDeviceToAllocate' -count=1
-go test ./pkg/kubelet/cm/devicemanager -run 'TestInitContainerDeviceAllocation' -count=1
-go test ./pkg/kubelet/cm/devicemanager -run 'TestRestartableInitContainerDeviceAllocation' -count=1
-go test ./pkg/kubelet/cm/devicemanager -run 'TestDevicePreStartContainer' -count=1
-go test ./pkg/kubelet/cm/devicemanager -run 'TestTopologyAlignedAllocation' -count=1
-go test ./pkg/kubelet/cm/devicemanager -run 'TestDeviceRunContainerOptions' -count=1
-```
-
-测试前要求：
-
-- 在源码工作树确认当前commit；
-- 不自动改写 `go.mod/go.sum`；
-- 依赖下载遵守网络与供应链策略；
-- 不在生产Node编译或跑单测；
-- 保留完整失败输出，不只截图最后一行；
-- `-run`正则没有命中任何测试时，不能误报通过。
-
-建议额外补的单测：
-
-- Preferred在部分aligned预留后返回error；
-- 普通init reusable ID变Unhealthy、但同resource仍有其他Healthy ID；
-- reusable只满足一部分request、随后available不足；
-- 一个RPC error整表重算时，另一个Allocate仍在flight；
-- Preferred前已有reusable/aligned预选，RPC期间触发 `UpdateAllocatedDevices` 整表重算；
-- Allocate返回0个ContainerResponses；
-- Allocate返回2个ContainerResponses；
-- 同container path、相同host path但不同permissions；
-- 相同mount path但ReadOnly冲突；
-- DRA CDI与Device Plugin CDI同名；
-- `GetDeviceRunContainerOptions`无缓存的nil语义。
+这里用 `text` 展示测试范围，不直接给出跨平台构建命令，避免把不匹配的Windows工具链结果当成Kubernetes官方验证。
 
 ---
 
-## 32. 七个生产故障推演
+## 15. 用五个生产场景检查自己有没有真正分层
 
-### 32.1 Node显示8，kubelet说available=0
-
-可能证据：
+### 15.1 Node 数量够，但插件尚未重新注册
 
 ```text
-Node status:
-  allocatable=8
-
-kubelet:
-  requested number of devices unavailable
-  Requested: 1, Available: 0
-```
-
-不要说字段自相矛盾。
-
-排查：
-
-1. Node对象resourceVersion与日志时间；
-2. 本地allocated账与active Pods；
-3. 是否绕过scheduler指定nodeName；
-4. kubelet是否刚重启/恢复checkpoint；
-5. 插件health是否刚变化；
-6. 是否存在DRA分流；
-7. scheduler缓存与Node本地事实是否短暂不同步。
-
-禁止动作：
-
-- 删除checkpoint“重算一下”；
-- 手工修改Node Capacity；
-- kill业务Pod验证；
-- 直接reset GPU。
-
-### 32.2 Preferred RPC卡住
-
 现象：
+  Pod已有nodeName
+  kubelet报 cannot allocate unregistered device
 
-- Pod已绑定；
-- 长时间没有Allocate completion；
-- 同resource新Pod本地准入变慢；
-- 插件服务端日志停在Preferred。
+判断：
+  scheduler数量账曾经允许放置
+  当前Node本地插件注册事实不足
 
-源码断点：
-
-```text
-devicesToAllocate
-  -> callGetPreferredAllocationIfAvailable
-  -> endpoint.getPreferredAllocation
+优先处理：
+  查Device Plugin注册、socket、kubelet与插件日志
 ```
 
-当前没有函数级显式deadline。
+不要因为Node对象还显示资源数量，就断言插件此刻一定可用。Node状态传播和本地注册可能存在时间差。
 
-先做：
+### 15.2 旧ID变成不健康
 
-- 暂停向异常Node新增GPU工作负载；
-- 对齐kubelet/plugin日志；
-- 检查插件版本与最近配置变更；
-- 只在批准的canary复现；
-- 准备节点排空与回退，而不是在线改socket。
-
-### 32.3 Allocate RPC返回error
-
+```text
 现象：
+  container重建
+  podDevices里有旧ID G
+  插件当前Healthy集合不再包含G
 
-```text
-UnexpectedAdmissionError
-Allocate failed due to <plugin error>
+判断：
+  当前源码拒绝把不健康旧ID当作恢复成功
 ```
 
-代码会对 `allocatedDevices` 做显式重算，但如果该container还请求其他resource，前面已经写入 `podDevices` 的成功项可能保留。
+正确方向是处理设备健康与工作负载恢复，不是手工改本地checkpoint让它“看起来一致”。
 
-要取：
+### 15.3 Allocate RPC 明确失败
 
-- resource name；
-- 请求IDs，脱敏后关联；
-- 插件服务端错误；
-- 同时是否有其他resource Allocate；
-- checkpoint是否写过；
-- Pod是否由controller重建。
-
-### 32.4 Allocate成功但response为空
-
+```text
 现象：
+  DeviceManager已经选中ID
+  插件Allocate返回error
 
-```text
-no containers return in allocation response
+判断：
+  scheduler和ID候选阶段已经越过
+  插件没有成功返回注入说明
 ```
 
-这是插件协议实现问题，不是“GPU数量不足”。
+应把kubelet请求时间和插件日志对齐。只看containerd通常太晚，因为CRI创建可能还没发生。
 
-当前error分支旁没有RPC error同款的显式重算。
+### 15.4 Allocate 成功，但 CDI 名称无法解析
 
-不要在生产构造空response；在fake plugin/单测修复。
-
-### 32.5 PreStartRequired但本地无设备缓存
-
+```text
 现象：
+  插件日志显示Allocate成功
+  kubelet生成ContainerConfig
+  runtime报CDI device unresolved
+  Pod为CreateContainerError
 
-```text
-no devices found allocated in local cache
+判断：
+  问题在插件响应与runtime本机CDI配置的交接
+  JVM没有启动
 ```
 
-由于PreStart在reAllocate检查之前，不能简单说“kubelet应该自动再分一次”。
+优先核对runtime是否支持当前CDI路径、配置文件是否存在、设备名称是否匹配，以及插件或 GPU Operator 的部署模式。**GPU Operator** 是自动安装和管理驱动、Device Plugin 等GPU节点组件的一组控制器。不要先改Java参数。
 
-检查：
-
-- checkpoint读取；
-- Pod UID/container name；
-- resource name；
-- 插件是否重新注册并上报同ID；
-- endpoint options；
-- kubelet/node restart时间线。
-
-禁止先删checkpoint。先保存证据并判断是否需要节点恢复流程。
-
-### 32.6 CDI name传给CRI但runtime报unknown
-
-链路：
+### 15.5 容器 Running，但 ONNX Runtime CUDA 初始化失败
 
 ```text
-AllocateResponse.CdiDevices
-  -> podDevices
-  -> RunContainerOptions
-  -> CRI ContainerConfig.CDIDevices
-  -> runtime解析CDI spec失败
+现象：
+  容器已Running
+  Java日志出现CUDA provider加载失败
+
+判断：
+  scheduler、DeviceManager、Allocate和CRI创建至少已经走得更远
+  当前焦点转到镜像内用户态库、宿主机驱动兼容和应用初始化
 ```
 
-检查：
+这时才适合深入Java日志、镜像依赖和CUDA兼容矩阵。
 
-- plugin的device-list-strategy；
-- CDI name；
-- runtime是否支持CDI；
-- CDI spec目录与权限；
-- spec生成时间是否早于container创建；
-- Node上的actual runtime binary/config；
-- Toolkit与runtime日志。
+### 15.6 本章 Go 语法翻译表
 
-不要删除真实CDI spec制造故障；可以在隔离环境使用不存在的测试name。
+| Go写法 | 大白话 | Java类比或注意点 |
+|---|---|---|
+| `x := value` | 第一次创建局部变量并赋值 | 类似局部变量声明，类型由右侧推断 |
+| `x = value` | 给已有变量重新赋值 | 普通赋值 |
+| `*T` | 指向T的指针类型 | 可先理解成对象引用，但语义不完全相同 |
+| `&value` | 取得value的地址 | 把可被修改的对象位置传下去 |
+| `map[K]V` | 键到值的映射 | `Map<K,V>` |
+| `[]string` | 字符串切片 | 可变长度视图，先类比 `List<String>` |
+| `value, ok := m[key]` | 查值并同时知道键是否存在 | 类似 `containsKey` 加 `get` |
+| `for k, v := range m` | 遍历map或切片 | map遍历顺序不保证固定 |
+| `_ ` | 明确忽略一个返回值 | Java通常不需要这种占位 |
+| `return value, err` | 同时返回结果和错误 | Go不依赖异常做普通错误传递 |
+| `defer f()` | 函数结束前执行f | 常用于解锁、关闭、取消 |
+| `append(a, b...)` | 把b的所有元素追加到a | `...` 是真实展开语法 |
+| `func (m *T) f()` | T类型的方法，m像this | 接收者写在函数名前 |
+| `interface` 调用 | 通过共同方法契约调用不同实现 | 类似Java接口多态 |
+| `nil` | 没有值 | 类似null，但适用类型有限 |
+| `sets.Set[string]` | 不重复的字符串集合 | 类似 `Set<String>` |
 
-### 32.7 传统device与Pod volume发生路径冲突
+### 15.7 还容易误解的词，再翻一次
 
-DeviceManager内部只去重多个Device Plugin response。
+| 词 | 不要误解成 | 本章正确意思 |
+|---|---|---|
+| allocate | GPU已进入容器并可计算 | 插件确认ID并返回注入说明 |
+| healthy | GPU利用率低或性能正常 | 插件通过ListAndWatch报告的健康状态 |
+| allocated | GPU此刻有计算负载 | DeviceManager账上已分配或预留 |
+| available | Node对象显示的Allocatable | 本地健康ID减去占用ID后的候选 |
+| cache | 可随时丢掉的无关数据 | 创建容器仍要读取的重要内存账 |
+| checkpoint | API Server对象 | Node本地的恢复文件 |
+| affinity | Kubernetes所有亲和规则 | 本节特指NUMA位置对齐结果 |
+| runtime | JVM | 创建Linux/Windows容器的containerd、CRI-O等 |
+| resource | 一定是一张物理GPU | 插件广告的逻辑设备单位 |
+| reuse | 两个活跃容器共享GPU | 普通init结束后，同一Pod后续container复用ID |
+| atomic | 多线程安全 | 这里指多步操作是否全有或全无 |
+| reconcile | Java重试任务 | 控制器或管理器不断让实际状态靠近期望状态；本章只少量涉及 |
 
-后续普通volume mount会追加到同一个RunContainerOptions。
-
-若插件和Pod都想占：
-
-```text
-/usr/local/vendor
-```
-
-错误可能下沉到runtime。
-
-排查时把来源分开：
-
-- 插件AllocateResponse；
-- Pod volumeMount；
-- DRA/CDI展开；
-- runtime最终spec。
-
-不要用raw inspect外发；本地提取必要mount path并脱敏。
+到这里，专业词不要求背英文全称，但必须能说清“它在这条链里做什么”和“它不能证明什么”。
 
 ---
 
-## 33. NVIDIA落地：配置决定AllocateResponse长什么样
+## 16. 学到什么程度：主线必须会，旁支知道边界
 
-Kubernetes核心只定义协议，不规定NVIDIA插件必须返回哪一种注入形式。
+| 内容 | 学习深度 | 你要达到的程度 |
+|---|---|---|
+| scheduler只选Node，不选具体ID | 必须讲清 | 能用数量账解释 |
+| `healthy - allocated` | 必须读懂源码 | 能手算候选集合 |
+| DeviceManager -> Device Plugin Allocate | 必须读懂源码 | 能说出请求传ID、响应传注入说明 |
+| `podDevices` 保存ID和响应 | 必须读懂源码 | 能解释为什么创建阶段通常读缓存 |
+| RunContainerOptions -> CRI ContainerConfig | 必须读懂源码 | 能追踪env/mount/device/CDI |
+| CreateContainer与JVM启动边界 | 必须用于排障 | 能解释为什么没有Java日志 |
+| 旧分配和kubelet重启 | 第二遍掌握 | 能解释 `needed==0` 和运行中容器特例 |
+| 普通init设备复用 | 第二遍掌握 | 不把reuse说成共享 |
+| NUMA与PreferredAllocation | 第二遍掌握边界 | 知道建议要与合法候选取交集 |
+| map/set顺序 | 必须知道 | 不承诺默认GPU0 |
+| 多资源非原子与checkpoint时机 | 第二遍掌握 | 能解释部分成功和后续清理 |
+| DRA、Pod级资源开关 | 先认分岔 | 现场先判断走哪条资源路线 |
+| 细粒度并发锁与竞态测试 | 后续深读 | 本章不要求独立证明全部竞态 |
+| 厂商插件内部实现 | 专项再学 | 先守住Kubernetes与插件契约 |
 
-NVIDIA Device Plugin的 `DEVICE_LIST_STRATEGY` 可以影响设备列表怎样交给runtime，例如：
+这张表的目的，是防止两种极端：
 
-- `envvar`；
-- `volume-mounts`；
-- `cdi-annotations`；
-- `cdi-cri`。
-
-还可能配置多个strategy。
-
-`DEVICE_ID_STRATEGY` 可影响NVIDIA插件在Allocate结果中交给底层runtime的设备标识是：
-
-- UUID；
-- index。
-
-它不应被简单等同为“改变kubelet从ListAndWatch看到的opaque ID”。要分别记录：
-
-- DeviceManager选择并发给Allocate的ID；
-- 插件在env/mount/CDI等结果中交给runtime的标识。
-
-因此不能把讲义示例：
-
-```text
-NVIDIA_VISIBLE_DEVICES=GPU-...
-```
-
-写成所有版本、所有部署的固定事实。
-
-生产证据必须记录：
-
-- NVIDIA插件版本/digest；
-- 实际flags/env/config file；
-- `deviceListStrategy`；
-- `deviceIDStrategy`；
-- `migStrategy`；
-- `passDeviceSpecs`；
-- Toolkit/runtime/CDI模式。
-
-两个集群都请求 `nvidia.com/gpu:1`，AllocateResponse完全可能不同。
-
-### 33.1 `passDeviceSpecs`不要凭名字随便开
-
-它会让插件返回设备路径/permissions，并可能要求更高权限，常用于与CPUManager配合的特定场景。
-
-变更它会改变信任面和ContainerConfig，必须：
-
-- 在canary Node验证；
-- 审查DaemonSet权限；
-- 审查driver root；
-- 验证CPU/NUMA目标；
-- 准备回退；
-- 不作为“容器看不到GPU”的万能开关。
+- 只会背“Device Plugin负责GPU”，却追不到具体源码；
+- 一上来钻锁和Alpha旁支，反而说不清Java容器为什么没启动。
 
 ---
 
-## 34. 本章Go语法集中复习
+## 17. 分两遍验收
 
-### 34.1 `sets.Set[string]`
+### 17.1 首遍验收：能解决日常平台问题
 
-大白话：
+请不用看答案，自己画出六站并回答：
 
-> 一个字符串只能出现一次的集合。
+1. `nvidia.com/gpu: 1` 到底表示什么？
+2. scheduler为什么能选中Node，却不知道GPU UUID？
+3. DeviceManager用哪两份集合计算新增候选？
+4. AllocateRequest和AllocateResponse各自装什么？
+5. 为什么 `podDevices` 同时保存ID和响应？
+6. env、mount、device、CDI最后怎样进入CRI？
+7. runtime CreateContainer失败时，JVM有没有启动？
+8. 哪三类日志要按同一时间窗对齐？
 
-本课关键运算：
+首遍合格答案应能连成一句话：
 
-```go
-healthy.Difference(allocated)
-aligned.Union(alreadyChosen)
-preferred.Intersection(available)
-```
+> scheduler按数量选Node；目标Node上的DeviceManager从本地健康且未占用的ID中选择，Device Plugin按这些ID返回注入说明，kubelet缓存并转换成CRI配置，runtime真正创建容器，之后JVM才可能启动。
 
-分别是：
+### 17.2 第二遍验收：能处理恢复和复杂边界
 
-- 差集；
-- 并集；
-- 交集。
+1. 容器原来拿过1个ID、现在仍请求1个时，`needed` 为什么变成0？
+2. 为什么正常恢复仍要检查插件注册和旧ID健康？
+3. kubelet初始化时，运行中的旧容器为什么可以提前返回？
+4. 普通init复用与两个活跃容器共享有什么区别？
+5. PreferredAllocation为什么不能越过kubelet候选集合？
+6. 为什么不能承诺默认选择GPU0？
+7. RPC error、空response、多资源第二项失败的收敛方式有什么不同？
+8. checkpoint为什么可能落后于某次内存变化？
+9. 两个PreStartContainer分别发生在什么时候？
+10. 怎样先判断传统Device Plugin路线还是DRA路线？
 
-### 34.2 closure捕获外层变量
-
-```go
-allocateRemainingFrom := func(...) bool {
-    needed--
-    allocated.Insert(device)
-}
-```
-
-`needed`和 `allocated`不是函数参数，是从外层捕获并修改。
-
-看到闭包时要问：
-
-- 改了哪些外部变量；
-- 是否持锁；
-- error后谁回滚；
-- 是否可能被并发重算。
-
-### 34.3 `defer`与锁
-
-```go
-m.mutex.Lock()
-defer m.mutex.Unlock()
-```
-
-保证函数各种return最终解锁。
-
-但本章helper中间会手动Unlock/Lock做RPC，说明仅看 `defer` 不能推断整段始终持锁。
-
-### 34.4 map迭代
-
-```go
-for k, v := range someMap
-```
-
-不能推断稳定顺序。
-
-直接影响：
-
-- 多resource Allocate顺序；
-- 冲突项谁先进入；
-- 无preferred时具体ID选择。
-
-### 34.5 `UnsortedList()`
-
-名字已经明确表示：
-
-```text
-把set转slice，但不承诺排序
-```
-
-不要在日志对比工具中把数组顺序变化直接判成设备重新分配；先按集合比较。
-
-### 34.6 nil与空集合/空结构
-
-| 值 | 可能语义 |
-|---|---|
-| `nil` device set | 没有缓存entry |
-| 空set | entry存在但没有ID |
-| `nil` run options | Pod/container缓存不存在 |
-| 空 `&DeviceRunContainerOptions{}` | 有缓存但没有注入项 |
-
-Go里它们不完全相同，源码分支也不同。
-
-### 34.7 `append(dst, src...)`
-
-```go
-opts.CDIDevices = append(
-    opts.CDIDevices,
-    devOpts.CDIDevices...,
-)
-```
-
-`...`把slice中的每一项展开追加。
-
-它不会自动去重，也不会自动验证。
-
-### 34.8 指针slice
-
-```go
-[]*runtimeapi.CDIDevice
-```
-
-表示slice里放的是对象指针。
-
-```go
-&runtimeapi.CDIDevice{
-    Name: device.Name,
-}
-```
-
-`&`取新结构体地址。
-
-### 34.9 `context.TODO()`
-
-它不是timeout，也不是永远安全。
-
-大白话：
-
-> 当前调用链还没有把合适的生命周期context传进来，先用一个不会自动取消的占位context。
-
-所以要继续看下游是否自己 `WithTimeout`：
-
-- Allocate：没有；
-- Preferred：没有；
-- Device Plugin PreStart：有30秒；
-- plugin dial：另有10秒建连timeout。
+第二遍不是要求背行号，而是能在现场把分支映射到正确组件、账本和证据。
 
 ---
 
-## 35. 哪些必须学深，哪些只看边界
+## 18. 参考资料与固定源码
 
-### 必须学深：S3/O3
+本章以本地固定提交为准，下面链接也固定到同一个commit，避免 `main` 分支后续变化导致行意漂移。
 
-- scheduler数量选择与kubelet具体ID选择的分界；
-- `healthyDevices`、`allocatedDevices`、`podDevices`；
-- init与restartable init复用；
-- `devicesToAllocate`恢复/健康/数量分支；
-- `healthy - allocated`；
-- NUMA aligned/unaligned/noAffinity；
-- Preferred只是建议；
-- set/map无稳定顺序；
-- 每resource独立Allocate；
-- 部分成功和checkpoint时机；
-- response验证与插件信任；
-- PreStart两条同名链；
-- RunContainerOptions到CRI Devices/CDI；
-- admission、config、runtime三类失败表现。
+- [DeviceManager：Allocate、devicesToAllocate、allocateContainerResources](https://github.com/kubernetes/kubernetes/blob/301946d15e67a4a2e8a5fb8292eb836acd366d78/pkg/kubelet/cm/devicemanager/manager.go)
+- [Device Plugin endpoint：Allocate 与 PreStartContainer](https://github.com/kubernetes/kubernetes/blob/301946d15e67a4a2e8a5fb8292eb836acd366d78/pkg/kubelet/cm/devicemanager/endpoint.go)
+- [podDevices：ID 与 AllocateResponse 缓存](https://github.com/kubernetes/kubernetes/blob/301946d15e67a4a2e8a5fb8292eb836acd366d78/pkg/kubelet/cm/devicemanager/pod_devices.go)
+- [TopologyManager scope：本地准入调用资源提供者](https://github.com/kubernetes/kubernetes/blob/301946d15e67a4a2e8a5fb8292eb836acd366d78/pkg/kubelet/cm/topologymanager/scope.go)
+- [ContainerManager：汇总设备运行参数](https://github.com/kubernetes/kubernetes/blob/301946d15e67a4a2e8a5fb8292eb836acd366d78/pkg/kubelet/cm/container_manager_linux.go)
+- [kubeGenericRuntimeManager：生成ContainerConfig并调用CRI](https://github.com/kubernetes/kubernetes/blob/301946d15e67a4a2e8a5fb8292eb836acd366d78/pkg/kubelet/kuberuntime/kuberuntime_container.go)
+- [Kubernetes官方文档：Device Plugins](https://kubernetes.io/docs/concepts/extend-kubernetes/compute-storage-net/device-plugins/)
+- [Kubernetes官方文档：Dynamic Resource Allocation](https://kubernetes.io/docs/concepts/scheduling-eviction/dynamic-resource-allocation/)
+- [CDI规范](https://github.com/cncf-tags/container-device-interface)
 
-### 只需读到边界：S1/S2
-
-- TopologyManager bitmask枚举的全部数学证明；
-- NUMA距离policy option所有版本差异；
-- gRPC HTTP/2底层帧；
-- protobuf生成代码；
-- NVIDIA插件内部NVML实现；
-- containerd CDI解析器内部实现；
-- DRA完整调度与allocation协议；
-- Windows Device Plugin细节。
-
-### 本课一笔带过
-
-- CUDA kernel、cuDNN、TensorRT；
-- DCGM/Xid/ECC根因；
-- GPU Operator控制器；
-- vLLM执行引擎；
-- MIG/time-slicing/队列公平性。
-
-它们分别在第 18～21 课进入。
-
----
-
-## 36. 本章自测
-
-### 36.1 十八个必须口述的问题
-
-1. scheduler为什么不直接选择GPU UUID？
-2. `nvidia.com/gpu:1`为什么不必然等于一张物理GPU？
-3. 当前主路径中DeviceManager Allocate发生在哪个阶段？
-4. `podDevices`与 `allocatedDevices`分别是什么账？
-5. 普通init与restartable init的设备复用有什么不同？
-6. 为什么容器已经运行且kubelet刚重启时可能不再Allocate？
-7. 除哪个提前返回分支外，为什么needed为0前仍检查resource注册与旧ID健康？
-8. 本地available公式是什么？
-9. Node Allocatable与DeviceManager available为什么不是同一字段？
-10. TopologyInfo能表达NVLink/NVSwitch吗？
-11. PreferredAllocation为什么不是强制结果？
-12. 为什么不能说默认选GPU0？
-13. 一个container请求两种Device Plugin resource时，RPC是否原子？
-14. Allocate RPC error会怎样重算 `allocatedDevices`？
-15. 哪几类“已经占座后失败”没有紧邻的同款显式重算？
-16. kubelet对AllocateResponse做了哪些检查、没做哪些检查？
-17. 两个PreStartContainer分别在什么位置、做什么？
-18. CDI name最终由谁解析成OCI设备注入？
-
-### 36.2 现场题一：scheduler成功、kubelet拒绝
+### 18.1 最后一页收口
 
 ```text
-Pod已绑定gpu-node-07
-Node Allocatable=8
-Event:
-  UnexpectedAdmissionError
-  requested number of devices unavailable
-  Requested: 1, Available: 0
-```
+Pod写：
+  nvidia.com/gpu: 1
 
-回答：
+scheduler做：
+  按数量选Node
+  不选具体device ID
 
-- 哪个组件已经成功？
-- 哪个组件拒绝？
-- Allocatable=8为什么不能推翻本地available=0？
-- 下一步取哪四类同时间窗证据？
-- 为什么不能直接改Node status为0或8？
+目标Node上的DeviceManager做：
+  恢复旧账和检查健康
+  新增候选 = healthy - allocated
+  结合复用、NUMA和插件建议选ID
+  调用Device Plugin Allocate
+  保存ID + ContainerAllocateResponse
 
-### 36.3 现场题二：Allocate成功，CRI失败
+Device Plugin做：
+  接收选中ID
+  返回env / mount / device / annotation / CDI
+  不直接创建业务容器
 
-```text
-kubelet:
-  Making allocation request...
-  Allocate duration的_count在时间窗有增量
+kubelet创建链做：
+  podDevices
+    -> RunContainerOptions
+    -> CRI ContainerConfig
 
-containerd:
-  unknown CDI device nvidia.com/gpu=...
-```
-
-回答：
-
-- Allocate duration证明到哪一步？
-- 为什么它不能单独证明就是这个Pod的Allocate？
-- CDI name经过哪三个结构？
-- kubelet是否已经展开CDI spec？
-- 首查plugin strategy、spec还是CUDA应用？
-- raw inspect如何脱敏？
-
-### 36.4 现场题三：init复用
-
-```text
-普通init request=2
-restartable init request=1
-app-a request=1
-app-b request=1
-```
-
-回答：
-
-- 哪些ID允许生命周期复用？
-- restartable init的ID为什么不能复用？
-- app-a与app-b能否拿同一个传统Device Plugin ID？
-- 这和time-slicing有什么不同？
-
-### 36.5 现场题四：两个PreStart
-
-```text
-FailedToCreateContainer
-device plugin PreStart timeout
-没有CRI container ID
-```
-
-回答：
-
-- 为什么没有container ID是合理的？
-- 这是不是internalLifecycle.PreStartContainer？
-- timeout是多少、来自哪里？
-- 能否通过crictl inspect container证明？
-- 应用什么身份锚点取日志？
-
-### 36.6 通过标准
-
-你能够：
-
-- 画出scheduler到CRI的完整时序；
-- 用三本账解释具体ID；
-- 手算reuse/available/aligned；
-- 不依赖ID顺序；
-- 分辨准入、配置、CRI失败；
-- 解释response信任面；
-- 正确区分传统Devices与CDI；
-- 给出不破坏生产的证据计划；
-
-才算通过第 16 课。
-
----
-
-## 37. 官方资料与版本校准
-
-> 链接于 2026-07-13核对。网页会变化；源码结论以本地commit为准。
-
-- [Kubernetes Device Plugins](https://kubernetes.io/docs/concepts/extend-kubernetes/compute-storage-net/device-plugins/)：Device Plugin工作流、Allocate、Preferred、PreStart和AllocateResponse字段。
-- [Kubernetes Topology Manager](https://kubernetes.io/docs/tasks/administer-cluster/topology-manager/)：Hint Provider、scope、policy与NUMA对齐。
-- [当前commit的Device Plugin API](https://github.com/kubernetes/kubernetes/blob/301946d15e67a4a2e8a5fb8292eb836acd366d78/staging/src/k8s.io/kubelet/pkg/apis/deviceplugin/v1beta1/api.proto)：本课协议事实。
-- [当前commit的DeviceManager](https://github.com/kubernetes/kubernetes/blob/301946d15e67a4a2e8a5fb8292eb836acd366d78/pkg/kubelet/cm/devicemanager/manager.go)：ID选择、Allocate、PreStart与恢复。
-- [当前commit的podDevices](https://github.com/kubernetes/kubernetes/blob/301946d15e67a4a2e8a5fb8292eb836acd366d78/pkg/kubelet/cm/devicemanager/pod_devices.go)：response缓存与运行参数汇总。
-- [当前commit的CRI ContainerConfig](https://github.com/kubernetes/kubernetes/blob/301946d15e67a4a2e8a5fb8292eb836acd366d78/staging/src/k8s.io/cri-api/pkg/apis/runtime/v1/api.proto)：Device与CDI字段。
-- [CDI Specification](https://github.com/cncf-tags/container-device-interface/blob/main/SPEC.md)：fully-qualified name与runtime注入规范。
-- [NVIDIA Kubernetes Device Plugin](https://github.com/NVIDIA/k8s-device-plugin)：device list strategy、device ID strategy、MIG与sharing配置。
-
-版本提醒：
-
-- Kubernetes官方概念页描述协议通用语义；本课精确时序以当前commit实现为准。
-- NVIDIA插件默认值、strategy名字和支持矩阵会变化，生产必须核实际image/config。
-- CDI处理已在Kubernetes较早版本逐步毕业；当前commit代码中没有旧的 `DevicePluginCDIDevices` feature gate判断，不能照抄旧版本排障手册。
-- DRAExtendedResource仍需按实际feature/status校准，不能和传统Device Plugin混讲。
-
----
-
-## 38. 一页收口
-
-```text
-Pod:
-  limits nvidia.com/gpu=1
-
-scheduler:
-  只按数量与约束选Node
-
-目标Node kubelet:
-  TopologyManager收集hints
-  保存NUMA bestHint
-  默认container级主路径调用DeviceManager.Allocate
-  PodLevelResourceManagers Alpha例外见8.2
-
-DeviceManager:
-  识别传统Device Plugin resource
-  DRA-backed则分流跳过
-  清理旧Pod账
-  复用普通init IDs
-  available = healthy - allocated
-  aligned / unaligned / noAffinity
-  optional GetPreferredAllocation
-  set/map不保证稳定ID顺序
-  RPC前预留ID
-
-Device Plugin:
-  Allocate(opaque IDs)
-  -> env
-  -> mounts
-  -> devices
-  -> annotations
-  -> CDI names
-
-kubelet:
-  podDevices保存IDs + AllocateResponse
-  若本轮有新分配且resource循环正常结束，再写checkpoint
-
-创建container:
-  GetDeviceRunContainerOptions
-  optional Device Plugin PreStart
-  汇总RunContainerOptions
-  转CRI ContainerConfig
-
-runtime:
-  传统Device mapping
-  或解析CDI spec
+container runtime做：
+  真正执行设备注入
   CreateContainer
   StartContainer
+
+Java应用最后才做：
+  JVM启动
+  加载CUDA用户态库
+  Spring Boot启动
+  readinessProbe通过
 ```
 
-五个“不等于”：
+遇到GPU Pod问题时，始终先问：
 
-```text
-Pod已调度
-  != 具体ID已分配
+> **现在已经走过哪一站？我手里的证据最多能证明到哪一站？**
 
-Node Allocatable=8
-  != 本地available=8
-
-Preferred返回ID
-  != kubelet必然全部采用
-
-Allocate RPC成功
-  != checkpoint与CRI创建成功
-
-Device Plugin PreStart
-  != kubelet internal lifecycle PreStart
-```
-
-下一课从两类问题继续：
-
-```text
-kubelet重启后怎样恢复：
-  PodUID/container/resource
-  device IDs
-  AllocateResponse
-
-运行中的Pod怎样被观测：
-  checkpoint
-  device health
-  PodResources API
-  CDI devices
-```
-
-第 17 课会把“已经分给container的设备账”继续读成可恢复、可观测、可排障的节点事实。
+这比先猜“是不是GPU坏了”更接近Kubernetes源码真正提供的排障方法。
