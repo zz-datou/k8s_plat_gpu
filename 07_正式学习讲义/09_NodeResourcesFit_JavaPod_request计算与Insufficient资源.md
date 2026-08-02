@@ -1,6 +1,6 @@
 # 第 09 课：game-api 主容器只写了 1200m，scheduler 为什么按整个 Pod 的 2000m 算账
 
-> 从一次 Java Pod 的 `Insufficient cpu`，读懂最终 Pod、资源并发模型、`CycleState` 和 NodeResourcesFit 的两本账。
+> 从一次 Java Pod 的 `Insufficient cpu`，读懂 scheduler 为什么把整个 Pod 算成 2000m，以及它怎样判断一台 Node 放不下。
 
 你在平台现场很容易遇到这种争论：
 
@@ -12,57 +12,83 @@
 如果只背一句“scheduler 看 requests”，这个故障仍然解释不完整。真正需要回答的是：
 
 - scheduler 到底看 Deployment、Helm values，还是最终 Pod？
-- 一个 Pod 里有 app、sidecar、init container 和 RuntimeClass overhead 时，request 为什么不能直接全部相加？
+- 一个 Pod 里有 app、sidecar、init container 和 RuntimeClass overhead（使用某种隔离运行环境时，Pod 要额外预留的固定资源）时，request 为什么不能直接全部相加？
 - 同一个 Pod 要试很多 Node，为什么 Pod request 只计算一次？
-- Node 的 `requested` 从哪里来，尚未完成 Bind 的 Pod 算不算？
-- `Insufficient cpu` 是怎样从一个不等式变成 Filter 结果的？
+- Node 的 `Requested`（scheduler 已经记在这台 Node 上的 Pod request 总和）从哪里来，尚未完成 Bind 的 Pod 算不算？
+- `Insufficient cpu` 是怎样从一个不等式变成 Filter（逐台检查候选 Node 的步骤）结果的？
 
 本课的学习顺序是：
 
 ```text
 先摆出 Java 发布现场的矛盾
-  -> 推导资源核算必须遵守的设计不变量
+  -> 推导资源核算不能违背的规则（设计不变量）
   -> 在白板上手算 2000m/2Gi
   -> 沿当前仓库源码验证 Pod 侧账本
   -> 再验证 Node 侧账本和 Filter 不等式
   -> 最后回到生产证据与 GPU 短映射
 ```
 
-整章只有一个中心命题：
+先把整章结论说成人话：
 
-> **NodeResourcesFit 不是拿“主容器 request”去看哪台机器此刻最闲，而是把 admission 后的整个 Pod 折算成一份逐资源的并发承诺，再与 scheduler 内存中的 Node 可承诺余额比较。**
+> admission 是 API Server 保存对象前的“检查和改写关口”。NodeResourcesFit 收到的是经过这道关口后的最终 Pod。
+
+- 它不看当前 CPU 使用率，而看 `requests`。
+- 它不只算主容器，而算整个 Pod 可能同时占用的资源。
+- 它不现场查询 Node，而是比较 scheduler 当前内存快照中的两本账：Pod 要多少，Node 还剩多少。
 
 ## 0. 本课定位与边界
 
-这是 scheduler 资源核算的 S3 深读，不是重讲 `requests/limits` 基础，也不是 NodeResourcesFit 参数使用手册。
+这是 scheduler 资源核算的 S3 深读。这里的 **S3** 是本套讲义的学习深度：要跟到关键源码、边界条件和生产证据；不是重讲 `requests/limits` 基础，也不是 NodeResourcesFit 参数使用手册。
 
 本课会读深：
 
 - 为什么 scheduler 必须以 admission 后保存的 Pod 为输入；
-- `AggregateContainerRequests` 怎样表达 app、普通 init 和 restartable init 的并发关系；
-- `PodRequests` 为什么在容器核算后处理 Pod-level request 和 overhead；
-- `computePodResourceRequest -> PreFilter -> CycleState -> Filter` 的职责边界；
-- `NodeInfo.Allocatable`、`NodeInfo.Requested` 和 assumed Pod 怎样形成 Node 侧账本；
+- `AggregateContainerRequests` 怎样表达 app、普通 init 和 restartable init（按 init 顺序启动，但启动后不退出、会继续陪 app 运行的容器，也叫 native sidecar）的并发关系；
+- `PodRequests` 为什么在容器核算后还要处理 Pod-level request（直接写在 Pod 层的统一 CPU、memory 预算）和 overhead；
+- `computePodResourceRequest -> PreFilter（先算一次 Pod 账） -> CycleState（本轮共用的临时草稿纸） -> Filter` 的职责边界；
+- `NodeInfo`（scheduler 内部的 Node 资料卡）里的 `Allocatable / Requested`（可承诺总预算 / 已承诺量），以及 assumed Pod（scheduler 已在内存中先占好位置，但 Bind 结果还没有正式写回 API Server 的 Pod）怎样形成 Node 侧账本；
 - CPU、memory 以及传统扩展资源的实际比较式；
 - 本章源码中真正会卡住你的 Go 写法。
 
 本课只建立边界、不深挖：
 
-- LimitRanger 和 RuntimeClass admission 插件内部如何修改 Pod；
-- Pod-level 原地扩缩容怎样在 spec、allocated、actuated 之间选值；
-- DRA、ignored extended resources 和 NodeResourcesFit 的 Score 策略；
+- LimitRanger（按 namespace 的默认/上下限补齐或检查容器资源）和 RuntimeClass admission 插件内部如何修改 Pod；
+- Pod-level resources（直接在 Pod 层声明的统一 CPU、memory 预算）和原地扩缩容怎样在 spec、allocated、actuated 这些“期望值、已分配值、已生效值”之间选值；
+- DRA（Dynamic Resource Allocation，Kubernetes 较新的设备申请与分配机制）、ignored extended resources（配置成由别处负责、因此本插件跳过检查的扩展资源）和 NodeResourcesFit 的 Score（候选 Node 通过硬条件后再做的打分排序）策略；
 - 失败 Pod 何时重入队、怎样抢占；这属于第 10 课；
-- Device Plugin 如何上报 GPU、kubelet 如何选择 device ID；这属于第 15～17 课。
+- Device Plugin（节点侧把 GPU 等设备资源报告给 Kubernetes 的插件机制）如何上报 GPU、kubelet 如何选择具体 device ID；这属于第 15～17 课。
 
-建议分两遍读：
+建议分两遍读。首遍只走六站：
 
-- **首遍抓主线：** 按 `2～5 -> 6.1～6.3 -> 7 -> 8.2～8.5 -> 9.1～9.3 -> 10（scalar/DRA 分支先跳过）-> 11～14 -> 16` 阅读；目标是独立手算 `2000m/2Gi`，讲清 `PreFilter` 与 `Filter` 为什么分开，并完成生产证据闭环。
-- **二遍补边界：** 再读标有“二遍”的 6.4、9.4、9.5，以及 8.1 的内部转换、10.3 的 scalar/ignored/DRA 分支和第 15 节 Go 示例；不需要先学完一本 Go 教程。
+```text
+① 看最终 Pod 为什么不是 Deployment 模板（§2）
+② 手算 1200m 怎样变成 2000m（§3～4）
+③ 看 Pod 账和 Node 账在哪里会合（§5）
+④ 看 scheduler 怎样调用 PodRequests（§5.1、§6.1～6.3、§7 的主案例；先跳过 §6.4 和 Pod-level/resize 旁支）
+⑤ 看 PreFilter 写一次、Filter 读多次（§8.4、§9.1～9.3、§10.1/10.3/10.4；§8.5 二遍再读）
+⑥ 用最终 Pod、Node Allocatable、Event 完成取证（§11）
+```
+
+首遍目标是能手算 `2000m/2Gi`，说清楚“Pod 账只算一次，为什么还要逐台 Node 比较”，并能指出 Node 的 `Allocatable/Requested` 两本账以及严格 `>` 的通过边界。
+
+二遍再补这些边界：restartable init 的完整阶段算法、Pod-level resources 和 resize status（原地扩缩容过程中的资源状态）、`CycleState` 类型错误、scalar resource（scheduler 放进 `int64` map、按资源名逐项比较的一组非核心资源；传统 GPU 是整数名额，hugepages 则按字节量保存）、DRA 分支、assumed Pod 的缓存/快照时间窗口，以及第 15 节 Go 语法附录。第一次不用把它们全啃完。
+
+下面这张小表每行从左往右读：“源码名词 -> 它在这条链里干什么”。先认职责，不要求背英文：
+
+| 源码名词 | 大白话 |
+|---|---|
+| `PreFilter` | 先把“只跟 Pod 有关、跟具体 Node 无关”的账算一次 |
+| `CycleState` | 这一次调度尝试共用的临时草稿纸 |
+| `Filter` | 拿同一份 Pod 账，逐台检查候选 Node 能不能装下 |
+| `NodeInfo` | scheduler 内部看到的 Node 资料卡，不是直接拿原始 Node YAML 现场计算 |
+| `Allocatable` / `Requested` | Node 可承诺总预算 / 已经承诺出去的量 |
+| `Bind` | 把“这个 Pod 选中了这台 Node”的结果正式写回 API Server |
+| `snapshot` | scheduler 在某一轮使用的 NodeInfo 只读视图，中文就是“当时那一版快照” |
 
 ## 1. 当前源码基线与阅读约定
 
 ```text
-源码目录：<KUBERNETES_SRC>
+本次核对目录：D:\datou\devops\kubernetes-master\kubernetes
 commit：301946d15e67a4a2e8a5fb8292eb836acd366d78
 describe：v1.37.0-alpha.0-280-g301946d15e6
 源码 go.mod：go 1.26.0
@@ -92,14 +118,14 @@ kubernetes/pkg/scheduler/backend/cache/cache.go
 | 项目 | 教学现场中的含义 |
 |---|---|
 | namespace / workload | `prod` / `Deployment game-api` |
-| 业务进程 | Spring Boot 游戏 API；会经历冷启动类加载、JIT、GC 和流量峰值 |
+| 业务进程 | Spring Boot 游戏 API；会经历冷启动类加载、JIT（运行时即时编译）、GC（垃圾回收）和流量峰值 |
 | 主容器预算 | `1200m/1536Mi`；假设来自平台压测与容量评审，不是 scheduler 猜出来的 |
-| JVM memory 边界 | 假设 `-Xmx=1Gi`，其余 request 还要覆盖 metaspace、线程栈、direct buffer 与 native 开销；不能把 request 机械等同于 heap |
+| JVM memory 边界 | 假设 `-Xmx=1Gi`，request 还要给 JVM 堆外内存留空间，例如类元数据、线程栈和直接内存；因此 request 不能只等于 `Xmx` |
 | CPU-heavy init | `prepare-config` 解密、校验并解压游戏配置包，申请 `1900m/1024Mi` |
 | 平台常驻容器 | `otel-agent` 与 Java 进程长期并发，模板漏填 request 后由 LimitRange 补齐 |
 | 隔离运行时 | 教学环境用 `kata-qemu`，借此观察 RuntimeClass overhead |
 
-这些数字是教学化的容量结论。真实服务必须用自己的启动曲线、GC/延迟、throttling 和业务峰值校准；scheduler 只消费校准后写入 Pod 的结果。
+这些数字是教学化的容量结论。真实服务必须用自己的启动曲线、GC/延迟、throttling（容器碰到 CPU limit 后被内核压住的现象）和业务峰值校准；scheduler 只消费校准后写入 Pod 的结果。
 
 ### 2.1 应用团队看到的 Deployment template
 
@@ -166,7 +192,7 @@ overhead:
 
 ### 2.2 admission 后真正保存的 Pod
 
-ReplicaSet 创建 Pod 时，Pod CREATE admission 会先处理这个对象。教学现场中，最终保存并被 scheduler informer 看到的片段是：
+ReplicaSet 创建 Pod 时，Pod CREATE admission 会先处理这个对象。教学现场中，最终保存并被 scheduler informer（跟着 API 对象变化，在本地维护一份缓存的机制；不是每次都临时查询 API Server）看到的片段是：
 
 ```yaml
 spec:
@@ -203,21 +229,38 @@ LimitRange：给 otel-agent 缺失的 request 补成 200m/256Mi
 RuntimeClass admission：把 podFixed 写成 Pod.spec.overhead
 ```
 
+阅读方向：从上往下。它展示的是同一个 Pod 从“模板里的声明”变成“scheduler 真正输入”的变化；箭头表示对象经过了哪些处理，不代表 scheduler 回头调用 Deployment。
+
+```mermaid
+flowchart TD
+    A["Deployment 模板<br/>game-api=1200m<br/>otel-agent 未写 request"]
+    B["ReplicaSet 创建 Pod"]
+    C["API Server 的 admission 关口"]
+    D["相关 admission 处理<br/>LimitRange 补 otel-agent=200m<br/>RuntimeClass 写 overhead=100m"]
+    F["API Server 保存最终 Pod"]
+    G["scheduler 的本地缓存看到最终 Pod"]
+
+    A --> B --> C --> D --> F
+    F --> G
+```
+
+这张图最重要的不是组件名字，而是输入发生了变化：`1200m` 只是主容器的一格；scheduler 收到的已经是补过 sidecar request、写过 overhead 的整个 Pod。
+
 ### 2.3 为什么 scheduler 不能回头猜“用户原意”
 
-Kubernetes 必须支持很多 Pod 来源：Deployment、StatefulSet、Job、自研 controller、直接创建 Pod，以及各种 mutating admission。scheduler 如果分别读取每个上层对象再重放这些逻辑，会出现三个根本问题：
+Kubernetes 必须支持很多 Pod 来源：Deployment、StatefulSet、Job、自研 controller、直接创建 Pod，以及各种 mutating admission（会改写对象的准入处理）。scheduler 如果分别读取每个上层对象再重放这些逻辑，会出现三个根本问题：
 
 1. **输入不唯一。** 一个 Pod 可能没有 Deployment，scheduler 不能假定所有工作负载都有同一种父对象。
 2. **逻辑会漂移。** admission 已经修改过 Pod；scheduler 再自行推导一遍，很可能与 API server 的最终结果不同。
-3. **组件耦合。** 每新增一种 controller 或 webhook，scheduler 都要理解它，控制面就无法独立演进。
+3. **组件耦合。** “耦合”就是彼此绑得太紧：每新增一种 controller 或 webhook，scheduler 都要跟着理解它，控制面就无法独立演进。
 
 因此这里的设计选择是：
 
-> **API server 中最终保存的 Pod 是调度契约；scheduler 只消费这份标准对象，不解释 Helm values，也不复原 Deployment template。**
+> **API Server 中最终保存的 Pod，是 scheduler 唯一认可的输入；scheduler 不解释 Helm values，也不复原 Deployment template。**
 
 代价也很现实：排障时只看 Git 仓库里的 YAML 不够，必须检查最终 Pod。这个代价换来的是控制器、admission 和 scheduler 之间清晰的责任边界。
 
-## 3. 在读函数前，先推导六条设计不变量
+## 3. 在读函数前，先推导六条不能违背的规则（设计不变量）
 
 函数名会变化，下面六条约束才是理解源码的骨架。
 
@@ -240,7 +283,7 @@ CPU 峰值可能来自 init，memory 峰值可能来自常驻 app。不能先挑
 
 - 普通 app containers 会并行常驻，所以相加；
 - 普通 init containers 按顺序运行，所以比较各阶段峰值；
-- restartable init 是 native sidecar，会留在后续阶段，所以必须累计；
+- restartable init 是 native sidecar，也就是“按 init 顺序启动、但不会退出的常驻辅助容器”；它会留在后续阶段，所以必须累计；
 - Pod overhead 与容器阶段同时存在，所以在有效容器请求之后追加。
 
 这不是任意的数学规则，而是 Pod 生命周期的并发模型。
@@ -251,11 +294,11 @@ CPU 峰值可能来自 init，memory 峰值可能来自常驻 app。不能先挑
 
 ### 3.5 Node 账本必须包含尚未完成 Bind 的承诺
 
-scheduler 可能已经选中某个 Node 并开始异步 Bind。若下一轮在 API 对象更新前仍把这份资源当空闲，就可能把同一容量重复承诺给另一个 Pod。`NodeInfo.Requested` 因此包含 assumed Pods。
+scheduler 可能已经选中某个 Node 并开始异步 Bind（正式写回绑定结果的动作还在进行）。若下一轮在 API 对象更新前仍把这份资源当空闲，就可能把同一容量重复承诺给另一个 Pod。`NodeInfo.Requested` 因此包含 assumed Pods。
 
 ### 3.6 “Node 放不下”和“插件内部坏了”必须分开
 
-资源余额不足是正常的 `Unschedulable` 结果；`CycleState` 数据缺失或类型错误则说明插件调用契约被破坏，应作为内部 Error。二者若混在一起，scheduler 会把自身故障伪装成业务容量不足。
+资源余额不足是正常的 `Unschedulable`（这台 Node 不满足调度条件）结果；`CycleState` 数据缺失或类型错误则说明插件之间约定好的调用顺序或数据类型被破坏，应作为内部 Error（scheduler 自己的执行错误）。二者若混在一起，scheduler 会把自身故障伪装成业务容量不足。
 
 ## 4. 白板手算：2000m/2Gi 表达的是两个时间阶段的峰值
 
@@ -312,6 +355,23 @@ CPU    = max(1200m + 200m, 1900m) + 100m = 2000m
 Memory = max(1536Mi + 256Mi, 1024Mi) + 256Mi = 2048Mi
 ```
 
+阅读方向：从上往下。上面两条支路是两个不会同时发生的容器阶段；它们先按 CPU、memory **分别取最大值**，最后再加始终存在的 Pod overhead。
+
+```mermaid
+flowchart TD
+    A["阶段 A：普通 init<br/>1900m / 1024Mi"]
+    B["阶段 B：game-api + otel-agent<br/>1400m / 1792Mi"]
+    C["逐资源取峰值<br/>CPU 取 1900m<br/>memory 取 1792Mi"]
+    D["再加 Pod overhead<br/>100m / 256Mi"]
+    E["最终 Pod request<br/>2000m / 2Gi"]
+
+    A --> C
+    B --> C
+    C --> D --> E
+```
+
+别把这张图读成“选中某一个整体最大的阶段”。CPU 的答案来自阶段 A，memory 的答案来自阶段 B；源码对资源表中的每个键单独计算。
+
 ### 4.4 放回 Node 余额
 
 教学现场每台候选 Node 的 scheduler 账本为：
@@ -336,6 +396,8 @@ Memory: 2Gi    <= 30Gi - 26Gi   -> 通过
 一个硬资源维度失败，这台 Node 就不再是可行 Node。Event 因而可以只出现 `Insufficient cpu`；memory 通过并不会抵消 CPU 失败。
 
 ## 5. 源码总图：先看两本账在哪里会合
+
+阅读方向：整体从左往右。上半条是“这个 Pod 要多少”的 Pod 账，下半条是“这台 Node 已经承诺多少、总共能承诺多少”的 Node 账，两条线在 `Filter` 会合。箭头表示数据怎样产生和被读取，不等于这些组件之间每一步都发生同步调用或网络请求。
 
 ```mermaid
 flowchart LR
@@ -369,6 +431,53 @@ flowchart LR
 
 接下来严格按这条主线读，不先跳去 Score、抢占或 GPU device ID。
 
+### 5.1 第一段先读核心入口：scheduler 怎样得到整份 Pod 账
+
+先不要从 Go 类型定义啃起。标题问的是“为什么按整个 Pod 算”，所以第一段直接看 [`computePodResourceRequest`](https://github.com/kubernetes/kubernetes/blob/301946d15e67a4a2e8a5fb8292eb836acd366d78/pkg/scheduler/framework/plugins/noderesources/fit.go#L317-L327) 的完整函数。
+
+读代码前先认清四个变量从哪里来：
+
+| 变量 | 从哪里来 | 大白话 |
+|---|---|---|
+| `pod` | 本次 scheduling cycle（一次完整调度尝试）传入的最终 Pod | admission 已经处理并由 API Server 保存的对象 |
+| `opts` | NodeResourcesFit 的功能配置 | 决定 Pod-level resources、DRA 等版本能力是否参与 |
+| `reqs` | `PodRequests` 的返回值 | 整个 Pod 的多维资源账，不只是主容器 |
+| `result` | 本函数刚创建的对象 | 转成 scheduler 便于高频比较的整数账，稍后写入 `CycleState` |
+
+下面是固定提交中的完整函数；中文注释为讲义新增，没有删分支：
+
+```go
+// computePodResourceRequest 计算 incoming Pod（当前正要调度的 Pod）的资源向量。
+func computePodResourceRequest(pod *v1.Pod, opts ResourceRequestsOptions) *preFilterState {
+	// 调用共享资源计算函数；Pod 尚未调度，本路径不使用状态里的原地扩缩容值。
+	reqs := resource.PodRequests(pod, resource.PodResourcesOptions{
+		// Pod-level resources 功能开启时，这里为 false，表示不要跳过它。
+		SkipPodLevelResources: !opts.EnablePodLevelResources,
+		// [二遍] 只有上层显式开启时，才把 DRA 的 Node 可分配结果纳入。
+		UseDRANodeAllocatableResourceClaimStatus: opts.EnableDRANodeAllocatableResources,
+	})
+	// 创建全零的状态对象。
+	result := &preFilterState{}
+	// 把“带单位的资源数值”转换成毫核、字节和整数型扩展资源。
+	result.SetMaxResource(reqs)
+	// 返回给 PreFilter 保存。
+	return result
+}
+```
+
+先只抓住这条变化：
+
+```text
+最终 pod
+  -> PodRequests(pod)：算出整个 Pod 的 reqs
+  -> SetMaxResource(reqs)：转成 scheduler 内部的 result
+  -> return result：交给 PreFilter 保存
+```
+
+**大白话总结：** `PodRequests` 负责“怎么算整个 Pod”；`SetMaxResource` 负责“把 `2000m`、`2Gi` 这类带单位的数换成 scheduler 内部好比较的整数”；这个入口只把两步接起来，没有重新发明一套公式。第 6、7 节再拆开看 `reqs` 怎样算成 `2000m/2Gi`，第 8 节再看 `result` 怎样被保存和复用。
+
+**顺手学 Go：** `:=` 表示声明并赋值；`&preFilterState{}` 表示创建一个结构体并取得它的地址。先把 `reqs` 理解成“普通资源账”，把 `result` 理解成“scheduler 专用账”，不需要先学完整本 Go。
+
 ## 6. `AggregateContainerRequests`：真正的设计不是“加法”，而是并发阶段建模
 
 ### 6.1 `ResourceList` 是一张“资源名 -> 数量”的表
@@ -377,7 +486,7 @@ flowchart LR
 
 ```go
 // ResourceName 不是另一种底层存储；它仍以 string 为底层类型，
-// 只是用独立类型表达“这个字符串必须是资源名”。
+// 只是让代码在编译时区分“资源名”和普通 string。
 type ResourceName string
 
 // ResourceList 是 map：键是 cpu、memory、nvidia.com/gpu 等资源名，
@@ -387,7 +496,7 @@ type ResourceList map[ResourceName]resource.Quantity
 
 **大白话总结：** Pod request 不是一个总数字，而是一张多维账单。CPU、memory 和扩展资源各有自己的键，后面的“求和”与“取最大”都是对每个键分别执行。
 
-**顺手学 Go：`type` 与 `map`。** `type ResourceName string` 创建了新类型，避免把任意字符串随便混进 API；`map[K]V` 类似 Java 的 `Map<K,V>`。但 Go 的 map 遍历顺序不稳定，所以不能依赖 CPU、memory 谁先被处理；这里每个键独立运算，最终结果不依赖遍历顺序。
+**顺手学 Go：`type` 与 `map`。** `type ResourceName string` 创建了新类型，主要提供编译期的语义区分；它自己不会检查字符串格式是否合法，真正的资源名校验由 Kubernetes API validation（API 字段合法性检查）负责。`map[K]V` 类似 Java 的 `Map<K,V>`。Go 的 map 遍历顺序不稳定，所以不能依赖 CPU、memory 谁先被处理；这里每个键独立运算，最终结果不依赖遍历顺序。
 
 ### 6.2 两个小函数，分别表达“同时存在”和“阶段取峰值”
 
@@ -623,7 +732,7 @@ func PodRequests(pod *v1.Pod, opts PodResourcesOptions) v1.ResourceList {
 		reqs = AggregateContainerRequests(pod, opts)
 	}
 
-	// [二遍旁读] feature 开启、调用者未跳过、而且 Pod 确实写了受支持的 Pod-level request 时进入。
+	// [二遍旁读] 功能开关已开启、调用者未跳过，而且 Pod 确实写了受支持的 Pod-level request 时进入。
 	if !opts.SkipPodLevelResources && IsPodLevelRequestsSet(pod) {
 		// 默认没有 status 生效值；incoming Pod 路径保持 nil。
 		var effectiveReqs v1.ResourceList
@@ -676,7 +785,7 @@ Pod-level resources 需要特别防止三种误读：
 
 1. 它是**按显式资源键覆盖**；Pod-level 只写 CPU 时，container 聚合出的 memory 仍保留。
 2. 当前固定源码支持 CPU、memory 和 `hugepages-*`，不是任意扩展资源。
-3. 这是有 feature gate 和版本边界的分支；主案例未使用，不要拿当前 master 行为硬套旧集群。
+3. 这是有 feature gate（控制某项能力是否启用的功能开关）和版本边界的分支；主案例未使用，不要拿当前 master 行为硬套旧集群。
 
 **大白话总结：** `AggregateContainerRequests` 先回答“容器生命周期需要多少”；`PodRequests` 再应用 Pod 自己的资源边界，并在本课 scheduler 调用选项下最后加 overhead。`SetMaxResource` 并不负责重新计算 init 峰值。
 
@@ -686,7 +795,7 @@ Pod-level resources 需要特别防止三种误读：
 
 ### 8.1 先把通用 `ResourceList` 转成 scheduler 的高频结构
 
-scheduler 会对大量 Node 高频比较。它没有在每次比较时反复解析 `2000m`、`2Gi`，而是使用 [`framework.Resource`](https://github.com/kubernetes/kubernetes/blob/301946d15e67a4a2e8a5fb8292eb836acd366d78/pkg/scheduler/framework/types.go#L991-L1003)：
+scheduler 会对大量 Node 高频比较。它没有在每次比较时反复解析 `2000m`、`2Gi`，而是使用 [`framework.Resource`](https://github.com/kubernetes/kubernetes/blob/301946d15e67a4a2e8a5fb8292eb836acd366d78/pkg/scheduler/framework/types.go#L991-L1003)。下面是固定提交中的完整结构体声明，中文注释为讲义新增：
 
 ```go
 // Resource 是 scheduler 内部为高频计算准备的资源向量。
@@ -699,7 +808,7 @@ type Resource struct {
 	EphemeralStorage int64
 	// Node 允许的 Pod 数单独保存为 int，减少转换。
 	AllowedPodNumber int
-	// GPU、hugepages 等整数型资源放在 scalar map 中。
+	// GPU、hugepages 等非核心资源放在 scalar map；具体单位由资源类型决定。
 	ScalarResources map[v1.ResourceName]int64
 }
 ```
@@ -755,7 +864,7 @@ type preFilterState struct {
 	framework.Resource
 }
 
-// Clone 满足 CycleState 数据接口。
+// Clone 满足 StateData 接口：存进 CycleState 的值都必须提供这个方法。
 func (s *preFilterState) Clone() fwk.StateData {
 	// 直接返回同一指针，没有深拷贝；后续必须把它当只读数据。
 	return s
@@ -766,34 +875,21 @@ func (s *preFilterState) Clone() fwk.StateData {
 
 **大白话总结：** `preFilterState` 是贴在本轮调度档案上的只读资源卡片。复制调度上下文时可以共用这张卡片，是因为后续任何人都只看、不涂改。
 
-### 8.3 `computePodResourceRequest` 只负责组装，不重新发明公式
+### 8.3 回看第一段源码：这里没有第三套资源公式
 
-完整函数见 [`fit.go:317-327`](https://github.com/kubernetes/kubernetes/blob/301946d15e67a4a2e8a5fb8292eb836acd366d78/pkg/scheduler/framework/plugins/noderesources/fit.go#L317-L327)：
+`computePodResourceRequest` 的完整源码已经在 5.1 读过。现在知道 `preFilterState` 的结构后，再回头看它，职责会更清楚：
 
-```go
-// computePodResourceRequest 计算 incoming Pod 的资源向量。
-func computePodResourceRequest(pod *v1.Pod, opts ResourceRequestsOptions) *preFilterState {
-	// 调用共享 helper；incoming Pod 尚未调度，本路径不使用 status resize 值。
-	reqs := resource.PodRequests(pod, resource.PodResourcesOptions{
-		// feature 开启时为 false，表示允许 Pod-level resources 参与。
-		SkipPodLevelResources: !opts.EnablePodLevelResources,
-		// 只有上层显式开启时，才把 DRA node-allocatable claim status 纳入。
-		UseDRANodeAllocatableResourceClaimStatus: opts.EnableDRANodeAllocatableResources,
-	})
-	// 创建全零的状态对象。
-	result := &preFilterState{}
-	// 把 Quantity 账单转换成 MilliCPU、bytes 和 scalar int64。
-	result.SetMaxResource(reqs)
-	// 返回给 PreFilter 保存。
-	return result
-}
+```text
+PodRequests：按 Pod 生命周期算账
+SetMaxResource：把 Quantity 转成 scheduler 内部整数结构
+computePodResourceRequest：把前两步接起来
 ```
 
-当前固定提交的 `Fit.PreFilter` 只设置 `EnablePodLevelResources`，没有设置 `EnableDRANodeAllocatableResources`；所以主路径中第二个 option 仍是 `false`。保留这个字段是函数能力，不代表本课调用一定启用它。
+当前固定提交的 `Fit.PreFilter` 只设置 `EnablePodLevelResources`，没有设置 `EnableDRANodeAllocatableResources`；所以主案例里的 DRA option 仍是 `false`。这个字段说明函数具备另一条能力，不表示本课案例真的走了那条分支。
 
-**大白话总结：** 这个函数是适配层：用公共 Pod 资源公式算账，再换成 scheduler 内部结构。init、sidecar、overhead 的设计不在这里重复实现，避免不同组件各算一套。
+**大白话总结：** Kubernetes 把“通用的 Pod 资源算法”和“scheduler 内部的数据格式”分开。这样其他组件可以复用同一套 Pod 公式，scheduler 也能使用适合大量 Node 比较的结构，不必复制一套容易算歪的代码。
 
-**顺手学 Go：复合字面量。** `resource.PodResourcesOptions{字段: 值}` 像 Java 创建配置对象并填写命名字段；没写的字段走零值。`&preFilterState{}` 前面的 `&` 取得新结构体地址，返回指针。
+**顺手学 Go：复合字面量。** `resource.PodResourcesOptions{字段: 值}` 像 Java 创建配置对象并填写命名字段；没写的字段使用零值。
 
 ### 8.4 `PreFilter` 写一次，`Filter` 按 Node 读多次
 
@@ -812,14 +908,14 @@ func (f *Fit) PreFilter(ctx context.Context, cycleState fwk.CycleState, pod *v1.
 }
 ```
 
-框架的 `CycleState` 使用 `sync.Map`，源码注释明确把它定位为“write once, read many”的场景。其完整读写方法很短，见 [`cycle_state.go:152-164`](https://github.com/kubernetes/kubernetes/blob/301946d15e67a4a2e8a5fb8292eb836acd366d78/pkg/scheduler/framework/cycle_state.go#L152-L164)：
+框架的 `CycleState` 使用 `sync.Map`（Go 提供的并发安全键值表），源码注释明确把它定位为“write once, read many”，也就是写一次、后面并行读很多次。其完整读写方法很短，见 [`cycle_state.go:152-164`](https://github.com/kubernetes/kubernetes/blob/301946d15e67a4a2e8a5fb8292eb836acd366d78/pkg/scheduler/framework/cycle_state.go#L152-L164)：
 
 ```go
 // Read 按 key 读取一次 scheduling cycle 中的数据。
 func (c *CycleState) Read(key fwk.StateKey) (fwk.StateData, error) {
 	// Load 同时返回值和是否存在。
 	if v, ok := c.storage.Load(key); ok {
-		// storage 存的是接口值，这里断言为框架要求的 StateData。
+		// storage 存的是接口值，这里还原为框架要求的 StateData。
 		return v.(fwk.StateData), nil
 	}
 	// key 不存在不是“Node 不合适”，而是状态契约缺失。
@@ -844,7 +940,7 @@ Filter：与 Node 相关的余额比较，N 次，可并行
 
 **大白话总结：** 先把同一份 Pod 作业算一次，再拿答案去逐台机器核对；不是每走到一台机器前都重新统计一遍容器。
 
-### 8.5 Filter 读取失败，为什么不能伪装成 `Insufficient cpu`
+### 8.5 【二遍】Filter 读取失败，为什么不能伪装成 `Insufficient cpu`
 
 完整读取函数见 [`fit.go:342-354`](https://github.com/kubernetes/kubernetes/blob/301946d15e67a4a2e8a5fb8292eb836acd366d78/pkg/scheduler/framework/plugins/noderesources/fit.go#L342-L354)：
 
@@ -908,7 +1004,7 @@ type NodeInfo struct {
 	// 已占用的 host ports。
 	UsedPorts fwk.HostPortInfo
 
-	// 这台 Node 上全部 Pod 的真实 request 总和；源码注释明确包含 assumed Pods。
+	// 这台 Node 上全部 Pod 按资源声明算出的 request 总和，不是实时 usage；其中包含 assumed Pods。
 	Requested *Resource
 	// 对缺失 CPU/memory request 应用最小值后的另一套账；不是本课 Filter 的真实 request。
 	NonZeroRequested *Resource
@@ -928,7 +1024,7 @@ Pod Add/Assume  -> AddPodInfo -> update(+1)          -> NodeInfo.Requested
 Pod Remove      -> RemovePod  -> update(-1)          -> NodeInfo.Requested
 ```
 
-`SetNode` 不会顺便扫描所有 Pods 重算 `Requested`，Pod 事件也不会重写 `Allocatable`。分开增量维护能避免每来一个事件都做全量聚合。
+`SetNode` 不会顺便扫描所有 Pods 重算 `Requested`，Pod 对象的新增、更新或删除通知（不是 `kubectl get events` 里的 Event）也不会重写 `Allocatable`。分开增量维护能避免每来一次对象变化都做全量聚合。
 
 ### 9.2 `SetNode` 只负责 Node 本身与 Allocatable
 
@@ -942,10 +1038,10 @@ func (n *NodeInfo) SetNode(node *v1.Node) {
 	// 只从 status.allocatable 构造 Allocatable，不读取 capacity，也不改 Requested。
 	n.Allocatable = NewResource(node.Status.Allocatable)
 	if utilfeature.DefaultFeatureGate.Enabled(features.NodeDeclaredFeatures) {
-		// [旁读] feature 开启时映射 Node 声明的已知特性，未知项可丢弃。
+		// [旁读] 功能开关开启时，映射 Node 声明自己支持的已知特性。
 		n.DeclaredFeatures = ndf.DefaultFramework.TryMap(node.Status.DeclaredFeatures)
 	}
-	// 标记该 NodeInfo 已变化，供 snapshot 增量更新判断。
+	// 更新 Generation（NodeInfo 的变化版本号），供 snapshot 判断是否需要同步。
 	n.Generation = nextGeneration()
 }
 ```
@@ -1022,7 +1118,7 @@ func (n *NodeInfo) update(podInfo fwk.PodInfo, sign int64) {
 
 **大白话总结：** Node 的 `Requested` 不是每次 Filter 临时执行一遍 `kubectl describe` 得到的，而是 scheduler 随 Pod 增删持续维护的内存总账。
 
-**顺手学 Go：用 `sign` 复用加减逻辑。** 乘以 `+1` 表示记账，乘以 `-1` 表示冲销；这样 CPU、memory、scalar 不需要各写两套函数。nil map 可以读取但不能写，所以 scalar 第一次写入前必须初始化。
+**顺手学 Go：用 `sign` 复用加减逻辑。** 乘以 `+1` 表示记到账里，乘以 `-1` 表示从账里减回去；这样 CPU、memory、scalar 不需要各写两套函数。nil map 可以读取但不能写，所以 scalar 第一次写入前必须初始化。
 
 ### 9.4 【二遍】已调度 Pod 也复用 `PodRequests`，但调用选项不完全相同
 
@@ -1136,11 +1232,11 @@ cache.addPod
   -> cache 中这台 Node 的 Requested 同步增加
 ```
 
-下一次 scheduling cycle 开始时，`Cache.UpdateSnapshot` 根据 `Generation` 把变化同步到 Filter 使用的 `nodeInfoSnapshot`。所以准确表述是：
+下一次 scheduling cycle 开始时，`Cache.UpdateSnapshot` 根据 `Generation`（NodeInfo 内部的变化版本号）把变化同步到 Filter 使用的 `nodeInfoSnapshot`。所以准确表述是：
 
 > Assume 成功返回前，Pod 已进入 scheduler cache 的 NodeInfo 并加账；下一轮 snapshot 更新后，后续 Pod 的 Filter 能看到这份承诺。Filter 读取 snapshot，不是每次直接锁住 cache。
 
-Reserve、Permit、PreBind 或 Bind 等后续阶段失败时，会走 `unreserveAndForget -> ForgetPod -> RemovePod -> update(-1)` 冲销。成功 Bind 后 informer 事件会把 assumed 状态确认成已加入状态，不会把同一 Pod 重复加两次。
+Reserve、Permit、PreBind、Bind 是选中 Node 后到正式绑定前后的几个扩展步骤。它们失败时，会走 `unreserveAndForget -> ForgetPod -> RemovePod -> update(-1)`，把先占的资源从账里减回去。成功 Bind 后，informer 收到的 Pod 对象更新通知（不是 Kubernetes Event 对象）会把 assumed 状态确认成已加入状态，不会把同一 Pod 重复加两次。
 
 **大白话总结：** 银行转账还在异步落库时，scheduler 已先把额度冻结。否则两个并发发布都可能看到“还剩 2 核”，然后同时花掉同一份 CPU。
 
@@ -1150,7 +1246,7 @@ Reserve、Permit、PreBind 或 Bind 等后续阶段失败时，会走 `unreserve
 
 ### 10.1 `Filter` 自己不做减法，它负责状态边界与结果组装
 
-完整函数见 [`fit.go:593-625`](https://github.com/kubernetes/kubernetes/blob/301946d15e67a4a2e8a5fb8292eb836acd366d78/pkg/scheduler/framework/plugins/noderesources/fit.go#L593-L625)：
+完整函数见 [`fit.go:593-626`](https://github.com/kubernetes/kubernetes/blob/301946d15e67a4a2e8a5fb8292eb836acd366d78/pkg/scheduler/framework/plugins/noderesources/fit.go#L593-L626)：
 
 ```go
 // Filter 对当前候选 Node 检查 Pod 的资源硬约束。
@@ -1378,7 +1474,7 @@ Unresolvable = 2000 > 7500                         = false
 Reason = "Insufficient cpu"
 ```
 
-`Unresolvable=false` 只说明“如果能释放足够 CPU，这台规格的 Node 理论上能容纳它”。它不保证现场存在低优先级 victim，也不保证抢占一定成功；第 10 课再讲这些条件。
+`Unresolvable=false` 只说明“如果能释放足够 CPU，这台规格的 Node 理论上能容纳它”。它不保证现场存在低优先级 victim（准备被抢占、用来腾位置的旧 Pod），也不保证抢占一定成功；第 10 课再讲这些条件。
 
 memory 分支则是：
 
@@ -1435,7 +1531,7 @@ Reason=Unschedulable
 Event 包含 Insufficient cpu
 ```
 
-这组证据把责任停在 scheduler。若 Pod 已有 Node、卡在 `ContainerCreating`，就不该继续拿 `fitsRequest` 解释；应切到第 11、12 课的 kubelet/CRI 链路。
+这组证据把当前失败阶段定位在调度阶段；它不能证明 scheduler 有 bug，根因仍可能是 Pod request、平台注入值或集群容量。若 Pod 已有 Node、卡在 `ContainerCreating`，就不该继续拿 `fitsRequest` 解释；应切到第 11、12 课的 kubelet/CRI（kubelet 调用容器运行时的标准接口）链路。
 
 如果 Pod 根本没有创建出来，要先看 ReplicaSet/Deployment Event 与 admission 拒绝；ResourceQuota 或 LimitRange 拒绝 Pod CREATE，不会生成本课这个 `NODE=<none>` 的 Pod 现场。
 
@@ -1521,17 +1617,22 @@ scheduler 已 Assume
 
 ### 11.6 用一张图收住本章的端到端闭环
 
-```text
-Deployment template 中 game-api=1200m
-  -> Pod CREATE admission 补 sidecar request、写 overhead
-  -> API server 保存最终 Pod
-  -> PodRequests 按并发阶段算出 2000m/2Gi
-  -> PreFilter 写入本轮 CycleState
-  -> worker-05/06/07 分别执行 Filter
-  -> 每台 Node 都满足 2000m > 7500m-6000m
-  -> 各自产生 InsufficientResource{Reason: "Insufficient cpu"}
-  -> 没有可行 Node，外层形成 FitError
-  -> API 证据表现为 PodScheduled=False、Pending、FailedScheduling Event
+阅读方向：从上往下，表示同一个 Pod 从创建到出现 `FailedScheduling` 的时间顺序。图中的 `Filter` 读取 scheduler 本轮快照里的 `NodeInfo`，不是此时再去查询 API Server 或 cache。
+
+```mermaid
+flowchart TD
+    A["Deployment template<br/>game-api=1200m"]
+    B["Pod CREATE admission<br/>补 sidecar request、写 overhead"]
+    C["API Server 保存最终 Pod"]
+    D["PodRequests<br/>按并发阶段算出 2000m / 2Gi"]
+    E["PreFilter<br/>写入本轮 CycleState"]
+    F["worker-05 / 06 / 07<br/>分别执行 Filter"]
+    G["每台 Node 都满足<br/>2000m > 7500m - 6000m"]
+    H["各自产生<br/>Insufficient cpu"]
+    I["没有可行 Node<br/>外层汇总成本轮无可用 Node 的错误<br/>源码名 FitError"]
+    J["API 证据<br/>PodScheduled=False<br/>Pending / FailedScheduling"]
+
+    A --> B --> C --> D --> E --> F --> G --> H --> I --> J
 ```
 
 最后把四种容易混淆的结果并排：
@@ -1539,11 +1640,11 @@ Deployment template 中 game-api=1200m
 | 结果 | 触发条件 | 大白话 |
 |---|---|---|
 | `nil Status` / Success | 本插件没有不足项 | 这台 Node 通过资源硬约束 |
-| `Unschedulable` | 至少一个不足项，但都可能通过释放 request 改变 | 正常业务拒绝，不是 scheduler 崩溃 |
-| `UnschedulableAndUnresolvable` | 任一 incoming 资源超过该 Node 整体 Allocatable | 单靠抢占这台 Node 上的 Pods 数学上也放不下 |
+| `Unschedulable` | 至少一个不足项，但都可能通过释放 request 改变 | 这台 Node 被正常排除；Pod 仍可继续尝试其他 Node，不是 API 拒绝了业务请求 |
+| `UnschedulableAndUnresolvable` | CPU、memory、ephemeral-storage 或 scalar 的不足项中，incoming 自身已经超过该 Node 的整体 Allocatable | 单靠抢占这台 Node 上的 Pods 数学上也放不下 |
 | internal Error | PreFilter state 缺失、类型错误等 | 插件执行契约坏了，不能伪装成容量不足 |
 
-`Unresolvable` 仍不是“永远失败”：更大规格 Node、Node 扩容或 Pod request 变化都可能让下一轮结果不同。
+Pod 数量上限的 `Too many pods` 分支是个例外：源码没有在这个分支设置 `Unresolvable`。而已有的 `Unresolvable` 也不是“永远失败”：更大规格 Node、Node 扩容或 Pod request 变化都可能让下一轮结果不同。
 
 ## 12. 从源码返回运维决策：应该改哪一层
 
@@ -1551,10 +1652,10 @@ Deployment template 中 game-api=1200m
 
 ### 12.1 主容器 request 偏大或偏小
 
-对 Spring Boot 服务，应结合稳定期、启动期、JIT/GC 峰值、延迟 SLO 与 throttling 证据校准。scheduler 不读取 JVM 指标，它只消费平台最终确定的 request。
+对 Spring Boot 服务，应结合稳定期、启动期、JIT/GC 峰值、延迟 SLO（服务延迟必须达到的目标）与 throttling 证据校准。scheduler 不读取 JVM 指标，它只消费平台最终确定的 request。
 
-- request 明显高于经过周期验证的需求：可评估下调，提高装箱率；
-- request 过低：即使更容易调度，也可能带来 CPU throttling、Node 超卖和高峰抖动；
+- request 明显高于经过周期验证的需求：可评估下调，提高装箱率（同一批 Node 能安全容纳多少 Pod）；
+- request 过低：即使更容易调度，也可能带来 CPU throttling、Node 超卖（账面看着能放，实际高峰时互相争抢）和高峰抖动；
 - 不要仅因为一次发布 Pending，就把资源承诺改成实时平均 usage。
 
 ### 12.2 平台 sidecar 或 LimitRange 默认值累积
@@ -1597,11 +1698,11 @@ LimitRange 不是 bug；它是在“应用漏填 request”时仍维持平台资
 若单 Pod 账本合理，但滚动发布的 `maxSurge` 让新旧版本短时重叠，可以回到第 07 课评估：
 
 - 调整 `maxSurge/maxUnavailable` 的可用性与容量取舍；
-- 为发布预留 headroom；
+- 为发布预留 headroom（额外容量余量）；
 - 扩容或增加合适规格的 Node；
-- 使用优先级/抢占前，先确认 victim 与业务中断边界。
+- 使用优先级/抢占前，先确认 victim（准备被抢占、用于腾位置的旧 Pod）与业务中断边界。
 
-重入队、backoff 和抢占的源码行为放在第 10 课，本课只先利用 `Unresolvable` 判断“释放现有 request 在数学上有没有可能解决”。
+重入队、backoff（失败越多，下一次重试间隔逐步变长）和抢占的源码行为放在第 10 课，本课只先利用 `Unresolvable` 判断“释放现有 request 在数学上有没有可能解决”。
 
 ### 12.6 五个常见错误直觉
 
@@ -1627,14 +1728,14 @@ incomingGPU > nodeAllocatableGPU - nodeRequestedGPU
 | Java CPU 主案例 | GPU 映射 |
 |---|---|
 | `MilliCPU=2000` | `ScalarResources["nvidia.com/gpu"]=1` |
-| `2000m > remaining CPU` | `1 > remaining GPU slot` |
+| `2000m > remaining CPU` | `1 > remaining GPU 可申请名额` |
 | `kubectl top` 低不能推翻 request 账 | `nvidia-smi` 利用率低不能证明整数 GPU 名额空闲 |
-| scheduler 选择 Node | scheduler 仍只选 Node，具体 device ID 由后续 kubelet DeviceManager 处理 |
+| scheduler 选择 Node | scheduler 仍只选 Node，具体 device ID 由后续 kubelet DeviceManager（kubelet 内负责挑选并注入具体设备的模块）处理 |
 
 四条边界必须先记住：
 
 1. 当前 Pod-level resources 只支持 CPU、memory、hugepages，不会用 Pod-level GPU 值覆盖 container 聚合。
-2. 传统扩展资源按整数名额核算，不是 GPU 核心利用率、显存使用量或温度账。
+2. 传统 `nvidia.com/gpu` 按整数名额核算，不是 GPU 核心利用率、显存使用量或温度账。
 3. Node 上是否有 `nvidia.com/gpu` Allocatable，来自 Device Plugin 等更前面的节点资源上报链；本课只消费结果。
 4. 当前源码还可能按 ignored resource 配置跳过，或把某类 extended resource 委托给 DRA；不能看到 scalar 循环就断言所有 GPU 集群都走完全相同分支。
 
@@ -1658,8 +1759,8 @@ Node requested GPU         = 4
 |---|---|---|
 | S3 必须掌握 | 最终 Pod、app 求和、普通 init 逐维峰值、overhead、PreFilter/CycleState、NodeInfo 两本账、CPU/memory 比较式 | 能不看答案复算生产现场，并沿固定源码讲出为什么这样设计 |
 | S3 二遍掌握 | restartable init 顺序累计、assumed Pod、内部 Error、`Unresolvable`、scalar 余额 | 能解释边界案例，不把抢占或 GPU 利用率混进 Filter |
-| S2 知道分支 | Pod-level 按键覆盖、NonZeroRequested、in-place resize options、ephemeral-storage | 知道何时必须切生产版本源码，不要求现在背完整实现 |
-| S1 一笔带过 | DRA delegation、ignored groups、NodeDeclaredFeatures、ResourceClaim status | 能识别它们不是主案例，后续专题再深读 |
+| S2 知道分支 | Pod-level 按键覆盖；`NonZeroRequested`（没写 request 时使用调度估值）；in-place resize（不重建 Pod 就调整资源）的选项；ephemeral-storage（节点临时存储） | 知道何时必须切生产版本源码，不要求现在背完整实现 |
+| S1 一笔带过 | DRA delegation（把设备资源交给 DRA 路径判断）、ignored groups（配置为由别处负责的资源组）、`NodeDeclaredFeatures`（Node 声明自己支持哪些功能）、`ResourceClaim` status（设备申请当前分配结果） | 能看出这些是设备资源旁支，后续专题再深读 |
 | 本章不学 | NodeResourcesFit Score、重入队、完整抢占、Device Plugin/DeviceManager | 分别交给第 08、10、15～17 课 |
 
 对当前平台工作，前两行决定你能否把 Java Pending 从“看 Event 猜容量”提升为源码级核算；对未来 GPU 运维，真正可迁移的是资源向量、Node 余额和责任边界，不是提前背 GPU 组件名。
@@ -1794,44 +1895,55 @@ func demoShortCircuit() {
 
 **大白话总结：** `&&` 不只是逻辑表达式，也常被 Go 源码用作安全门：先确认指针存在，再读取它指向的值。
 
-## 16. 本章验收：先独立回答，再展开答案
+## 16. 本章验收：首遍先过主线，二遍再补边界
 
-### 16.1 核心问题
+### 16.1 首遍必会：7 题
 
 1. 为什么 scheduler 不读取 Helm values 或 Deployment template 重新计算 Pod request？
 2. `game-api=1200m/1536Mi`、`otel-agent=200m/256Mi`、普通 init=`1900m/1024Mi`、overhead=`100m/256Mi`，最终为什么是 `2000m/2Gi`？
 3. 为什么 CPU 峰值可以来自 init，而 memory 峰值来自 app containers？
-4. 有 restartable init 时，为什么不能只背 `max(sum(app), max(each init))`？
-5. `PodRequests` 中 Pod-level request 是整张表替换，还是逐键覆盖？overhead 是否无条件追加？
-6. 为什么 `PreFilter` 计算一次、`Filter` 对每个 Node 执行？
-7. `CycleState` key 缺失时为什么是内部 Error，而不是 `Unschedulable`？
-8. `NodeInfo.Allocatable` 与 `NodeInfo.Requested` 分别从哪里来？
-9. assumed Pod 尚未完成 Bind，为什么仍必须进入 Node request 账？Filter 是否直接读取 cache？
-10. incoming=`1500m`、allocatable=`7500m`、requested=`6000m`，CPU 这一维通过还是失败？
-11. `Unresolvable=true` 的精确条件是什么？它是否等于“Pod 永远无法调度”？
-12. 为什么 `kubectl top node` 很低，仍可能得到 `Insufficient cpu`？
-13. 在传统 GPU 扩展资源路径中，`nvidia.com/gpu` 在哪张表里比较？scheduler 此时是否选择具体 GPU UUID？
+4. 为什么 `PreFilter` 计算一次、`Filter` 对每个 Node 执行？
+5. `NodeInfo.Allocatable` 与 `NodeInfo.Requested` 分别从哪里来？
+6. incoming=`1500m`、allocatable=`7500m`、requested=`6000m`，CPU 这一维通过还是失败？
+7. 为什么 `kubectl top node` 很低，仍可能得到 `Insufficient cpu`？
 
 <details>
-<summary>展开参考答案</summary>
+<summary>展开首遍参考答案</summary>
 
 1. 最终 Pod 是各类 controller 和 admission 汇合后的标准调度契约；回读上层对象会造成输入不唯一、逻辑漂移和组件耦合。
 2. 常驻阶段是 `1400m/1792Mi`；与普通 init 对每个资源取最大得到 `1900m/1792Mi`；再加 overhead 得 `2000m/2048Mi`。
-3. 资源向量逐键取最大，不选择一整行“最大阶段”；不同资源的峰值可以来自不同阶段。
-4. restartable init 会留在后续阶段：普通 init 要加此前已启动的 restartable，最终 app 阶段要加全部 restartable，且声明顺序有意义。
-5. 对受支持并显式出现的键逐键覆盖；未出现的 container 聚合键保留。公共 helper 可用 `ExcludeOverhead=true`，但本章 PreFilter 路径为 false，所以会追加 `spec.overhead`。
-6. Pod request 与候选 Node 无关，适合一轮写一次；Node 余额各不相同，必须逐 Node Filter，并可并行读取只读 state。
-7. 这表示插件执行顺序或状态类型契约被破坏，不是某台 Node 的容量事实。
-8. Allocatable 来自 `Node.Status.Allocatable` 经 `SetNode` 转换；Requested 由 NodeInfo 随已分配/assumed Pods 的 Add/Remove 增量维护。
-9. 为防止异步 Bind 窗口重复承诺同一资源。Assume 先更新 cache NodeInfo，下一轮 `UpdateSnapshot` 后 Filter 从 snapshot 读取，不是每次直接锁 cache。
-10. 通过；源码判断是 `1500 > 7500-6000`，严格大于为 false。
-11. `incoming request > 该 Node 的总 allocatable`。它只说明单靠释放当前 request 仍放不下，不排除更大 Node、扩容或修改 Pod 后成功。
-12. usage 描述当前消耗，requests 描述已经做出的资源承诺；NodeResourcesFit 使用后者。
-13. 在 `ScalarResources["nvidia.com/gpu"]` 中按整数余额比较；scheduler 这里只选 Node，设备 UUID 由 kubelet DeviceManager 后续处理。
+3. 资源账按 CPU、memory 等键分别取最大，不选择一整行“最大阶段”；所以不同资源的峰值可以来自不同阶段。
+4. Pod request 与候选 Node 无关，适合一轮写一次；每台 Node 的余额不同，必须逐台 Filter。
+5. Allocatable 来自 `Node.Status.Allocatable` 经 `SetNode` 转换；Requested 由 NodeInfo 随已绑定 Pod 和 assumed Pod 的加入、移除增量维护，具体的快照时间窗口放在二遍理解。
+6. 通过；源码判断是 `1500 > 7500-6000`，严格大于为 false，余额刚好用完也能通过 CPU 这一关。
+7. usage 描述当前消耗，requests 描述已经做出的资源承诺；NodeResourcesFit 使用后者。
 
 </details>
 
-### 16.2 两个生产推理题
+### 16.2 二遍进阶：7 题
+
+1. 有 restartable init 时，为什么不能只背 `max(sum(app), max(each init))`？
+2. `PodRequests` 中 Pod-level request 是整张表替换，还是逐键覆盖？overhead 是否无条件追加？
+3. `CycleState` key 缺失时为什么是内部 Error，而不是 `Unschedulable`？
+4. assumed Pod 尚未完成 Bind，为什么仍必须进入 Node request 账？Filter 是否直接读取 cache？
+5. `Unresolvable=true` 的精确条件是什么？它是否等于“Pod 永远无法调度”？
+6. 在传统 GPU 扩展资源路径中，`nvidia.com/gpu` 在哪张表里比较？scheduler 此时是否选择具体 GPU UUID？
+7. 说明 `computePodResourceRequest` 中 `pod -> reqs -> result` 三个变量各从哪里来、发生了什么变化。
+
+<details>
+<summary>展开二遍参考答案</summary>
+
+1. restartable init 会留在后续阶段：普通 init 要加此前已启动的 restartable，最终 app 阶段要加全部 restartable，而且声明顺序有意义。
+2. 对受支持并显式出现的键逐键覆盖，未出现的 container 聚合键保留。公共 helper 可以选择排除 overhead，但本章 PreFilter 没有排除，所以会追加 `spec.overhead`。
+3. 这表示插件执行顺序或状态类型契约被破坏，不是某台 Node 的容量事实。
+4. 为防止异步 Bind 窗口重复承诺同一资源。Assume 先更新 cache 中的 NodeInfo，下一轮 snapshot 更新后 Filter 从 snapshot 读取，不是每次直接锁 cache。
+5. 对 CPU、memory、ephemeral-storage 或 scalar 不足项，条件是 `incoming request > 该 Node 的总 allocatable`；Pod 数量不足分支不会设置它。它只说明单靠释放这台 Node 上已有 Pod 的 request 仍放不下，不排除更大 Node、扩容或修改 Pod 后成功。
+6. 在 `ScalarResources["nvidia.com/gpu"]` 中按整数余额比较；scheduler 这里只选 Node，设备 UUID 由 kubelet DeviceManager 后续处理。
+7. `pod` 是本轮传入的最终 Pod；`PodRequests(pod)` 生成整个 Pod 的 `reqs`；`SetMaxResource(reqs)` 把它转换成 scheduler 内部的 `result`，然后返回给 PreFilter。
+
+</details>
+
+### 16.3 两个生产推理题
 
 **题 A：** 最终 Pod 中 app 总和为 `1800m/3Gi`，两个普通 init 分别为 `2500m/1Gi`、`900m/4Gi`，overhead 为 `100m/256Mi`。请算最终 CPU 和 memory。
 
@@ -1845,13 +1957,15 @@ func demoShortCircuit() {
 
 </details>
 
-### 16.3 通过标准
+### 16.4 通过标准
 
-达到下面三条，才算本章过关：
+首遍不用把二遍内容全背下来。先达到：
 
+- 7 道首遍题至少答对 6 道，其中第 1、2、4、5、6 题必须正确；
 - 不看正文，能画出 `最终 Pod -> PodRequests -> PreFilter/CycleState -> Filter -> fitsRequest`；
-- 能手算主案例和题 A，并解释严格 `>`、assumed Pod 与 API 视图时差；
-- 13 个核心问题至少答对 10 个，其中第 1、2、6、8、10 题必须正确。
+- 能用最终 Pod、Node Allocatable 和 Event 把一次 Java Pod Pending 讲完整。
+
+完成二遍后，再以整章 S3 标准要求自己：上面 14 个概念题至少答对 11 个，能解释 `pod -> reqs -> result`，并至少独立完成一个生产推理题。
 
 若只会说“requests 大于剩余资源”，但说不清 request 怎样聚合、Node requested 怎样形成，还没有达到本课 S3 目标。
 
@@ -1933,7 +2047,7 @@ NodeResourcesFit 返回 Insufficient cpu
 这个 Pod 进入 scheduler 哪个内部状态？
 什么 Node/Pod 事件值得唤醒它？
 为什么不能每秒无脑重试？
-backoff、QueueingHint 和抢占分别解决什么问题？
+backoff（逐步延长重试间隔）、QueueingHint（判断某次对象变化是否值得让 Pod 重新入队）和抢占分别解决什么问题？
 ```
 
 不要在本课提前把“资源比较”和“失败后的重试策略”揉成一个函数。能在这里正确停住，说明你已经开始按 Kubernetes 的职责边界读源码，而不是按 Event 文本猜调用链。
