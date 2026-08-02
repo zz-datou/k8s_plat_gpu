@@ -75,6 +75,19 @@ Ready=False
 | 新 ReplicaSet `game-api-v2` | 1 | 1 | 0 | 0 |
 | 合计 | 4 | 4 | 3 | 3 |
 
+先把表里的四个词翻成人话：
+
+```text
+Running：容器进程已经启动，但应用不一定能接请求。
+Ready：kubelet 当前认为这个 Pod 可以进入正常流量后端。
+Available：Pod Ready 后又稳定了足够时间，RS 才把它计入发布可用量。
+minReadySeconds：Ready 后还要稳定多少秒，才能成为 Available。
+```
+
+后面还会看到两个名字很像、但不是一回事的字段：`RS.status.availableReplicas` 是“可用副本有几个”；Deployment 的 `Available` Condition 是一张判断卡，回答“当前是否守住最低可用量”。
+
+本例新 Pod 虽然 Running，但 Ready=False，所以它既不能正常接流量，也没有给 Deployment 增加 Available。
+
 从平台值班视角看，这个画面很容易产生两个直觉：
 
 ```text
@@ -113,6 +126,8 @@ Ready=False
 - `Running`、`Ready`、`Available` 为什么不是同一个意思；
 - 源码为什么会把“当前没有安全动作”表示成正常的 `false, nil`，而不是错误；
 - 为什么 status 只能报告超时，通用 controller 却不能擅自替业务回滚。
+
+这里的 `Condition` 可以先理解成 `status` 里的一张“判断卡”：记录在判断什么、结果是真是假、原因是什么、什么时候更新。后面看到 `Available`、`Progressing`，就是在看不同主题的判断卡。
 
 这不是重新教你使用 Deployment。本课要练的是：
 
@@ -154,7 +169,7 @@ ReplicaSet controller 才真正创建或删除 Pod
 
 ### 0.3 先记住 controller 每轮只做四件事
 
-先不管“声明式、level-driven、不变量”这些词。你先记住下面四步：
+先不管专业词，你先记住下面四步：
 
 ```text
 第 1 步：看 Deployment 最终想要几个副本。
@@ -200,31 +215,22 @@ no-op：代码正常执行完了，但这一轮没有修改副本数。
   → 最后再用 kubectl 和应用证据验证根因
 ```
 
-本章较长，建议分两遍：
+本章较长，明确分两遍。**第一遍不要顺着三千多行从头硬读到底**：
 
 ```text
-第一遍主线：0～10 → 14～17
-  先理解设计背景、两本账、关键源码和生产推理。
-
-第 11～13 节：首遍只看每节开头、黑板结论和“大白话总结”
-  cache 时差、首次 Create、Condition 源码留到第二遍。
-
-完成主线后：直接做第 21 节标成“首遍”的题
-
-遇到 Go 阅读障碍：查第 18 节附录 A
-想继续追 queue、定时重算、首次 Create：读第 19 节附录 B
-真正值班需要命令：查第 20 节附录 C
+0～2：看事故背景、设计原因和三层职责
+4～5：手算“两本账”，先得到不动的答案
+7.2、7.4：先读最简单的扩新公式和正常 no-op
+8.1～8.4：再读缩旧公式与两道安全保护
+9～10：看 Ready 怎样变成 RS Available，再反馈给 Deployment
+13.1、13.3：只拿到“超时是报告，不是自动回滚”的边界
+14、17：把源码变量带回 Java 生产现场
+21：只做标成“首遍”的题
 ```
 
-第一次阅读只抓一条主线：
+第 3 节首遍只看 3.1 和 3.4 的结论；第 6 节只把函数地图当导航。第二遍再回看 7.1 的总编排、11.1～11.3 的多轮对账、13.2 的 Condition 源码，以及第 19 节的队列、错误重试、定时重算。首次创建等更细的例外也都放在第二遍。
 
-```text
-第 4、5 节：先用数字算出为什么不能动
-第 7、8 节：再看源码怎样得出同一个结果
-第 9、10 节：最后看 Ready 怎样传到 Deployment
-```
-
-第 11～13 节不是不重要。它们解释多轮对账、status 和超时边界，只是源码细节比主线更密。第一遍先拿到结论，第二遍再逐行读。
+遇到 Go 阅读障碍时查第 18 节；值班需要命令时查第 20 节。第一遍的目标不是背函数名，而是能自己算出：为什么扩新和缩旧都应当 no-op。
 
 ---
 
@@ -247,7 +253,7 @@ no-op：代码正常执行完了，但这一轮没有修改副本数。
 
 - 第一步请求已经被 API Server 接受，但客户端没有收到成功响应；
 - 发布程序在第二步和第三步之间崩溃并重启；
-- 新 Pod 已创建，但 scheduler、kubelet、镜像仓库或 CNI 的反馈还没回来；
+- 新 Pod 已创建，但 scheduler、kubelet、镜像仓库或网络插件的反馈还没回来；
 - 一个旧 Pod 恰好同时因为节点故障变成不可用；
 - `v2` 还没发完，用户已经把目标改成 `v3`；
 - 两个相同的对象变化通知被重复投递，或者多个变化合并成一次唤醒。
@@ -300,7 +306,7 @@ controller 看到最新目标已经是 `v3`，就不必先把 `v2` 完整发到 
 
 2015 年最初的 Deployment 设计提案明确写过：Deployment controller 应当能够在发布过程中崩溃后恢复，因此发布进度不能只依赖 controller 进程内存。
 
-这里的“无状态”不是说 controller 进程里什么都不保存。它当然有 cache、queue 和重试次数。
+这里的“无状态”不是说 controller 进程里什么都不保存。它当然会保留本地对象副本、待办队列和重试次数；这些实现词后面再解释。
 
 这里真正想说的是：
 
@@ -328,10 +334,10 @@ controller 重启后，重新读取这些对象，就能接着算。
 | 进程和网络都会失败 | 把目标与状态放进 API 对象 | controller 重启后可重新计算 | 一个对象改完，其他组件不会立刻同时看到 |
 | 对象变化通知可能重复、合并 | 每次重新看当前状态（level-based） | 不必按顺序重放所有通知 | 重复执行也不能把副本越加越多（幂等） |
 | 多个职责的反馈速度不同 | 分控制循环，并把交接状态写入 API 对象 | 某一步失败或进程重启后，可以按当前对象恢复，不必保住一条长调用栈 | 链路和排障更长；同进程退出时多个循环仍会一起暂停 |
-| 发布中途目标可能变化 | 始终读取最新 `spec` | 可以中途直接转向新版本（rollover） | 中间版本不保证完整发布 |
+| 发布中途目标可能变化 | 始终读取最新 `spec` | 可以中途直接转向新版本（rollover，也就是发布中途再次换目标） | 中间版本不保证完整发布 |
 | 可用性比发布速度更重要 | 在策略里写清“最多多建几个、最多少用几个” | 新版本异常时先保留旧容量 | 资源不足或新版本异常时，发布会等住 |
 
-这张表很重要。后面看到的 queue、early return、`maxSurge` 公式和 `return false, nil`，都不是孤立代码技巧，而是在实现这些设计选择。
+这张表很重要。后面看到的待办队列、early return（提前结束本轮）、`maxSurge` 公式和 `return false, nil`，都不是孤立代码技巧，而是在实现这些设计选择。
 
 ---
 
@@ -371,12 +377,12 @@ kubelet
 
 ### 2.2 ReplicaSet 为什么像一张“版本快照”
 
-一次 rollout 期间，系统必须同时回答两个问题：
+一次 rollout 期间，Deployment controller 必须回答两个问题：
 
 1. 哪些 Pod 属于旧模板，哪些属于新模板？
 2. 每个版本当前应该保留多少副本？
 
-这里的判断者是 **Deployment controller**，不是 API Server，也不是 Deployment 对象自己在运行代码：
+这两个判断都由 **Deployment controller** 完成，不是 API Server 在算，也不是 Deployment 对象自己在运行代码：
 
 - Deployment controller 读取 Deployment 的最新模板和发布策略，找出哪个 RS 是新版本、哪些是旧版本，再计算这一轮每个 RS 的目标副本数；
 - API Server 只像共享账本一样保存 Deployment、RS、Pod 的目标和状态，不替 Deployment 计算新旧版本各留几个；
@@ -392,9 +398,9 @@ RS.status.replicas
   = RS controller 随后观察和汇总到几个 Pod，是结果数
 ```
 
-所以“旧 RS 缩到 0”只表示 `oldRS.spec.replicas=0`，也就是旧版本现在不再希望保留 Pod；它不等于旧 RS 对象立刻被删除。旧 RS 对象通常还会作为发布历史保留，超过 `revisionHistoryLimit` 后才按清理条件处理。
+所以“旧 RS 缩到 0”只表示 `oldRS.spec.replicas=0`，也就是旧版本现在不再希望保留 Pod；它不等于旧 RS 对象立刻被删除。`revisionHistoryLimit` 限制的是“最多保留多少个旧 RS 历史对象”，不是“保留多少个旧 Pod”。超过这个数量后，controller 才按清理条件删除多余的旧 RS 对象。
 
-Deployment 根据 Pod template 计算 `pod-template-hash`，不同模板对应不同 ReplicaSet。于是 rollout 不再是“把一批 Pod 原地改成另一个版本”，而是：
+Deployment 根据 Pod template 计算 `pod-template-hash`。它可以先理解成“Pod 模板的指纹”：模板内容不同，指纹通常不同，Deployment 就能据此区分哪个 RS 对应哪个版本。于是 rollout 不再是“把一批 Pod 原地改成另一个版本”，而是：
 
 ```text
 旧 RS（v1 模板）逐步缩小
@@ -414,7 +420,7 @@ Deployment 根据 Pod template 计算 `pod-template-hash`，不同模板对应�
 | 看哪里 | 变简单的部分 | 变复杂的部分 |
 |---|---|---|
 | 单个 controller | 只需要理解自己负责的判断 | 必须相信下层以后会把结果写回来 |
-| 故障恢复 | 重启后可以重新读取对象，不必恢复一条旧调用栈 | 必须处理重复通知、旧 cache 和中间状态 |
+| 故障恢复 | 重启后可以重新读取对象，不必恢复一条旧调用栈 | 必须处理重复通知、本地对象副本还没更新和中间状态 |
 | 状态传递 | 每一步都有 Deployment、RS 或 Pod 可以观察 | 状态不会瞬间传完，排障链更长 |
 | 整个架构 | 版本编排、副本维护、节点执行分开处理 | 组件更多，并共同依赖 API Server 这本总账 |
 
@@ -437,6 +443,38 @@ Kubernetes 状态接力：A 把目标写进 API 对象后结束本轮；
                     B 稍后观察到变化，再做自己那一步。
 ```
 
+首遍先看两张短图，不要一上来同时记七个角色。
+
+**第一张图从左往右读，只回答“谁决定副本数，谁创建 Pod”。虚线表示后一个 controller 稍后看到对象变化，不是前一个函数在原地等它。**
+
+```mermaid
+flowchart LR
+    D["Deployment controller<br/>计算各 RS 的目标副本"] -->|"写 newRS.spec=1"| A["API Server<br/>保存目标"]
+    A -.->|"稍后看到 RS 变化"| R["ReplicaSet controller<br/>按单个 RS 兑现副本"]
+    R -->|"创建 1 个 Pod 对象"| A
+```
+
+**第二张图也从左往右读，只回答“新 Pod 的 Ready 怎样反馈回来”。**
+
+```mermaid
+flowchart LR
+    K["kubelet<br/>执行探针"] -->|"更新 Pod.status Ready"| A2["API Server<br/>保存观察结果"]
+    A2 -.->|"Pod 状态变化"| R2["ReplicaSet controller<br/>汇总 Available"]
+    R2 -->|"写 RS.status.availableReplicas"| A2
+    A2 -.->|"RS 状态变化"| D2["Deployment controller<br/>下一轮重新算"]
+```
+
+两张图合起来就是：前半程把目标往下传，后半程把观察结果往上汇总。中间任何一步慢了，Deployment 都只能等下一轮再算。
+
+<details>
+<summary><strong>第二遍再展开：完整七角色时序图</strong></summary>
+
+下面的完整七角色图把 scheduler、kubelet 和容器运行时也接进来。图中几个词先翻成人话：
+
+- `nodeName`：Pod 要运行在哪个节点；它为空时，通常表示还没有完成节点选择；
+- `CRI`：kubelet 调用容器运行时的标准接口，可以理解成二者约定好的“插座”；
+- `PATCH Pod.status`：只更新 Pod 状态里的部分字段，不是在直接调用 Deployment controller。
+
 下面继续使用本章数字：
 
 ```text
@@ -457,6 +495,7 @@ sequenceDiagram
     participant C as 容器运行时
 
     U->>A: 把 Deployment 模板从 v1 改成 v2
+    A-->>D: 稍后观察到 Deployment 变化
     D->>A: 创建 new RS，并写 newRS.spec=1
     Note over D: 继续完成本轮能做的判断，但不等待 Pod Ready
     A-->>R: 稍后观察到 RS 变化
@@ -471,6 +510,8 @@ sequenceDiagram
     A-->>D: 稍后观察到 RS 状态变化
     D->>A: 下一轮安全时把 oldRS.spec 从 3 改成 2
 ```
+
+</details>
 
 controller 也不一定每次都直接读取 API Server。可以先这样理解：
 
@@ -493,9 +534,9 @@ newRS.spec=1
 已经存在的 Pod 和 status
 ```
 
-进程重启或新的 leader 接管后，可以重新读取这些对象，从当前状态继续计算。它不需要恢复一条已经消失的 Go 调用栈，也不需要记住“上次执行到第几行”。
+进程重启或新的 leader 接管后，可以重新读取这些对象，从当前状态继续计算。这里的 `leader` 是多个 `kube-controller-manager` 副本中，当前真正负责执行控制循环的那个负责人；原负责人退出后，另一个副本可以接手。它不需要恢复一条已经消失的 Go 调用栈，也不需要记住“上次执行到第几行”。
 
-源码还会反复计算“应该等于多少”，而不是盲目执行“再加一个”。这使重复通知和重试不容易把副本越加越多。更细的 queue、expectations 和 ownerReference 机制放在第 19 节第二遍阅读。
+源码还会反复计算“应该等于多少”，而不是盲目执行“再加一个”。这使重复通知和重试不容易把副本越加越多。至于“怎样避免状态反馈慢时重复创建”和“怎样记录 Pod 归哪个 RS 管”，放到第 19 节第二遍阅读。
 
 ### 2.5 什么情况值得拆，什么情况说明拆过头
 
@@ -553,11 +594,13 @@ Kubernetes 源码里没有“达到多少分就拆成 controller”的通用公�
 
 > 链路变长确实是代价。Kubernetes 接受这个代价，是为了让每一步都有持久记录，进程恢复后能够重新计算；但这种理由不能自动证明任何微服务拆分都是合理的。
 
-下一节继续看：对象变化怎样只负责叫醒 controller，而不是携带“下一步必须执行什么”的命令。更完整的 Ready 反馈链在第 10 节，多轮 reconcile 在第 11 节，handler 和 queue 源码在第 19.8 节。
+下一节继续看：对象变化怎样只负责叫醒 controller，而不是携带“下一步必须执行什么”的命令。更完整的 Ready 反馈链在第 10 节，多轮 reconcile 在第 11 节，对象回调和队列源码在第 19.8 节。
 
 ---
 
 ## 3. 先分清两种“事件”：真正叫醒 controller 的不是 `kubectl get events` 那张表
+
+> **第一遍只抓一句：对象变化通知只负责叫醒，真正动作要等 controller 重新读取当前对象后再算。** 本地对象副本、待办队列和回调接线细节放到第二遍。
 
 运维时说“Event”，很容易把两件不同的东西混在一起。
 
@@ -588,9 +631,9 @@ Kubernetes Event 对象
 
 ```text
 某个相关 API 对象发生变化
-  → informer 回调被触发
-  → workqueue 记下 game/game-api
-  → worker 取出这个 key
+  → informer（变化接收器）触发回调，并更新本地对象副本
+  → workqueue（待办队列）记下 game/game-api
+  → worker（后台取任务的循环）取出这个 key
   → syncDeployment 重新读取当前 Deployment 和 RS
   → 用最新对象重新计算现在能不能扩新、缩旧
 ```
@@ -599,6 +642,7 @@ Kubernetes Event 对象
 
 - `informer`：持续接收对象变化，并在 controller 本机维护一份可查询的对象副本；
 - `workqueue`：controller 的待办队列；
+- `worker`：不断从待办队列取出一个 key、执行一次对账的后台循环；
 - `key`：对象索引，本例是 `game/game-api`，不是“把新 RS 加一”的命令。
 
 因此，通知只负责叫醒。真正决定动作的是 controller 醒来后看到的当前对象状态。
@@ -606,7 +650,7 @@ Kubernetes Event 对象
 ### 3.2 Pod Ready 怎样间接叫醒 Deployment
 
 当前固定提交中，Deployment controller 会监听 Deployment 和
-ReplicaSet 的新增、更新、删除。它对 Pod 注册的 handler 只有删除，
+ReplicaSet 的新增、更新、删除。它对 Pod 注册的回调函数（handler）只有删除，
 主要服务于 Recreate 策略。
 
 这意味着 RollingUpdate 的 Ready 反馈通常不是：
@@ -660,7 +704,7 @@ controller 不必把它们当作三张必须按顺序执行的发布工单。
 这个最新事实重新算缩旧预算。
 
 这种“关心当前值，不要求重放每个历史事件”的方式，叫
-`level-driven`。
+`level-based`。
 
 ### 3.4 幂等：同一个 key 重算两次，不能错误地多加一个 Pod
 
@@ -700,7 +744,7 @@ reconcile：重新读取并计算绝对目标
 幂等：重复计算不能无条件重复加副本
 ```
 
-handler 和 lister 的 Go 源码在附录 19.8，`scaleReplicaSet` 在
+对象变化回调和本地读取的 Go 源码在附录 19.8，`scaleReplicaSet` 在
 19.9；确定性 RS 名称在 19.6。都留到第二遍再读。
 
 ---
@@ -783,7 +827,16 @@ maxUnavailable = 0
 先缩旧：总 Available 会从 3 变 2，低于下限。
 ```
 
-把这次 reconcile 画成源码判断分支，会更直观。**这张图从上往下读，菱形是 controller 必须回答的判断题：**
+把这次 reconcile 画成源码判断分支，会更直观。图里的字母和斜杠先读成：
+
+```text
+N = desired replicas = 3
+S = maxSurge = 1
+U = maxUnavailable = 0
+old=3/3、new=1/0 都按 spec/available 读取
+```
+
+**这张图从上往下读，菱形是 controller 必须回答的判断题：**
 
 ```mermaid
 flowchart TD
@@ -794,7 +847,7 @@ flowchart TD
     C -- "否：缩容预算为 0" --> D["安全 no-op<br/>保留旧容量，等待新事实"]
 ```
 
-图中的 `old=3/3、new=1/0` 都按 `spec/available` 读取。这张图只想说明：
+这张图只想说明：
 
 ```text
 扩新被容量上限挡住。
@@ -1044,9 +1097,13 @@ Pod Ready
 
 函数名记不住没关系。能说清“它看了哪些数、为什么没改副本”才算读懂。
 
+后面看到 `helper` 时，把它理解成“被主函数调用、只负责一个小计算或小判断的辅助函数”。它不是新的 controller，也不是另一个服务。
+
 ---
 
 ## 7. 源码第一问：新 RS 为什么只扩到 1
+
+> **Go 新手第一遍：先跳到 7.2 看扩新公式，再读 8.2 的缩旧公式；7.1 留到第二遍回看。** 7.1 只是把两个公式串起来；如果先读它，容易同时被 receiver、slice、多返回值和多个辅助函数挡住。
 
 ### 7.1 `rolloutRolling` 先尝试找到一个安全动作
 
@@ -1056,7 +1113,7 @@ Pod Ready
 pkg/controller/deployment/rolling.go
 ```
 
-【主读】这段源码只回答一个问题：RollingUpdate 一轮对账时，按什么顺序尝试扩新、缩旧，以及重算并按需提交 status？
+【第二遍回看主干】等你先读懂 7.2 和 8.2 的两个公式后，再看这段。它只回答：RollingUpdate 一轮对账时，怎样把“先试扩新、再试缩旧、最后重算 status”串起来？
 
 下面是教学注释版主干。它省略了 rollout 完成后的 `cleanupDeployment` 等收尾分支，只保留本课讨论的扩新、缩旧和 status 重算入口；因此不要把它当作完整函数复制使用。
 
@@ -1070,7 +1127,7 @@ func (dc *DeploymentController) rolloutRolling(
 	// 找出与最新 Pod 模板匹配的 newRS，以及其余 oldRSs；true 表示不存在时允许创建 newRS。
 	newRS, oldRSs, err := dc.getAllReplicaSetsAndSyncRevision(ctx, d, rsList, true)
 	// 如果查找、同步 revision 或创建 newRS 失败，立即把错误交给上层处理。
-	// 最终是否限速重试，要看 worker 的 handleErr 分支。
+	// 这里只把 error 交给外层；错误怎样重试留到附录 19.3。
 	if err != nil {
 		return err
 	}
@@ -1147,7 +1204,9 @@ pkg/controller/deployment/util/deployment_util.go
 
 【主读】这段源码只回答：new RS 的绝对目标副本数应该是多少？
 
-下面是完整函数中 `RollingUpdate` 分支的教学摘录；原函数外层还有 `switch strategy` 以及 `Recreate/default` 分支，本段没有展示。
+【非连续主干，不能直接复制编译】下面保留函数签名和 `RollingUpdate` 核心计算，但没有展示原函数外层的 `switch strategy` 以及 `Recreate/default` 分支。
+
+先堵住 Go 新手最容易担心的两个点：普通 `apps/v1` Deployment 在 YAML 里省略 `spec.replicas` 时，API 默认逻辑通常会先补成 `1`，controller 正常读取已保存对象时，这个指针通常已经有值；代码里的 `int(...)` 只是把 API 字段使用的 `int32` 转成这个换算函数需要的 Go `int`，数字含义没有改变。
 
 ```go
 // 定义计算 newRS 新目标副本数的函数。
@@ -1203,7 +1262,8 @@ func NewRSNewReplicas(
 **顺手学 Go：**
 
 - `(int32, error)`：函数同时返回“副本目标值”和“有没有错误”；
-- `*deployment.Spec.Replicas`：读取指针里保存的实际副本数；
+- `*deployment.Spec.Replicas`：读取指针里保存的实际副本数；普通 apps/v1 对象省略该字段时通常已由 API 默认成 1；
+- `int(...)`：只做整数类型转换，把 `int32` 变成 Go `int`，数值本身不变；
 - `min(a, b)`：两个限制里取更小的那个。
 
 这里的 `true` 只是百分比向上取整的参数，不是“允许扩容”的开关。
@@ -1249,7 +1309,7 @@ newRS 新目标               = 1
 取出 replicas 指针指向的 int32 值
 ```
 
-API 类型中使用指针，常用于区分“字段没有设置”和“字段明确设置为 0”。读 controller 时，先把 `*x` 心译成“x 的实际值”即可。
+API 类型中使用指针，常用于区分“字段没有设置”和“字段明确设置为 0”。但普通 `apps/v1` Deployment 省略 `replicas` 时，API 通常会在对象保存前补成默认值 `1`；因此这里不是在教你无条件解引用任意指针。读这段 controller 时，可以先把 `*x` 心译成“取出 x 里面的实际副本数”。
 
 第二，函数返回两个值：
 
@@ -1333,7 +1393,7 @@ controller 不能只看“现在一共有 4 个 Pod”，因为这 4 个 Pod 的
 
 ### 8.2 源码中的第一道安全闸
 
-【主读】这段源码只回答：旧 RS 的 `spec.replicas` 最多还能降低多少？下面只截取第一道缩容预算的计算。
+【主读·连续摘录】这段源码只回答：旧 RS 的 `spec.replicas` 最多还能降低多少？下面只截取 `reconcileOldReplicaSets` 中相邻的第一道缩容预算计算，前后还有清理和实际 scale 分支。
 
 ```go
 // 汇总所有新旧 RS 的 spec.replicas；这是账面期望数，不是 Running Pod 实数。
@@ -1389,19 +1449,15 @@ maxScaledDown
 
 > 本轮没有错误，但为了不扩大不可用，不能缩旧 RS。
 
-首遍在这里就把返回值走到底：
+首遍只把返回值读到这里：
 
 ```text
-maxScaledDown <= 0
-  → reconcileOldReplicaSets 返回 false, nil
-  → rolloutRolling 正常同步 status
-  → status 同步成功后，worker 最终收到 nil error
-  → handleErr 执行 Forget，不走错误退避
-  → 等对象变化通知、时间重算或其他入队来源再算
+false = 这一步没有降低旧 RS 的目标副本数
+nil   = 没有程序错误
+外层会正常结束本轮，等以后再次被叫醒后重新计算
 ```
 
-这里的 `false` 只在 rollout 函数内部表示“没有缩旧”。
-workqueue 最终只看见 `nil error`，不会直接读取这个 `false`。
+这条返回值在队列层怎样决定“正常结束还是错误重试”，统一放在附录 19.3，不让内部函数名打断这道核心公式。
 
 ### 8.3 为什么一定要减 `newRSUnavailablePodCount`
 
@@ -1443,7 +1499,7 @@ controller 会误以为可以缩一个旧副本。但删完后：
 
 第一道计算限制“旧 RS 总共最多能减多少”，并优先处理本来就不可用的旧副本。如果还想继续减健康旧副本，第二道再检查当前 Available 是否真的高于下限。
 
-【主读】下面是第二道保护的教学注释版源码：
+【主读·连续摘录】下面这段来自 `scaleDownOldReplicaSetsForRollingUpdate`。它只回答“健康旧副本还能缩几个”，不是 8.2 那段代码的紧接下一行：
 
 ```go
 // 重新写出本轮要守住的最低 Available，仍然是 desired - U。
@@ -1486,6 +1542,8 @@ totalScaleDownCount := availablePodCount - minAvailable
 
 `cleanupUnhealthyReplicas` 比较：
 
+【非连续检查点】下面只是函数循环中的一条计算式，`targetRS` 是当前正在检查的旧 RS；它离开前后文不能单独编译。
+
 ```go
 // 旧 RS 的期望数减去 Available，得到“不贡献 Available 却占着期望数”的差值。
 *(targetRS.Spec.Replicas) - targetRS.Status.AvailableReplicas
@@ -1500,6 +1558,8 @@ totalScaleDownCount := availablePodCount - minAvailable
 ```
 
 这个 `1` 的意思是：旧 RS 里至少有一个期望副本没有贡献 Available。
+
+这里说的“不健康”只表示“没有贡献 Available”。它不一定已经崩溃；也可能只是 Ready 还没稳定到 `minReadySeconds`。
 
 **大白话总结：**
 
@@ -1540,7 +1600,7 @@ totalScaleDownCount := availablePodCount - minAvailable
 - 监听端口和 readiness 配置不一致；
 - 数据库连接池没有建立；
 - 必要配置、缓存初始化或应用级服务注册尚未完成；
-- Full GC、依赖超时让探针持续失败。
+- Full GC（JVM 做全堆垃圾回收时的长暂停）、依赖超时让探针持续失败。
 
 如果 Deployment 只看 `Running` 就删旧 Pod，可能出现这种情况：
 
@@ -1566,7 +1626,7 @@ pkg/controller/replicaset/replica_set_utils.go
 calculateStatus
 ```
 
-【主读】下面只截取 RS `calculateStatus` 中统计 Ready/Available 的部分。`activePods` 是该 RS 当前纳入计算的活动 Pod，不是集群全部 Pod。
+【主读·连续摘录】下面只截取 RS `calculateStatus` 中统计 Ready/Available 的部分，不是完整函数。`rs` 是正在统计的 ReplicaSet，`activePods` 是前面筛出的该 RS 活动 Pod，`now` 是本轮当前时间，`newStatus` 是准备填好后写回 API 的状态副本。
 
 ```go
 // Ready 计数从 0 开始。
@@ -1743,7 +1803,7 @@ replicas
 3. 统计值真的变化时，RS controller 更新 RS status；
 4. Deployment controller 看到 RS 更新，再算能不能缩旧副本。
 
-完整反馈链如下。**这张时序图从上往下读，横向五列只表示职责归属，不表示五个组件在做同步 RPC：**
+`RPC` 可以先理解成“一个组件直接请求另一个组件，并在原地等返回”。完整反馈链如下。**这张时序图从上往下读，横向五列只表示职责归属，不表示五个组件正在组成一条同步 RPC：**
 
 ```mermaid
 sequenceDiagram
@@ -1799,7 +1859,7 @@ Deployment 没缩旧，
 
 前面白板上用了“第 0 轮、第 1 轮”。现在解释为什么 controller 不把整个发布在一次函数调用里做完。
 
-第一次阅读重点看 11.1～11.3。11.4 的首次创建例外和 11.5 的 `DeepCopy` 属于第二遍细节。
+本节整体放到第二遍。第二遍先读 11.1～11.3；11.4 的首次创建例外和 11.5 的 `DeepCopy` 再往后读。
 
 ### 11.1 一次发布跨越多个异步系统
 
@@ -1836,6 +1896,8 @@ watch：把新照片送回来
 ```
 
 `syncDeployment` 的读取路径是：
+
+下面的 `namespace` 和 `name` 不是凭空出现：前面的代码已经把队列 key `game/game-api` 拆成 `namespace=game`、`name=game-api`。这里从拆好的两个变量继续读 cache。
 
 ```go
 // 从本地 informer cache 读取 Deployment；不是直接向 API Server 发 GET。
@@ -1897,20 +1959,24 @@ controller 也拿不到 Deployment、RS、Pod 在同一瞬间的一张合影。�
 等新照片回来，下轮再算。
 ```
 
-回看 `rolloutRolling`。下面是把两个 early return 放在一起的教学摘录，中间真实存在缩旧计算：
+回看 `rolloutRolling`。下面是同一函数里的两个**非连续检查点**：它们中间真实存在缩旧调用和错误检查，不能把两个代码块拼起来当成可独立编译的完整函数。
+
+检查点一：扩新已经发生时。
 
 ```go
 // 如果本轮确实提高了已有 newRS 的 spec.replicas。
 if scaledUp {
-	// 调用状态同步后立即结束本轮；return 后面的缩旧路径不会再执行。
+	// 同步 status 后立即结束本轮；后面的缩旧路径不会再执行。
 	return dc.syncRolloutStatus(ctx, allRSs, newRS, d)
 }
+```
 
-// 中间省略 reconcileOldReplicaSets 的调用和错误检查。
+检查点二：中间的缩旧计算完成以后。
 
+```go
 // 如果本轮确实降低了某个旧 RS 的 spec.replicas。
 if scaledDown {
-	// 同样调用状态同步并结束本轮；status 没变化时不会发 UpdateStatus。
+	// 同样同步 status 后结束本轮；status 没变化时不会发 UpdateStatus。
 	return dc.syncRolloutStatus(ctx, allRSs, newRS, d)
 }
 ```
@@ -1974,14 +2040,14 @@ if err != nil {
 // 把计算结果写进即将发送的 newRS 对象。
 *(newRS.Spec.Replicas) = newReplicasCount
 
-// 在 Create 前写入 revision、desired replicas、max replicas 等 controller annotation。
+// 在 Create 前写入 controller annotation：也就是 metadata.annotations 里供 controller 保存辅助信息的键值记录。
 deploymentutil.SetNewReplicaSetAnnotations(ctx, d, &newRS, newRevision, false, maxRevHistoryLengthInChars)
 
 // 向 API Server 发 Create；返回创建后的对象和 error。
 createdRS, err := dc.client.AppsV1().ReplicaSets(d.Namespace).Create(ctx, &newRS, metav1.CreateOptions{})
 ```
 
-这段只展示 Create 的正常主线。真实源码后面还会处理 `AlreadyExists`、模板 hash 冲突、`collisionCount` 和创建失败 Condition；这些分支不影响这里要说明的“初始副本数在 Create 前已经算好”，所以本节暂不展开。
+这段只展示 Create 的正常主线。真实源码后面还会处理 `AlreadyExists`（同名对象已经存在）、模板 hash 冲突、`collisionCount`（为解决 hash 重名而记录的碰撞次数）和创建失败 Condition；这些分支不影响这里要说明的“初始副本数在 Create 前已经算好”，所以本节暂不展开。
 
 **大白话总结：**
 
@@ -2256,7 +2322,7 @@ pkg/controller/deployment/util/deployment_util.go
 DeploymentTimedOut
 ```
 
-【主读】下面省略日志，只保留时间判断主干：
+> **第二遍再读。** 第一遍只需看 13.1 和 13.3，知道“超时只报告，不自动回滚”。下面才进入 defaulting、时间判断和 status 写回细节。
 
 先不看 Go，把判断顺序写成人话：
 
@@ -2281,7 +2347,7 @@ controller 判断 deadline 已禁用 → 不判超时
 
 源码里的“没有进度期限”不是简单等于“用户 YAML 没写”。当前实现的
 `HasProgressDeadline` 只有在字段为 `nil`，或值等于内部使用的
-`math.MaxInt32` 哨兵值时，才返回 `false`。
+`math.MaxInt32` 哨兵值时，才返回 `false`。这里的“哨兵值”就是借一个特殊数字表达额外含义；它不是让系统真的等待这么多秒，而是 controller 内部约定的“关闭 deadline 检查”。
 
 默认值来自：
 
@@ -2289,6 +2355,8 @@ controller 判断 deadline 已禁用 → 不判超时
 pkg/apis/apps/v1/defaults.go
 SetDefaults_Deployment
 ```
+
+【连续摘录】下面是 defaulting 函数里相邻的四行，不是完整函数：
 
 ```go
 // apps/v1 对象没有填写 progressDeadlineSeconds 时……
@@ -2300,13 +2368,19 @@ if obj.Spec.ProgressDeadlineSeconds == nil {
 }
 ```
 
-controller 判断“是否启用期限”的 helper 是：
+`new(int32)` 可以读成“先造一个能存 `int32` 的小格子，并拿到它的地址”；下一行前面的 `*` 再把 `600` 写进这个格子。
+
+controller 判断“是否启用期限”的辅助函数是：
+
+【非连续检查点】这里只摘出函数里的返回表达式，离开函数外壳不能单独编译：
 
 ```go
 // 字段存在，并且不是内部约定的禁用哨兵值，才算启用了 deadline。
 return d.Spec.ProgressDeadlineSeconds != nil &&
 	*d.Spec.ProgressDeadlineSeconds != math.MaxInt32
 ```
+
+【非连续检查点】下面来自 `DeploymentTimedOut`。为聚焦超时判断，省略了中间日志语句，因此不能把它当成完整函数直接复制编译：
 
 ```go
 // 定义“当前 Deployment 是否已经超过进度期限”的判断函数。
@@ -2373,6 +2447,8 @@ syncRolloutStatus
 
 这里的 `switch` 可以先当成一串 `if / else if` 来读。前面的“已经完成”和“仍有新进展”都没命中，才会检查是否超时。
 
+【非连续检查点】下面的 `case` 位于一个前文未展示的 `switch` 里面，不能离开这个 `switch` 单独编译：
+
 ```go
 // 前面的“完成”和“仍有新进展”分支都没有命中后，再判断是否超时。
 case util.DeploymentTimedOut(ctx, d, &newStatus):
@@ -2393,7 +2469,11 @@ case util.DeploymentTimedOut(ctx, d, &newStatus):
 	util.SetDeploymentCondition(&newStatus, *condition)
 ```
 
-写 API 前，源码先比较新旧两份 status。完全相同就不写，只按需要预约 deadline 的未来检查；内容真的变了，才调用 `UpdateStatus`：
+写 API 前，源码先比较新旧两份 status。完全相同就不写，只按需要预约 deadline 的未来检查；内容真的变了，才调用 `UpdateStatus`。
+
+这里的 `status` 子资源可以理解成“只允许写观察结果的 API 入口”。通过它更新 `status`，不会顺手把 Deployment 的 Pod 模板、replicas 或发布策略这些 `spec` 目标改掉。
+
+【连续摘录】下面是 `syncRolloutStatus` 写回状态的相邻代码：
 
 ```go
 // d 在 syncDeployment 开头已经 DeepCopy；这里仅把同一个对象指针赋给另一个变量名，并没有再复制对象。
@@ -2412,8 +2492,8 @@ return err
 controller 只是在 status 上记录“发布超时”。
 它没有修改 Pod template。
 它没有把 spec 改回旧版本。
-写 status 失败时，才返回 error 交给上层处理。
-最终是否限速重试，还要经过 worker 的 handleErr 分支。
+写 status 失败时，才返回 error 交给外层处理。
+正常写成功则结束本轮；错误重试细节放在附录 19.3。
 ```
 
 告警、暂停和回滚，由外部发布平台或人决定。
@@ -2430,8 +2510,7 @@ controller 只是在 status 上记录“发布超时”。
 
 controller 本身也不是在这里直接发送监控告警；监控或发布平台可以读取这条 Condition，再按自己的规则告警、暂停流水线或请求人工处理。
 
-`ProgressDeadlineExceeded` 本身是一条 Condition，不是传给
-`handleErr` 的 Go error，因此它不会触发 workqueue 的错误退避。
+`ProgressDeadlineExceeded` 本身是一条 Condition，不是 Go error，因此它不会触发“程序出错后先等一会儿再重试”的错误退避。
 它也不会把 Deployment 永久冻住：后续对象变化或其他入队来源仍可
 让 controller 重新对账；但当前 `requeueStuckDeployment` 看到已经
 TimedOut 后，不会再为同一个 deadline 预约下一次定时检查。
@@ -2440,12 +2519,12 @@ TimedOut 后，不会再为同一个 deadline 预约下一次定时检查。
 
 “新版本超时就回滚”听起来很合理，但 controller 不知道这些业务事实：
 
-- 新版本是否执行了不可逆的数据库 schema 迁移；
+- 新版本是否执行了不可逆的数据库 schema 迁移（数据库表结构或字段格式变化）；
 - 旧版本是否还能读取新格式数据；
 - 旧镜像是否本来就有严重安全漏洞；
 - 当前失败是否来自集群容量，而不是应用版本；
 - 公司策略是自动回滚、暂停等待审批，还是继续灰度观察；
-- GitOps controller 是否会把自动回滚又覆盖回最新 Git 目标。
+- GitOps controller（持续把 Git 中声明的目标同步到集群的控制器）是否会把自动回滚又覆盖回最新 Git 目标。
 
 以 Java 服务为例：`v2` 启动时把字段改成新格式，旧 `v1` 已不兼容。如果 Deployment controller 只因为 readiness 超时就擅自切回 `v1`，可能制造第二次事故。
 
@@ -2576,6 +2655,8 @@ HTTP Server 已在应用端口启动
 
 ### 14.3 第三组证据：旧 Pod 承担了哪些流量，哪条路径不受 Kubernetes Ready 直接控制
 
+`EndpointSlice` 是 API Server 里的一张 Service 后端清单：它记录这个 Service 目前有哪些候选 Pod，以及这些后端是否 Ready。查它，是为了确认 Kubernetes Service 会不会把新请求选到这个 Pod。
+
 ```bash
 kubectl -n game get endpointslice \
   -l kubernetes.io/service-name=game-api -o yaml
@@ -2597,6 +2678,8 @@ EndpointSlice 只能验证 Kubernetes Service 这条流量路径。Java 微服�
 这也说明 Deployment 的责任边界：它根据 Kubernetes Available 保护旧副本，不负责统一所有应用级流量发现系统。如果它为了“让 rollout 看起来完成”删掉一个旧 Pod，可用冗余会先下降，但新版本的启动依赖和其他流量路径不会因此自动恢复。
 
 ### 14.4 修复后应该观察哪条反馈链恢复
+
+先把后面会用到的监控词翻成人话：`RT` 是一次请求花了多久；`P95/P99` 表示 95%/99% 的请求能在多长时间内完成；`SLI` 是实际测到的指标，`SLO` 是团队希望这些指标达到的目标。
 
 修复启动期必要初始化，或修正健康端点对“必要就绪条件”的表达后，不要只看到 Pod 变绿就结束：
 
@@ -2717,7 +2800,9 @@ old(-1) → 等资源释放 → new(+1)
 
 - `nvidia.com/gpu`：scheduler 能计数的一种 GPU 资源名；
 - `Allocatable`：节点告诉 scheduler“我能分给 Pod 多少 GPU”的资源数；
-- Device Plugin / DeviceManager：把节点 GPU 报告给 kubelet，并在启动容器时完成设备分配的链路。具体源码留到 GPU 专章。
+- `Device Plugin`：GPU 厂商侧组件，把健康 GPU 告诉 kubelet，并响应设备分配请求；
+- `DeviceManager`：kubelet 内部的设备管家，维护设备账本，并在容器启动时协调具体设备；
+- 两者怎样通过接口配合，留到 GPU 专章，本课只记住它们不是同一个组件。
 
 ### 16.1 GPU rollout 为什么更容易出现“没有下一步”
 
@@ -3051,7 +3136,9 @@ error”。到了 worker 这一层只剩最终的 `nil error`，所以不会触�
 #### 当前固定提交有一条必须单独记住的失败旁路
 
 上面讲的是正常 no-op 的传播。可当前固定提交
-`301946d15e67...` 还有一个反直觉事实：
+`301946d15e67...` 还有一个反直觉事实。
+
+【非连续检查点】下面两段来自 `reconcileOldReplicaSets` 的不同位置，不能独立编译。`oldRSs` 是前面取得的旧 RS 列表；`cleanupCount`、`scaledDownCount` 是分别接住两个辅助函数返回数量的变量。
 
 ```go
 // 清理旧 RS 不健康副本时，如果更深层 helper 返回 error……
@@ -3189,7 +3276,11 @@ generation 已被观察
 
 > **首遍跳过。** 第 3 节已经给出概念链。这里才补 handler、key 和 lister 的 Go 写法。
 
-这段只回答：Deployment controller 在启动时登记了哪些对象变化回调？
+这段只回答：Deployment controller 在启动时登记了哪些对象变化回调？这里的 `handler` 就是“对象变化时要执行的回调函数”。
+
+先认清代码里的现成变量：`dInformer`、`rsInformer`、`podInformer` 是构造函数收到的三类对象监听器；`logger` 是日志记录器；`dc` 是正在组装的 Deployment controller。它们都在这段摘录之前已经准备好。
+
+`tombstone` 可以理解成“删除通知的包装盒”：对象已经从本地 cache 消失时，它尽量保留最后看到的旧对象，方便 controller 判断这个对象原来归谁管理。
 
 文件：
 
@@ -3209,7 +3300,7 @@ dInformer.Informer().AddEventHandler(cache.ResourceEventHandlerFuncs{
 	UpdateFunc: func(oldObj, newObj interface{}) {
 		dc.updateDeployment(logger, oldObj, newObj)
 	},
-	// 删除时可能收到对象，也可能收到 tombstone 包装。
+	// 删除时可能收到对象，也可能收到上面解释过的 tombstone 删除包装。
 	DeleteFunc: func(obj interface{}) {
 		dc.deleteDeployment(logger, obj)
 	},
@@ -3309,6 +3400,10 @@ scaleReplicaSet
 
 这段只回答：同一个 key 被重复处理时，已有 RS 为什么不会每次都再加一个副本？
 
+`forceUpdate` 是调用方传进来的布尔参数，不是 RS 对象上的字段；普通“目标没变就不写”路径先按 `false` 理解。这里的 annotation 是 `metadata.annotations` 中供 controller 保存 desired/max replicas 等辅助信息的键值记录。
+
+【连续摘录】下面保留同一函数里相邻的判断与 Update 主干；函数结尾和 Event 记录没有展示，因此不能当作完整函数复制：
+
 ```go
 // 非强制更新时，当前 RS 目标已经等于 newScale，就不再写 API。
 if !forceUpdate && *(rs.Spec.Replicas) == newScale {
@@ -3334,9 +3429,7 @@ if sizeNeedsUpdate || annotationsNeedUpdate {
 }
 ```
 
-上面保留了 early return、两个更新条件和 API Update。为了聚焦副本
-目标，省略了 `scaled` 标记、Kubernetes Event 记录和统一返回，
-不可直接复制成完整函数。
+上面保留了 early return、两个更新条件和 API Update。为了聚焦副本目标，省略了 `scaled` 标记、Kubernetes Event 记录和统一返回，所以它是连续主干摘录，不是完整函数。
 
 **大白话总结：**
 
@@ -3369,6 +3462,8 @@ manageReplicas
 diff := len(activePods) - int(*(rs.Spec.Replicas))
 ```
 
+这里 `len(activePods)` 返回 Go 的 `int`，而 `RS.spec.replicas` 是 `*int32`。源码先用 `*` 取出副本数，再用 `int(...)` 转成同一种整数类型，才能相减；这一步没有改变副本数的含义。
+
 代入数字：
 
 ```text
@@ -3381,7 +3476,12 @@ diff=4-3=1
   → 多 1 个，需要删除
 ```
 
-真实函数还包含 expectations、批量慢启动、并发删除和错误处理。
+真实函数还包含三项第二遍机制：
+
+- `expectations`：controller 本机的临时待确认账，记录“创建或删除请求已经发出，但 informer 还没看见结果”，避免反馈慢时重复操作；
+- `slowStartBatch`：大量创建 Pod 时先发小批，成功后逐步放大；前一批大量失败时，不继续猛发请求；
+- `ownerReference`：写进 Pod `metadata` 的归属记录，说明这个 Pod 由哪个 RS 管理；它不是组件之间的一次函数调用。
+
 为了不伪造一段可以复制的连续函数，下面只展示两个真实调用落点。
 
 `diff<0` 时，源码先把负数转成缺少数量，并在
@@ -3394,7 +3494,7 @@ err := rsc.podControl.CreatePods(
 	rs.Namespace,                                           // RS 所在 namespace。
 	&rs.Spec.Template,                                      // RS 保存的 Pod 模板。
 	rs,                                                     // 当前 owner 对象。
-	metav1.NewControllerRef(rs, rsc.GroupVersionKind),      // owner reference。
+	metav1.NewControllerRef(rs, rsc.GroupVersionKind),      // 生成上面解释的 ownerReference 归属记录。
 )
 ```
 
