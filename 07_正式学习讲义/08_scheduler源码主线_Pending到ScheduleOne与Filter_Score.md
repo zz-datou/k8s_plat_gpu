@@ -19,13 +19,15 @@
   -> 最后回到 Java 生产证据与 GPU 短映射
 ```
 
-整章贯穿的中心命题是：
+先用一句大白话说清本课：
 
-> **调度不是“找一台看起来空闲的机器”，而是在一份不断变化的集群账本上，先排除所有不安全的 Node，再从可行 Node 中选择更合适的一个，并用 Assume 保护尚未完成的异步绑定。**
+> **Node 只剩 `1500m` 可以继续承诺，而新 Pod 要 `2000m`。scheduler 宁愿让它继续 Pending，也不能因为机器此刻看起来很闲，就把一份将来可能兑现不了的 CPU 承诺交出去。**
+
+后面才把这句话换成源码术语：scheduler 先用 Filter 淘汰不安全的 Node；有可行 Node 时才用 Score 比较偏好。真正写入 API Server 前，它还会先做 Assume——也就是在自己内存里暂时记下“这份资源已经答应给这个 Pod”，避免异步绑定期间重复许诺。
 
 ## 0. 本课定位与边界
 
-第 08 课属于平台 Kubernetes 的 scheduler 深读，源码深度是 S3。现阶段统一用你熟悉的 Java 平台故障进入源码，GPU 只做简短迁移。
+第 08 课属于平台 Kubernetes 的 scheduler 深读，源码深度是 S3。这里的 S3 不是“尽量多贴源码”，而是：首遍读懂主判断，第二遍再跟住等待、失败和撤销过程。现阶段统一用你熟悉的 Java 平台故障进入源码，GPU 只做简短迁移。
 
 本课会讲：
 
@@ -35,32 +37,49 @@
 - 0、1、多个可行 Node 为什么走不同分支；
 - 为什么 scheduling cycle 串行，而 binding cycle 可以并发；
 - 为什么“当前没有可行 Node”是正常调度结果，不等于 scheduler 进程故障；
-- 遇到的 Go 函数字段、短路判断、类型断言、context 和 goroutine；
+- 遇到的 Go 函数字段、短路判断和类型断言；第二遍再认识 context（传递取消、截止时间和本轮上下文）与 goroutine（轻量并发任务）；
 - 最后用一个小节说明相同框架怎样迁移到 GPU。
 
 本课不展开：
 
 - NodeResourcesFit 汇总 init container、app container 和 Pod-level resources 的全部细节；
 - DefaultPreemption 怎样挑选候选 Node 和 victim；
-- scheduler PodGroup、Extender、DRA、OpportunisticBatching 和并行 Filter 实现；
+  这里的 victim 是“为了给更高优先级 Pod 腾位置，可能被抢占的低优先级 Pod”；
+- PodGroup（把一批 Pod 当成一个整体）、Extender（外部调度扩展）、DRA（动态资源分配）、OpportunisticBatching（机会式批处理）和并行 Filter 的实现；
 - Driver、CUDA、Device Plugin、DeviceManager 等 GPU 专属链路。
 
 这些分别放在第 09、10、14～17 课，不会打断本课的 scheduler 主线。
 
-建议分两遍读，不要第一次就把每个旁支都背下来：
+本章不适合从第 1 行顺着读到最后，明确分成两遍：
 
-- **首遍读主干：** 读到 5～13 节，先回答“Pod 怎样入队、怎样 Filter/Score、为什么先 Assume 再 Bind”；11.2 的并行 Filter 明确先跳过。
-- **二遍补边界：** 再看 Error/Rejected 分流、Permit 等待和 binding failure 补偿；遇到 Go 写法卡住，直接回查第 16 节语法索引，不需要先系统学完整本 Go 教程。
+```text
+第一遍主线
+2～4：先手算为什么三个 Node 都放不下
+3.1：把手算结果对到第一段核心源码
+9～10：看“0 个可行 Node”怎样变成 FitError
+11.3：只看完整 Filter 怎样包装资源不足原因
+12.1～12.2：用反事实理解有可行 Node 时的 Score、Assume
+13～14：回到生产证据，并做一次 GPU 短映射
+
+第二遍实现
+5.3～8：Pod 怎样入队、取队列、刷新 snapshot
+11.1～11.2：PreFilter 和并行 Filter 的完整边界
+12.3～12.4：Permit、Bind 失败和撤销
+```
+
+第一遍先牢牢记住：**本案例真实走的是 Filter 失败路径，没有走到 Score、Assume 和 Bind。** 后三者是为了回答“如果以后出现可行 Node，会继续发生什么”。
+
+遇到 Go 写法卡住，查第 16 节语法索引；不需要先系统学完整本 Go 教程。
 
 ## 1. 当前源码基线
 
 ```text
-源码目录：<KUBERNETES_SRC>
+本地核对目录：D:\datou\devops\kubernetes-master\kubernetes
 commit：301946d15e67a4a2e8a5fb8292eb836acd366d78
 describe：v1.37.0-alpha.0-280-g301946d15e6
 ```
 
-本篇按当前 master 快照定位。生产排障时必须切换到目标集群对应的 tag/branch，不能记死行号。
+本篇按上述固定快照完成静态源码核对。没有运行 scheduler Go 测试，所以本文只声明“源码路径和控制流已核对”，不把它写成“测试已经通过”。生产排障时必须切换到目标集群对应的 tag/branch，不能记死行号。
 
 主要文件：
 
@@ -116,9 +135,14 @@ Pod request > 剩余可承诺 CPU
 
 它不使用 `kubectl top` 的实时 CPU usage 做这个判断。机器此刻只有 10% CPU 利用率，也可能因为 requests 账本已经预订到很高而拒绝新 Pod。
 
-这里的“已分配 request”也不能机械理解成某一刻 `kubectl describe node` 输出中的静态数字。scheduler 本轮使用的是自己的 cache/snapshot；正式 Bind 尚未写进 API 时，已经 Assume 的 Pod 也会先进入 scheduler 内存账本，防止下一轮重复许诺同一份资源。
+这里的“已分配 request”也不能机械理解成某一刻 `kubectl describe node` 输出中的静态数字。先把两个词翻成人话：
 
-为了先读通控制流，第 08 课把 admission 处理后的整个 Pod 有效 request 抽象成：
+- `cache`：scheduler 自己维护的一本内存账，不必每次计算都重新请求 API Server；
+- `snapshot`：本轮调度拿来比较各 Node 的内存视图，可以理解成“这一轮计算使用的账本快照”。
+
+正式 Bind 尚未写进 API 时，已经 Assume 的 Pod 也会先进入这本内存账，防止下一轮重复许诺同一份资源。
+
+为了先读通控制流，第 08 课把经过 API defaulting 与 admission 后的整个 Pod 有效 request 抽象成。两者都发生在 scheduler 看到 Pod 之前，但不是同一步：defaulting 是“省略字段时按 API 规则补默认值”；admission 是“对象保存前，由准入插件继续检查或修改”：
 
 ```text
 effective Pod request:
@@ -241,7 +265,49 @@ worker-05   800m         10%
 如果以后选出了 Node，但 API Bind 还没完成，下一轮怎样避免重复使用同一份容量？
 ```
 
-第 6～12 节会让源码逐个回答；真正值班时怎样用命令验证这些变量，放到第 13 节再讲。
+第一遍先让最短的一段源码回答 CPU 公式；更完整的调用链随后再读。真正值班时怎样用命令验证这些变量，放到第 13 节再讲。
+
+### 3.1 第一段源码先只回答：为什么这台 Node 是 `Insufficient cpu`
+
+这段先不讲队列、锁和异步 Bind。只把白板上的三个数对到源码变量：
+
+```text
+podRequest.MilliCPU = 2000
+nodeInfo.Allocatable.MilliCPU = 7500
+nodeInfo.Requested.MilliCPU = 6000
+```
+
+文件：`pkg/scheduler/framework/plugins/noderesources/fit.go`  
+函数：`fitsRequest`  
+摘录类型：**连续摘录，教学注释版**。这里只保留 CPU 判断和追加失败原因的相邻代码；同一函数前后还会处理 Pod 数量上限、零资源快速返回、memory、临时存储和其他标量资源，因此本段不能独立复制编译。
+
+```go
+// Pod 确实申请了 CPU，并且申请量超过 Node 剩余可承诺 CPU 时，CPU 这一关失败。
+if podRequest.MilliCPU > 0 && podRequest.MilliCPU > (nodeInfo.GetAllocatable().GetMilliCPU()-nodeInfo.GetRequested().GetMilliCPU()) {
+	// 把“CPU 不足”作为一条结构化原因追加到结果列表。
+	insufficientResources = append(insufficientResources, InsufficientResource{
+		ResourceName: v1.ResourceCPU,                          // 哪种资源不够：CPU。
+		Reason:       "Insufficient cpu",                      // 后续诊断使用的人话原因。
+		Requested:    podRequest.MilliCPU,                     // 新 Pod 需要 2000m。
+		Used:         nodeInfo.GetRequested().GetMilliCPU(),   // 内存账里已经承诺 6000m。
+		Capacity:     nodeInfo.GetAllocatable().GetMilliCPU(), // Node 总共可承诺 7500m。
+		Unresolvable: podRequest.MilliCPU > nodeInfo.GetAllocatable().GetMilliCPU(), // 清空这台 Node 仍放不下吗。
+	})
+}
+```
+
+**大白话总结：**
+
+```text
+输入：Pod 要 2000m，Node 总账 7500m，已经承诺 6000m。
+判断：2000m > 7500m - 6000m。
+动作：把 Insufficient cpu 放进失败原因列表。
+结果：这台 Node 不能进入可行 Node 集合。
+```
+
+`Unresolvable=false`，因为 `2000m < 7500m`：如果以后释放足够 request，CPU 这一关理论上可以通过；taint、affinity 等其他硬约束仍要分别检查。它不是“把整台 Node 清空也放不下”。
+
+**顺手学 Go：** `slice` 可以先理解成“可增长的列表”。`&&` 表示“两个条件都成立”；它会短路，左边为假时不再计算右边。`append(slice, value)` 会返回追加后的 slice，所以结果要重新赋回 `insufficientResources`。
 
 ## 4. 先从证据判断责任层
 
@@ -260,6 +326,41 @@ worker-05   800m         10%
 本课的重点不是背这些命令，而是把每条证据对应回 scheduler 的函数、分支和返回值。
 
 本案例为什么仍然可以确认“没有选出可行 Node”？因为 `NODE=<none>` 不是孤证：它同时伴随 `PodScheduled=False`、持续的 `FailedScheduling` 和三个 Node 的 `Insufficient cpu`。这些证据共同指向 Filter 后可行集合为空，而不是短暂卡在异步 Bind。
+
+先把“本次真的发生了什么”和“正常成功时还会发生什么”分开：
+
+**第一张图从上往下读，只画本次事故真实走过的失败路径。方框是处理阶段，箭头文字是这一步产生的结果。**
+
+```mermaid
+flowchart TD
+    A["未绑定的 game-api Pod"] --> B["NodeResourcesFit 检查 3 台 Node"]
+    B --> C["3 台都只有 1500m<br/>Pod 需要 2000m"]
+    C --> D["可行 Node 数量 = 0"]
+    D --> E["返回 FitError"]
+    E --> F["PostFilter 尝试抢占"]
+    F --> G["没有合适 victim"]
+    G --> H["FailureHandler 记录结果<br/>Pod 继续 Pending"]
+```
+
+**第二张图从左往右读，是反事实成功路径：假设以后释放 CPU，出现了可行 Node。方框仍是阶段，实线箭头表示顺序推进。**
+
+```mermaid
+flowchart LR
+    F1["Filter<br/>先判断能不能放"] --> S1["Score<br/>再比较更喜欢哪台"]
+    S1 --> H1["SuggestedHost<br/>只是算出候选 Node"]
+    H1 --> A1["Assume<br/>scheduler 内存先占账"]
+    A1 --> B1["Bind 成功<br/>API 写入 spec.nodeName"]
+```
+
+中间最容易误判的状态变化是：
+
+```text
+刚算出 SuggestedHost：API 中 spec.nodeName 仍为空
+  -> Assume 完成：scheduler 内存已经占账，API 中仍可能为空
+  -> Bind 成功：API 中 spec.nodeName 才真正写成目标 Node
+```
+
+所以，`NODE=<none>` 单独一条证据，既可能表示还没选出 Node，也可能表示已经 Assume、正在等待 Bind。必须结合 Condition、Event 和持续时间判断。
 
 ## 5. 先看 scheduler 总地图
 
@@ -280,14 +381,20 @@ PreFilter：只和 Pod 或候选集合有关的准备，尽量只算一次
 Filter：逐 Node 判断硬约束
 PostFilter：当前无解时，尝试为未来一次调度创造条件
 PreScore / Score：只比较已经可行的 Node
-Reserve / Unreserve：插件资源的临时占用与补偿
+Reserve / Unreserve：插件资源的临时占用与撤销
 Permit：在正式绑定前批准、等待或拒绝
+PreBindPreFlight：正式 PreBind 前，先轻量询问插件是否需要工作
 PreBind / Bind / PostBind：提交前准备、正式绑定、成功后通知
 ```
 
-这套设计的代价是调用链变长；收益是核心保持稳定，插件能共享 `CycleState`，并且每个可能失败的阶段都有明确的停止或回滚边界。
+这套设计的代价是调用链变长；收益是核心保持稳定，插件能共享 `CycleState`。这里的 `CycleState` 是“这一个 Pod 的本轮调度临时记事本”：PreFilter 算好的结果可以写进去，后面的 Filter、Score 等阶段再读取。每个可能失败的阶段也因此有明确的停止或撤销边界。
 
-### 5.2 普通 Java Pod 的主地图
+### 5.2 【第二遍展开】完整 scheduler 地图
+
+首遍看第 4 节的两张短图就够了。下面这张图从上往下读：方框表示阶段或内部状态，实线表示本轮继续执行，失败分支最终汇入 FailureHandler。它把队列、Permit 和绑定失败补偿全部放在一起，所以只在第二遍展开。
+
+<details>
+<summary><strong>展开完整 scheduler 调用与失败补偿图</strong></summary>
 
 ```mermaid
 flowchart TD
@@ -334,9 +441,15 @@ flowchart TD
 
 这样 scheduler 不必等较慢的 API Bind 完成，就能继续处理后面的 Pod，同时又不会把相同资源重复许诺出去。
 
-### 5.3 不是所有 Pod Add 事件都应该进入调度队列
+</details>
 
-文件：`kubernetes/pkg/scheduler/eventhandlers.go`。下面是 `addPod` 完整控制分支的教学注释版：
+### 5.3 【第二遍】不是所有 Pod Add 事件都应该进入调度队列
+
+> 第一遍只要知道“未绑定、并且归当前 scheduler 负责的 Pod 才进入待办队列”。本节才展开对象变化回调和 profile。这里的 `profile` 是由 Pod 的 `schedulerName` 选中的一套调度插件配置。
+
+文件：`kubernetes/pkg/scheduler/eventhandlers.go`。这里的 informer 可以先理解成“持续接收 API 对象变化，并在 scheduler 本机维护对象副本的机制”；它触发的 Add 回调只是通知，不是 `kubectl get events` 看到的 Kubernetes Event 记录。
+
+下面是 `addPod` **完整函数，教学注释版**：
 
 ```go
 // 定义 Scheduler 处理 Pod Add 事件的方法；obj 先以通用接口类型传进来。
@@ -364,9 +477,11 @@ func (sched *Scheduler) addPod(obj interface{}) {
 
 **大白话总结：** Pod Add 事件只是入口。已经绑定的 Pod 用来更新资源账本；尚未绑定、并且明确由当前 scheduler 负责的 Pod，才会进入 scheduling queue。一个自定义 scheduler 的 Pod 不应被 default-scheduler 抢走。
 
-**顺手学 Go：** `func (sched *Scheduler)` 中的 `sched` 可暂时类比 Java 的 `this`；`obj.(*v1.Pod)` 是安全类型断言，第二个返回值 `ok=false` 时不会 panic；`else if` 表示只有前面的“已绑定”条件不成立，才继续判断当前 scheduler 是否负责。
+**顺手学 Go：** `func (sched *Scheduler)` 中，`sched` 是 receiver，可以暂时类比 Java 的 `this`；但 Go 没有 Java class 和继承。`*Scheduler` 表示“指向 Scheduler 值的指针”，所以方法可以读写同一个 scheduler 对象。`obj.(*v1.Pod)` 是安全类型断言，第二个返回值 `ok=false` 时不会 panic；`else if` 表示只有前面的条件不成立，才继续判断。
 
-`addPodToSchedulingQueue` 最终调用 `SchedulingQueue.Add`。当前源码还有 PodGroup/Gang 相关旁支，本课主案例没有启用这些能力，只先跟进入普通队列的调用：
+`addPodToSchedulingQueue` 最终调用 `SchedulingQueue.Add`。
+
+摘录类型：**连续中段，教学注释版**。它省略了函数开头的指标 `defer`，也没有展示 `SchedulingQueue.Add` 之后的 GangScheduling 尾支；主案例不使用 GangScheduling，因此这些省略不改变“普通 Pod 被交给队列”的结论。
 
 ```go
 // addPodToSchedulingQueue 先从 Scheduler 取出自己的 logger。
@@ -381,7 +496,9 @@ sched.SchedulingQueue.Add(klog.NewContext(context.Background(), logger), pod)
 
 **大白话总结：** event handler 不负责选 Node，它只把“这个 Pod 需要调度”交给队列。真正的排队资格还要经过 `PriorityQueue.Add` 内部的 PreEnqueue 检查。
 
-### 5.4 `SchedulingQueue.Add` 为什么不是无条件进入 `activeQ`
+### 5.4 【第二遍】`SchedulingQueue.Add` 为什么不是无条件进入 `activeQ`
+
+> `activeQ` 是“现在可以尝试调度的队列”；`backoffQ` 是“失败后先等一会儿再试的队列”。队列锁和 closure 只在第二遍读。
 
 文件：`kubernetes/pkg/scheduler/backend/queue/scheduling_queue.go`。`PriorityQueue.Add` 的完整函数很短：
 
@@ -465,7 +582,9 @@ func (p *PriorityQueue) moveToActiveQ(logger klog.Logger, pInfo *framework.Queue
 
 **顺手学 Go：** `defer` 表示把函数安排到当前函数返回前执行；`if added := call(); added` 把调用和布尔判断写在一起，`added` 只在这个 `if` 中有效；`!skipPreEnqueue` 中 `!` 表示取反。
 
-## 6. ScheduleOne：调度循环怎样从 `activeQ` 取一个任务
+## 6. 【第二遍】ScheduleOne：调度循环怎样从 `activeQ` 取一个任务
+
+> 本节的 `in-flight` 表示“已经从队列取出、当前正在处理”。首遍不要求跟锁、函数值和清理时机；只要知道 scheduler 一次取一个普通 Pod 进入 scheduling cycle。
 
 ### 6.1 为什么 scheduling cycle 是串行入口
 
@@ -643,6 +762,7 @@ func (sched *Scheduler) schedulingCycle(
 	// 把 scheduler cache 当前内容更新到本轮只读 NodeInfo snapshot。
 	if err := sched.Cache.UpdateSnapshot(klog.FromContext(ctx), sched.nodeInfoSnapshot); err != nil {
 		// snapshot 失败属于内部 Error；同时清空旧的 nominated node 意图。
+		// nominated node 是抢占流程暂记的候选 Node，不是正式 Bind。
 		return ScheduleResult{nominatingInfo: clearNominatedNode}, podInfo, fwk.AsStatus(err)
 	}
 
@@ -678,6 +798,37 @@ func (sched *Scheduler) schedulingCycle(
 | `prepareForBindingCycle` | Assume、Reserve、Permit | 失败时撤销相应临时状态 |
 
 主案例实际停在第二道门：三个 Node 都 Filter 失败，所以不会产生 assumed Pod，更不会进入 Bind。
+
+在继续读 `FitError` 前，先看一张**简化返回传播卡**。它省略了 framework runner 等中间调用，只保留值班时需要追的结果层次。**从上往下读；每一层都在整理上一层的结果。**
+
+```text
+NodeResourcesFit.Filter
+  返回“这台 Node 为什么不合适”
+        ↓
+findNodesThatFitPod
+  记录哪些 Node 失败、各自失败原因
+        ↓
+schedulePod
+  发现可行 Node 数量为 0，生成 FitError
+        ↓
+schedulingAlgorithm / schedulingCycle
+  保留这次“没有位置”的结果
+        ↓
+FailureHandler
+  记录诊断，并决定 Pod 后面怎样再次尝试
+```
+
+先用一张短表防止把所有 `nil` 和非 Success 都读成错误：
+
+| 返回现象 | 大白话 | 是否表示程序出错 |
+|---|---|---|
+| 队列关闭后 `NextPod` 返回 `nil, nil` | scheduler 正常结束取任务循环 | 否 |
+| framework 的 `nil Status` | 这一阶段成功 | 否 |
+| 多个可行候选，但没有 Score 插件和 extender | 候选同分，走 `prioritizeNodes` 快速路径 | 否 |
+| `FitError` | 有 Node，但当前一个都放不下 | 否 |
+| framework `Error` | 插件或 scheduler 执行异常 | 是 |
+| PostFilter 自己出错 | 当前实现记录它的错误，但对外仍保留原 FitError | 内部有错，外层看到的仍是原无解结果 |
+| PostBind | 成功后的通知阶段，本身没有 Status 返回值 | 不适用 |
 
 ## 9. `schedulingAlgorithm`：为什么 FitError 不是 scheduler 崩了
 
@@ -823,7 +974,8 @@ func (sched *Scheduler) schedulePod(ctx context.Context, fwk framework.Framework
 
 	// 多个可行 Node 进入 prioritizeNodes；默认 profile 会运行 PreScore/Score。
 	priorityList, err := prioritizeNodes(ctx, sched.Extenders, fwk, state, pod, feasibleNodes)
-	// 评分插件或 extender 执行失败时，不能继续从不完整分数中选 Node。
+	// 这里能向上返回的是 PreScore/Score 等框架评分错误；不能从不完整框架分数里选 Node。
+	// 单个 extender 的 Prioritize 错误会在 prioritizeNodes 内部被记录并忽略，不会从这里返回。
 	if err != nil {
 		return result, err
 	}
@@ -895,15 +1047,18 @@ func (sched *Scheduler) schedulePod(ctx context.Context, fwk framework.Framework
 
 ### 10.2 SuggestedHost 还不是正式 Bind
 
-`schedulePod` 返回：
+`schedulePod` 返回。
+
+摘录类型：**连续摘录，教学注释版**。这是完整函数末尾的真实 `return`，不是单独构造结构体的伪代码：
 
 ```go
-// schedulePod 返回的是算法结果结构体，不是已经写入 API 的 Pod。
-ScheduleResult{
+// 返回算法结果和 err；前面的判断已经确认这里的 err 是 nil。
+// 这仍只是建议 Node，不是已经写入 API 的 Pod。
+return ScheduleResult{
 	SuggestedHost:  node,                                             // 本轮建议的 Node。
 	EvaluatedNodes: len(feasibleNodes) + diagnosis.NodeToStatus.Len(), // 检查过多少 Node。
 	FeasibleNodes:  len(feasibleNodes),                               // 本轮收集到多少可行 Node。
-}
+}, err
 ```
 
 **大白话总结：** `SuggestedHost` 只是“算法决定把它放哪”。它还没有证明 scheduler cache 已占账，更没有证明 API Server 已写入 `spec.nodeName`。
@@ -1068,7 +1223,7 @@ checkNode := func(i int) {
 
 ### 11.3 `Insufficient cpu` 最终来自哪个判断
 
-NodeResourcesFit 的 Filter 位于 `kubernetes/pkg/scheduler/framework/plugins/noderesources/fit.go`。它先从 CycleState 读取 PreFilter 结果，再把资源不足列表变成 framework Status：
+NodeResourcesFit 的 Filter 位于 `kubernetes/pkg/scheduler/framework/plugins/noderesources/fit.go`。这里的 framework Status 可以理解成“插件交回的一张结果卡”：写明成功、当前不适合，还是程序执行出错，并附带原因。它先从 CycleState 读取 PreFilter 结果，再把资源不足列表变成 Status：
 
 ```go
 // 对一台 Node 执行 NodeResourcesFit 硬约束检查。
@@ -1117,26 +1272,9 @@ func (f *Fit) Filter(ctx context.Context, cycleState fwk.CycleState, pod *v1.Pod
 
 **顺手学 Go：** `failureReasons...` 不是“此处省略源码”。这是 Go 的 variadic 展开：把 `[]string` 中的每个元素依次作为 `NewStatus` 的可变参数传入。
 
-CPU 分支的完整字段如下：
+CPU 数字比较已经在第 3.1 节作为首段源码逐行读过。这里补上它怎样被完整 `Filter` 包装：`fitsRequest` 返回结构化列表，`Filter` 再把原因整理成 framework Status。
 
-```go
-// 只有 Pod 确实请求了 CPU，并且请求大于 Node 剩余可承诺 CPU 时才失败。
-if podRequest.MilliCPU > 0 && podRequest.MilliCPU > (nodeInfo.GetAllocatable().GetMilliCPU()-nodeInfo.GetRequested().GetMilliCPU()) {
-	// 把这次 CPU 不足追加到资源失败列表。
-	insufficientResources = append(insufficientResources, InsufficientResource{
-		ResourceName: v1.ResourceCPU,                              // 失败资源是 CPU。
-		Reason:       "Insufficient cpu",                          // 最终诊断使用的原因文本。
-		Requested:    podRequest.MilliCPU,                          // 新 Pod 请求多少毫核。
-		Used:         nodeInfo.GetRequested().GetMilliCPU(),        // scheduler 账本已承诺多少毫核。
-		Capacity:     nodeInfo.GetAllocatable().GetMilliCPU(),      // Node 可承诺总量。
-		Unresolvable: podRequest.MilliCPU > nodeInfo.GetAllocatable().GetMilliCPU(), // 清空 Node 也放不下吗。
-	})
-}
-```
-
-**大白话总结：** 本例代入就是 `2000 > 7500 - 6000`，所以三个 Node 都追加 `Insufficient cpu`。`Unresolvable=false`，因为 `2000 < 7500`：释放足够资源理论上可解决；只是当前没有合适的低优先级 victim。
-
-**顺手学 Go：** `&&` 是短路“并且”；`append(slice, value)` 返回追加后的 slice，所以要重新赋回 `insufficientResources`；`InsufficientResource{Field: value}` 是结构体字面量；最后一个布尔表达式直接成为 `Unresolvable` 字段值。
+这里的 `UnschedulableAndUnresolvable` 可以读成“当前不是腾出几个低优先级 Pod 就能解决”。例如 Pod 自己要 `8000m`，而 Node 总共只有 `7500m`，清空 Node 也放不下。本案例只要 `2000m`，所以是普通 `Unschedulable`。
 
 还要记住：`nodeInfo.GetRequested()` 来自 scheduler 的本轮内存视图，可能已经包含尚未正式 Bind、但已经 Assume 的 Pod；它不保证与同一瞬间 `kubectl describe node` 的展示完全相同。
 
@@ -1175,7 +1313,9 @@ if !scoreStatus.IsSuccess() {
 }
 ```
 
-真实函数在这之后还会记录详细分数，并按需合并 extender 分数；这些旁支结束后，函数最后用下面这一行把最终结果交还给 `schedulePod`。这行与上面的代码不是连续摘录，特意单列是为了把“分数去了哪里”闭环：
+真实函数在这之后还会记录详细分数，并按需合并 extender 分数。这里有一个容易讲反的边界：PreScore 或 Score 插件失败会向上返回 error；单个 extender 的 `Prioritize` 失败则只记录日志，并忽略这个 extender 本轮的分数，其他评分仍可继续。
+
+这些旁支结束后，函数最后用下面这一行把最终结果交还给 `schedulePod`。这行与上面的代码不是连续摘录，特意单列是为了把“分数去了哪里”闭环：
 
 ```go
 // 日志与 extender 分数合并结束后，把最终 Node 分数返回给 schedulePod。
@@ -1316,7 +1456,7 @@ if runPermitStatus.IsWait() {
 
 **大白话总结：** Permit=Wait 不是失败，它把 assumed Pod 连同各个 Wait 插件自己的等待时限登记起来；不是大家统一等一个“最长时间”。后续任一等待条件拒绝或超时，都可能结束等待。Permit 直接拒绝或 Error 时，则必须先把临时占账撤掉。真正阻塞等结果发生在 binding cycle 的 `WaitOnPermit`。
 
-**顺手学 Go：** `else if` 只有前一个条件不成立时才判断；`pluginsWaitTime, runPermitStatus := ...` 是两个返回值；`fitErr := &framework.FitError{...}` 创建的局部变量只在当前分支后续代码中使用。
+**顺手学 Go：** `map` 可以先理解成“键到值的表”；这里的 `pluginsWaitTime` 就按插件名保存等待时限。`else if` 只有前一个条件不成立时才判断；`pluginsWaitTime, runPermitStatus := ...` 是两个返回值；`fitErr := &framework.FitError{...}` 创建的局部变量只在当前分支后续代码中使用。
 
 ### 12.4 Bind 失败为什么必须 Unreserve + Forget
 
@@ -1345,7 +1485,8 @@ var preFlightStatus *fwk.Status
 // 特性开关开启时，先做正式 PreBind 前的轻量预检。
 if sched.nominatedNodeNameForExpectationEnabled {
 	preFlightStatus = schedFramework.RunPreBindPreFlights(ctx, state, assumedPod, scheduleResult.SuggestedHost)
-	// Error 或 Rejected 都直接结束 bindingCycle，交给外层统一补偿。
+	// 正常合同只允许 Success、Skip、Error；其他非法状态会被框架转换成 Error。
+	// IsRejected 仍作为防御性保护保留，不能据此理解成“正常会返回 Rejected”。
 	if preFlightStatus.Code() == fwk.Error || preFlightStatus.IsRejected() {
 		return preFlightStatus
 	}
@@ -1368,8 +1509,8 @@ if status := schedFramework.WaitOnPermit(ctx, assumedPod); !status.IsSuccess() {
 	}
 	return status // 其他 Error 保留原 Status 返回。
 }
-// Permit 是最后一个还能把 Pod 分类为 Unschedulable 的扩展点；之后释放队列 in-flight 记录。
-sched.SchedulingQueue.Done(assumedPod.UID)
+// Permit 是最后一个还能按“等待集群事实变化”分类为 Unschedulable 的扩展点。
+sched.SchedulingQueue.Done(assumedPod.UID) // 之后结束队列 in-flight 记录。
 // 运行正式绑定前的插件；任何非 Success Status 都原样返回并进入统一补偿。
 if status := schedFramework.RunPreBindPlugins(ctx, state, assumedPod, scheduleResult.SuggestedHost); !status.IsSuccess() {
 	return status
@@ -1382,9 +1523,15 @@ if status := sched.bind(ctx, schedFramework, assumedPod, scheduleResult.Suggeste
 schedFramework.RunPostBindPlugins(ctx, state, assumedPod, scheduleResult.SuggestedHost)
 ```
 
-当前 master 在 PreBind 附近还有 nominated node 更新与 preemption 保护 bookkeeping；上面是从同一函数抽出的控制检查点，不是可独立复制编译的完整函数。`RunPreBindPreFlights` 返回 Error 或 Rejected 时也会立刻返回，外层 `runBindingCycle` 随即调用同一套 `handleBindingCycleError`，因此它同样不能漏掉补偿。
+当前 master 在 PreBind 附近还有 nominated node 更新与 preemption 保护 bookkeeping（内部记账和收尾处理）；上面是从同一函数抽出的控制检查点，不是可独立复制编译的完整函数。
 
-失败后，普通 Pod 的 `unreserveAndForget` 核心动作是：
+`RunPreBindPreFlights` 的正常合同只有 `Success / Skip / Error`。插件若返回 `Unschedulable` 等其他状态，framework runtime 会先把它转换成 `Error`；源码里的 `IsRejected()` 是防御性保护，不代表 Rejected 是这个扩展点的正常返回类别。无论如何，只要 binding cycle 没成功，外层都会进入同一套补偿。
+
+“Permit 是最后一个还能分类为 Unschedulable”说的是**队列语义**：Permit 之前的正常不可调度结果可以等待相关集群变化再唤醒。队列记录 `Done` 之后，PreBind 或 Bind 失败会进入 `backoffQ` 做错误退避重试，不再按同一种 Unschedulable 事件唤醒路径处理。
+
+失败后，普通 Pod 的 `unreserveAndForget` 核心动作如下。
+
+摘录类型：**非连续的普通 Pod 控制路径，教学注释版**。前两行和最后的 `ForgetPod` 在真实函数中间隔着 PodGroup 分支；本案例不是 PodGroup，所以把普通 Pod 路径并排展示，但不能当作完整连续函数复制：
 
 ```go
 // 从 binding context 取得 logger，供 ForgetPod 报错时补充日志上下文。
@@ -1476,7 +1623,7 @@ kubectl top node worker-05
 1. 核对 Pod 最终生效的 requests，包括 LimitRange 或其他默认注入。
 2. 查看所有候选 Node 的 allocatable 和 Allocated resources。
 3. 判断是 requests 配置偏大、其他工作负载占用账本，还是集群确实缺容量。
-4. 结合 Java 应用的历史 p95/p99 使用量、启动峰值和 GC 行为，评估 request 是否合理；不要只为让 Pod 调度成功而盲目下调。
+4. 结合 Java 应用的历史 p95/p99 使用量（分别表示 95%/99% 的观测值不超过哪个水平）、启动峰值和 GC 行为，评估 request 是否合理；不要只为让 Pod 调度成功而盲目下调。
 5. 可选动作包括释放非关键工作负载、扩 Node、调整发布窗口，或评估 `maxUnavailable=1` 是否可以先退出一个旧副本。
 
 两个常见误区：
@@ -1506,28 +1653,30 @@ scheduler 选择 GPU Node，不选择具体 GPU UUID
 
 第 09 课会在读懂 CPU/memory request 计算后，再把同一个 `fitsRequest` 扩展到 `nvidia.com/gpu`；Driver、Device Plugin 和 UUID 分配留在冻结后的专项章节。
 
-## 15. 本章哪些要读深，哪些先略过
+## 15. 本章哪些首遍必须会，哪些放到第二遍
 
-必须掌握：
+### 15.1 首遍通过线
 
-- 从 `Pending/NODE=<none>/FailedScheduling` 反查 scheduler 责任层；
-- `addPod -> PreEnqueue -> activeQ -> ScheduleOne -> scheduleOnePod`；
-- `schedulingCycle`、`schedulingAlgorithm`、`schedulePod` 的职责边界；
-- PreFilter、Filter、Score 的先后关系；
-- 0、1、多个可行 Node 的不同分支；
-- FitError 为什么可能触发 PostFilter；
-- SuggestedHost、Assume 和正式 Bind 不是一回事；
-- Reserve、Permit、PreBindPreFlight、PreBind 或 Bind 失败为什么必须 Unreserve/Forget；
-- 为什么 `NODE=<none>` 不能单独证明“尚未选点”；
-- request 账本与实时 usage 的区别。
+第一遍结束时，能用自己的话回答下面六点就可以进入第 09 课：
 
-首遍只认入口：
+1. 为什么 `800m` 实时使用率不能推翻 `Insufficient cpu`；
+2. 怎样手算 `2000m > 7500m - 6000m`；
+3. Filter 和 Score 分别回答什么，为什么 Score 不能救回失败 Node；
+4. 0 个可行 Node 为什么会得到 FitError，而不是 scheduler 进程崩溃；
+5. SuggestedHost、Assume、Bind 分别改变哪份状态；
+6. 为什么 `NODE=<none>` 必须和 Condition、Event 一起判断。
 
-- Generic Workload/PodGroup、gang scheduling；
-- nominated node、node hint、OpportunisticBatching；
-- extender、DRA；
-- Filter 并行实现里的 channel、atomic、cancel；
-- DefaultPreemption 的 victim 选择细节；
+### 15.2 第二遍再掌握
+
+下面这些属于 S3 的实现加深，不是进入第 09 课的门槛：
+
+- `addPod -> PreEnqueue -> activeQ -> ScheduleOne` 的完整队列入口；
+- queue 锁、`backoffQ`、in-flight 清理和函数值；
+- PreFilter 与并行 Filter 的 channel、atomic、cancel；
+- Reserve、Permit、PreBindPreFlight、PreBind 或 Bind 失败后的 Unreserve/Forget；
+- Generic Workload、PodGroup、gang scheduling、nominated node 和 node hint；
+- Extender、DRA、OpportunisticBatching；
+- DefaultPreemption 选择 victim 的细节；
 - Score 排序堆和 extender 并发评分。
 
 这些不是不学，而是不在第一次读主链时抢占注意力。
@@ -1559,40 +1708,45 @@ scheduler 选择 GPU Node，不选择具体 GPU UUID
 
 ## 17. 本章验收题
 
-不用背全部行号，先尝试回答：
+题目分两组。首遍先做 1～8：至少答对 7 题，而且第 2、4、5、6、7 题必须说清因果链。第 9～14 题留到第二遍；它们不阻止你进入第 09 课。
+
+**首遍题**
 
 1. 为什么 `NODE=<none>` 不能单独证明 scheduler 还没选出 Node？还要结合什么证据？
 2. 为什么 `kubectl top node` 只有 10%，仍可能出现 `Insufficient cpu`？
-3. `schedulingCycle` 的三道主门分别是什么？
+3. 本轮收集到 0、1、多个可行 Node 时，分别走什么分支？
 4. `FitError` 与 scheduler 内部 Error 有什么不同？
-5. 本轮收集到 0、1、多个可行 Node 时，分别走什么分支？多个候选是否在任何 profile 下都必然运行 Score？
-6. Filter 和 Score 分别回答什么问题？
-7. 把 `2000m > 7500m - 6000m` 对应到 `fitsRequest` 的哪几个字段？
-8. 为什么已经得到 SuggestedHost 仍不能说 Pod 已完成绑定？
+5. Filter 和 Score 分别回答什么问题？
+6. 把 `2000m > 7500m - 6000m` 对应到 `fitsRequest` 的哪几个字段？
+7. 为什么已经得到 SuggestedHost 仍不能说 Pod 已完成绑定？
+8. 迁移到 GPU 后，scheduler 负责选择 GPU Node 还是具体 GPU UUID？
+
+**第二遍题**
+
 9. 本例为什么进入 PostFilter 后仍然 Pending？
 10. `SchedulingQueue.Add` 为什么不保证 Pod 一定进入 activeQ？
 11. Assume 为什么是异步 Bind 的前提？
 12. Reserve、Permit 或 Bind 失败后，不执行 Unreserve/Forget 会造成什么后果？
 13. `Unresolvable=true` 与普通 `Insufficient cpu` 对抢占意味着什么差别？
-14. 迁移到 GPU 后，scheduler 负责选择 GPU Node 还是具体 GPU UUID？
+14. 没有 Score 插件和 extender 时，多个候选 Node 是否仍必然执行完整 Score？
 
 <details>
 <summary>展开参考答案</summary>
 
 1. `NODE=<none>` 只说明 API 中 `spec.nodeName` 还没写成；已经 SuggestedHost/Assume、正在异步 Bind 时也可能如此。还要结合 `PodScheduled`、FailedScheduling Event 和持续时间判断。
 2. Filter 使用 request 承诺账本，不使用瞬时 usage。其他 Pod 暂时空闲不代表它们放弃了已声明的 request。
-3. `UpdateSnapshot -> schedulingAlgorithm -> prepareForBindingCycle`，分别是刷新本轮视图、选点、应用内存占账并过 Reserve/Permit。
-4. `FitError` 表示有 Node 但硬约束后可行集合为空；其他 Error 表示插件、cache 或 scheduler 执行异常。
-5. 0 个返回 FitError；1 个直接选择；多个进入 `prioritizeNodes`。没有 Score 插件和 extender 的 profile 会走同分快速路径，不运行 PreScore/Score。
-6. Filter 回答“能不能安全放”；Score 回答“能放的 Node 中更偏好哪台”。Score 不能复活 Filter 失败 Node。
-7. `Requested=2000`、`Capacity=7500`、`Used=6000`；判断是 `Requested > Capacity - Used`。
-8. SuggestedHost 只是算法输出；Assume 才写 scheduler 内存账本，Bind 才把选择提交到 API Server。
+3. 0 个可行 Node 返回 FitError；1 个直接选择；多个进入 `prioritizeNodes`。
+4. `FitError` 表示有 Node但硬约束后可行集合为空；framework Error 表示插件、cache 或 scheduler 执行异常。
+5. Filter 回答“能不能安全放”；Score 回答“能放的 Node 中更偏好哪台”。Score 不能复活 Filter 失败 Node。
+6. `Requested=2000`、`Capacity=7500`、`Used=6000`；判断是 `Requested > Capacity - Used`。
+7. SuggestedHost 只是算法输出；Assume 才写 scheduler 内存账本，Bind 才把选择提交到 API Server。
+8. scheduler 选择满足 `nvidia.com/gpu` 名额的 Node；具体 GPU UUID 由该 Node 上 kubelet DeviceManager 后续选择。
 9. PostFilter 没找到更低优先级且合适的 victim，只能保留原 FitError，并让 Pod 等待后续事实变化。
 10. `moveToActiveQ` 会先运行 PreEnqueue；被 scheduling gate 等插件拦住的 Pod 进入 `unschedulablePods`，不会被 `ScheduleOne` Pop。
 11. Bind 较慢且异步。若不先 Assume，下一次 scheduling cycle 可能还看不到这个 Pod，重复许诺同一份资源。
 12. 插件临时状态和 scheduler cache 中的 assumed 资源会泄漏，后续 Pod 会错误地认为资源仍被占用。
-13. 普通不足表示释放当前占用后理论上能放；`Unresolvable=true` 表示 Pod 请求本身超过 Node 总 allocatable，清空该 Node 也无解。
-14. scheduler 选择满足 `nvidia.com/gpu` 名额的 Node；具体 GPU UUID 由该 Node 上 kubelet DeviceManager 后续选择。
+13. 普通不足表示释放当前占用后，当前资源这一关理论上能过；`Unresolvable=true` 表示 Pod 请求本身超过 Node 总 allocatable，清空该 Node 也无解。
+14. 只有多个候选才进入 `prioritizeNodes`；若此时既没有 Score 插件也没有 extender，候选会得到相同默认分数，不运行 PreScore/Score。
 
 </details>
 
