@@ -1,13 +1,13 @@
-# 第 12 课：`game-api` 已有 Pod IP 却没有 Java 日志——kubelet 为什么先造 Sandbox，再逐个启动容器
+# 第 12 课：`game-api` 已有 Pod IP 却没有 Java 日志——kubelet 为什么先造 Pod 公共环境（Sandbox），再逐个启动容器
 
-> 从一次 Spring Boot 私有镜像认证失败，读懂 `kubeGenericRuntimeManager.SyncPod`、`podActions`、PodSandbox、CRI、镜像拉取、`CreateContainer` / `StartContainer`、部分成功与下一轮重试。
+> 先用一句人话说清本课：**Pod 的“公共运行环境”已经好了，不代表里面每个容器都已经启动。** 本课就用一次 Spring Boot 私有镜像认证失败，追清 kubelet 为什么保留已经成功的部分，只重试失败的 `game-api`。
 
 第 11 课结束时，同一个 `prod/game-api-new-x` 已经完成调度、节点接单、ConfigMap 卷恢复，并越过：
 
 ```text
-Kubelet.SyncPod
-  -> WaitForAttachAndMount
-  -> kl.containerRuntime.SyncPod(...)
+Kubelet.SyncPod（kubelet 处理这个 Pod 的一轮工作）
+  -> WaitForAttachAndMount（先等卷挂载完成）
+  -> kl.containerRuntime.SyncPod(...)（再进入本课的容器运行阶段）
 ```
 
 现在值班现场出现了一个更容易误判的画面：
@@ -20,61 +20,75 @@ game-api=ImagePullBackOff
 game-api containerID=""
 ```
 
-很多平台同学会先去查 JVM、Spring Boot、startup probe，甚至怀疑 `-Xmx` 或应用启动太慢。但这个现场真正说明的是：**Java 进程还没有被创建，120 秒 startup probe 预算连计时资格都没有。**
+先只翻译两个关键状态：`PodReadyToStartContainers=True` 是“Pod 公共运行环境已具备启动容器的条件”；`ImagePullBackOff` 是“镜像拉取失败后正在等待下一次尝试”。它们同时出现并不矛盾。
 
-本章只有一个中心命题：
+很多平台同学会先去查 JVM、Spring Boot、startup probe（启动探针：容器进程启动后，给慢启动应用留时间并判断它是否完成启动），甚至怀疑 `-Xmx` 或应用启动太慢。但这个现场真正说明的是：**Java 进程还没有被创建，120 秒 startup probe 预算连计时资格都没有。**
 
-> **runtime manager 接到的不是“一次性创建 Pod 命令”，而是 desired Pod 与 runtime actual state。它先计算可重放的动作，再分阶段执行；某个普通容器失败时，健康的 Sandbox 和已经成功的 sidecar 不会被自动回滚。错误被写进 `PodSyncResult` 与 reason cache，Pod worker 以后重新对账，只补仍然缺失的 `game-api`。**
+本章只讲清一件事：
+
+> **kubelet 每次都会先看“配置里想要什么”和“节点上现在有什么”，然后只补差的那一块。** 所以 `game-api` 拉镜像失败时，已经可用的 Pod 网络和已经运行的 `jmx-exporter` 不会被一起推倒；修好镜像凭据后，下一轮只需继续启动 `game-api`。
+
+先把开头出现的几个词翻成人话：
+
+- `PodSandbox`：一个 Pod 里所有容器共用的“房间”，主要承载 Pod 的网络等公共环境；下文简称 Sandbox。
+- runtime manager：kubelet 里负责和容器运行时对账的那部分代码，可以先理解成“节点施工负责人”。
+- desired / actual：desired 是 Pod 配置里**想要的样子**，actual 是 containerd 等运行时里**现在真实的样子**。
+- action：比较两边以后列出的“本轮施工项”，例如建 Sandbox、启动 `game-api`。
+- CRI：kubelet 与 containerd、CRI-O 等容器运行时之间的标准接口，像统一的办事窗口。
+- Event：本章默认指 `kubectl get events` 看到的诊断记录；不是控制器通过 Watch/Informer（监听 API 对象变化的机制）收到的“对象变了”通知。
+- reconcile：再次对比“想要”和“现状”，只补差距；本章统一叫“重新对账”。
 
 先不要执行命令。带着五个问题读本章：
 
 1. 为什么 `PodReadyToStartContainers=True` 仍然可能没有 Java container ID？
 2. `game-api` 镜像失败后，为什么同一轮仍会尝试 `jmx-exporter`？
 3. 为什么 `CreateContainer` 成功不等于进程已经运行？
-4. 为什么 `PostStart` 失败后要 kill container，却不删除整个 PodSandbox？
-5. 下一轮重试靠什么知道 Sandbox、sidecar 已经成功，不必从零开始？
+4. 为什么 `PostStart`（用户声明的进程启动后动作）失败后要 kill（停止）container，却不删除整个 PodSandbox？
+5. 下一轮重试靠什么知道 Sandbox、`jmx-exporter` 这个辅助容器已经成功，不必从零开始？
 
 ## 0. 本课定位、深度和两遍阅读路线
 
-这是 kubelet 节点执行主线的第二篇 **S3 深读**。你已经有多年 Kubernetes 运维经验，本课不会重新讲 Pod、containerd、CNI 或镜像仓库的基础使用；重点是设计边界、状态所有权、失败分类和可重放控制流。
+这是 kubelet 节点执行主线的第二篇 **S3 深读**。这里的 S3 不是要求你背完所有源码，而是要求你最后能画出主流程、能根据现场状态反查关键分支。你已经有多年 Kubernetes 运维经验，本课不会重新讲 Pod、containerd、CNI 或镜像仓库怎么用；重点是解释它们在 kubelet 源码里的责任边界。
 
 本课读深：
 
 - 为什么 Pod 级环境和业务 container 要分成两层生命周期；
 - 为什么 kubelet先算 `podActions`，再执行 kill / sandbox / container 动作；
-- `NetworkNotReady` 为什么位于 runtime manager 外层，而单 Pod CNI 错误位于 `RunPodSandbox` 下游；
+- `NetworkNotReady` 为什么位于 runtime manager 外层，而单 Pod CNI（给 Pod 配网络的插件接口）错误位于 `RunPodSandbox` 下游；
 - `PodSandboxChanged` 怎样根据 runtime actual state 判断复用还是重建；
-- `createPodSandbox` 为什么依次经过 config、日志目录、RuntimeClass、CRI 四道门；
+- `createPodSandbox` 为什么依次经过 config、日志目录、RuntimeClass（选择哪套 runtime 配置）、CRI 四道门；
 - kubelet为什么只调用 CRI，而不在核心仓库直接绑定 containerd 或 CNI 实现；
-- Sandbox ready 以后，为什么 image、config、Create、Start、PostStart 仍是不同失败域，以及源码里的 internal PreStart 防御分支为什么不能直接当成当前 stock Kubelet 的生产故障点；
+- Sandbox ready 以后，为什么 image、config、Create、Start、PostStart 仍是不同失败阶段，以及 internal PreStart（kubelet启动前的内部登记点）防御分支为什么不能直接当成当前上游原版 kubelet 的生产故障点；
 - 一个普通容器失败后，为什么另一个普通容器仍可成功；
-- `PodSyncResult -> reasonCache -> result.Error -> completeWork` 怎样闭合重试；
-- normal no-op、等待、业务失败、内部 Error、非致命通知失败和显式补偿怎样区分。
+- “本轮施工结果单 -> 最近失败原因缓存 -> 汇总错误 -> 安排下一轮”怎样闭合重试；
+- 正常 no-op（检查后发现什么都不用做）、等待、业务失败、内部 Error、非致命通知失败和显式补偿怎样区分。
 
 本课只建立边界、不展开：
 
-- containerd CRI plugin 怎样创建 namespace、调用 CNI、生成 OCI bundle；
-- CNI/IPAM、iptables 或 eBPF datapath 内部实现；
-- PLEG、probe 和 statusManager 怎样把 Running/Ready/restartCount 写回 API，留到第 13 课；
-- Device Plugin、DeviceManager、GPU UUID、checkpoint 与 CDI 分配，留到第 15～17 课；
-- GC 怎样清理由 Create/Start 失败留下的旧 runtime 对象，只说明其责任边界。
+- containerd 的 CRI 插件怎样创建隔离空间、调用 CNI、生成 OCI bundle（容器运行时使用的一套启动文件）；
+- CNI/IPAM、iptables 或 eBPF datapath（数据包在节点里真正经过的路径）内部实现；
+- PLEG（节点上发现容器状态变化的组件）、probe 和 statusManager（把节点状态整理并写回 API 的组件）怎样更新 Running、Ready、restartCount，留到第 13 课；
+- Device Plugin、DeviceManager、GPU UUID、checkpoint（kubelet保存在本地的设备分配记录）与 CDI（把设备信息交给容器的标准格式）分配，留到第 15～17 课；这些都是 GPU 设备分配细节，本课不要求掌握；
+- GC（garbage collection，后台清理不用的旧对象）怎样清理由 Create/Start 失败留下的 runtime 对象，本课只说明责任边界。
 
-建议分两遍：
+不要按 26 个小节从头硬啃。按下面两个短路线读，蓝色标题可以直接点击跳转：
 
-- **首遍抓主线：** 读 `2～5 -> 6.1～6.2 -> 7 -> 8.1～8.4 -> 9～14 -> 16～19 -> 24`。目标是能解释“Sandbox 成功不等于 Java 启动、普通容器可以部分成功、失败后为什么不全量回滚”。
-- **二遍补边界：** 再读 `6.3 -> 8.5 -> 10.3 -> 12.4 -> 15 -> 20～23`。重点是 RuntimeClass、DRA、回调错误、Event/日志时间边界、测试锚点和 Go 语法。
+- **首遍抓主线：** [看事故快照](#ch12-case) -> [看两张总图](#ch12-map) -> [先读最关键的两段源码](#ch12-core-source) -> [回到 Java 现场](#ch12-java-recovery) -> [做首遍验收](#ch12-first-check)。首遍只要说清“Sandbox 成功不等于 Java 启动、两个普通容器可以部分成功、修复后为什么不用全量重建”。
+- **二遍补边界：** [看 CRI 责任边界](#ch12-cri-boundary) -> [看错误怎样进入下一轮](#ch12-retry-loop) -> [看反事实分支](#ch12-counterfactual) -> [做二遍加深题](#ch12-second-check)。RuntimeClass、DRA（动态资源分配）、回调、Event 时差和测试限制都放在第二遍，不是进入下一课的门槛。
+
+全章阅读约定：**表格按同一行从左往右读，每一行是一个独立对照；流程图按箭头读。** 图中的实线表示当前这一轮直接调用，虚线表示状态稍后才传回来或下一轮才继续。
 
 ## 1. 当前源码基线与阅读约定
 
 ```text
-源码目录：<KUBERNETES_SRC>
+源码目录：D:\datou\devops\kubernetes-master\kubernetes
 commit：301946d15e67a4a2e8a5fb8292eb836acd366d78
 describe：v1.37.0-alpha.0-280-g301946d15e6
 源码 go.mod / go.work：go 1.26.0
 本机 Go：go1.19.4 windows/amd64
 ```
 
-本机 Go 低于当前源码要求。本课完成的是固定提交下的静态源码核对、官方资料核对、三路独立审校和讲义机械校验；不能把它写成“相关 Go 单测已经在本机通过”。生产排障必须切换到目标集群对应 tag、发行分支和 CRI/CNI 版本，重新核对 feature gate、Event 文本、日志级别、超时和行号。
+本机 Go 低于当前源码要求。本课完成的是固定提交下的静态源码核对、官方资料核对、三路独立审校和讲义机械校验；不能把它写成“相关 Go 单测已经在本机通过”。生产排障必须切换到目标集群对应 tag、发行分支和 CRI/CNI 版本，重新核对 feature gate（功能开关）、Event 文本、日志级别、超时和行号。
 
 主文件：
 
@@ -117,7 +131,7 @@ spec:
       maxUnavailable: 0
 ```
 
-旧版本 3 个 Pod 都是 `Ready=True`，继续承接流量。新 Pod `game-api-new-x` 是第 4 个临时 surge Pod；只要它还没有 Available，Deployment 就不会主动缩掉旧副本。
+旧版本 3 个 Pod 都是 `Ready=True`，继续承接流量。新 Pod `game-api-new-x` 是滚动发布期间临时多出来的第 4 个 Pod，源码里常叫 surge Pod；只要它还没有 Available（Ready 后又稳定了一段最短时间），Deployment 就不会主动缩掉旧副本。
 
 ### 2.2 同一个 Pod、两个普通容器
 
@@ -147,15 +161,18 @@ spec:
 
 参与本章推理的 Java 事实：
 
-- Spring Boot 完成类加载、连接池建立、JIT 预热和 readiness 大约需要 45 秒；
+- Spring Boot 完成类加载、连接池建立、JIT（运行时即时编译）预热和 readiness 大约需要 45 秒；
 - startup probe 理论宽限是 `5 秒 × 24 次 = 120 秒`；
 - 但 probe 只能在 container 被 runtime 启动以后开始；
-- `game-api` 私有镜像不在 `worker-05` 本地，引用的 registry credential 已过期；
+- `game-api` 私有镜像不在 `worker-05` 本地，引用的 registry credential（镜像仓库认证凭据）已过期；
 - `jmx-exporter` 镜像已在节点缓存中；
 - 两个 container 都是普通容器，没有 init container；
-- `runtimeClassName` 未设置，使用默认 runtime handler；
-- 没有 ResourceClaim，经典 Java 主案不走 DRA 设备准备分支；
-- 第 11 课的 ConfigMap 卷已经 mounted。
+- `hostNetwork=false`，表示它要建立自己的 Pod 网络空间，不是直接使用 Node 网络；
+- `runtimeClassName` 未设置，使用默认 runtime handler；handler 就是告诉 runtime “这次用哪套运行配置”的名字；
+- 没有 ResourceClaim（特殊设备资源申请单），经典 Java 主案不走 DRA（动态资源分配）准备分支；
+- 第 11 课的 ConfigMap 卷已经挂载完成。
+
+<a id="ch12-case"></a>
 
 ### 2.3 事故快照：部分成功已经发生
 
@@ -196,7 +213,19 @@ containerStatuses:
   jmx-exporter         = RUNNING
 ```
 
-本章的可证伪假设：
+`attempt=0` 表示这是该 Pod 第 1 次 Sandbox 创建尝试；如果以后重建 Sandbox，attempt 会递增。它不是容器的 restartCount。
+
+这五个状态先这样读，不要急着背字段：
+
+| 你看到的词 | 大白话意思 | 此刻还不能证明什么 |
+| --- | --- | --- |
+| `PodReadyToStartContainers=True` | Pod 的公共运行环境和网络已经具备启动容器的条件 | 不代表业务容器已经创建 |
+| `PodIP` | Pod 的公共网络身份已经出现 | 不代表 JVM 已监听端口 |
+| `ImagePullBackOff` | 上一次拉镜像失败，现在先等一会再试；backoff 就是“失败后别立刻狂重试” | 不代表容器启动后又崩了 |
+| `containerID=""` | API 当前没有记录 `game-api` 的运行时对象编号 | 单凭 API 快照还不能断言运行时此刻绝对没有对象 |
+| `jmx-exporter=RUNNING` | 这个辅助容器已经启动成功 | 不代表 `game-api` 也成功 |
+
+本章先提出一个**可证伪假设**，意思是“先给出当前最合理的判断，同时明确什么证据一出现就必须推翻它”：
 
 ```text
 game-api 失败在 EnsureImageExists；
@@ -222,7 +251,9 @@ game-api 失败在 EnsureImageExists；
 
 答案要从不变量和源码中推出，而不是凭 `kubectl STATUS` 猜。
 
-## 3. Kubernetes 在这里解决的不是“调用 containerd”，而是跨失败域收敛
+## 3. Kubernetes 在这里解决的不是“调用 containerd”，而是失败后怎样接着做
+
+后文会把网络、镜像、Create、Start 叫作不同“失败域”，意思是它们可以各自成功、各自失败。所谓“收敛”，就是不管中间失败几次，后面经过重新对账，现场最终尽量回到 Pod 配置想要的样子。
 
 ### 3.1 错误方案一：kubelet收到 Pod 后执行一个 `CreatePod` 大 RPC
 
@@ -232,31 +263,33 @@ game-api 失败在 EnsureImageExists；
 CreatePod(fullPodSpec) -> success / failure
 ```
 
-网络、镜像、container create、进程 start、hook 分属不同外部系统。大 RPC 超时以后，kubelet无法知道：
+网络、镜像、container create、进程 start、hook 分属不同外部系统。hook 是容器启动前后额外执行的“钩子动作”。RPC 就是一次跨进程请求；可以先把它理解成 kubelet 向 containerd 发出的一张办事单。大 RPC 超时以后，kubelet无法知道：
 
 - Sandbox 是否已经创建；
 - CNI 是否已经分配 IP；
 - 哪个镜像已经拉好；
 - 哪个 container 只有 runtime object、哪个进程已经运行；
-- sidecar 是否成功、主容器是否失败；
+- `jmx-exporter` 这类辅助容器是否成功、主容器是否失败；
 - 重试会不会重复创建第二套环境。
 
-Kubernetes 选择把过程拆成可观察的资源与 RPC，并在下一轮重新读取 actual state。收益是可恢复、可诊断和 runtime 可替换；代价是状态可能部分成功，运维必须理解多个时间点而不是一个事务结果。
+Kubernetes 选择把过程拆成可观察的资源与 RPC，并在下一轮重新读取 actual state。收益是可恢复、可诊断和 runtime 可替换；代价是状态可能部分成功，运维必须理解多个时间点，而不是期待一次调用要么全成功、要么什么都没发生。
 
 ### 3.2 错误方案二：每个 container 各建一套 Pod 网络
 
-同一个 Pod 中的 container 需要共享 Pod IP、网络 namespace、hostname、部分 namespace 和 Pod 级资源边界。如果每个 container 各自创建网络：
+同一个 Pod 中的 container 需要共享 Pod IP、网络 namespace（Linux 用来隔离网络、进程等资源的“隔间”）、hostname 和 Pod 级资源边界。如果每个 container 各自创建网络：
 
 - `localhost` 不再天然指向同一个 Pod；
 - container 重启会改变 Pod 网络身份；
-- sidecar 与主进程无法共享稳定的 Pod 地址；
+- 辅助容器与主进程无法共享稳定的 Pod 地址；
 - Service 后端、探针和日志关联都更难保持 Pod 级语义。
 
-CRI 因此把 Pod 级运行环境抽象成 `PodSandbox`，再让多个 container 依附于它。Sandbox 在 containerd 上常由 infra/pause 相关实现承载，但 CRI 故意不把接口语义限定成“必须是 pause 容器”；虚拟机型 runtime 可以用不同实现。
+CRI 因此把 Pod 级运行环境抽象成 `PodSandbox`，再让多个 container 依附于它。Sandbox 在 containerd 上常由 infra/pause（负责占住 Pod 网络等公共空间的基础容器）相关实现承载，但 CRI 故意不把接口语义限定成“必须是 pause 容器”；虚拟机型 runtime 可以用不同实现。
 
 ### 3.3 错误方案三：任何一步失败都全量 rollback
 
-本案中 Sandbox、Pod IP、`jmx-exporter` 都已经成功。如果 `game-api` image pull 失败就全部推倒：
+rollback 就是回滚：把前面已经做成的事情也撤掉，试图退回开始前的状态。
+
+本案中 Sandbox、Pod IP、`jmx-exporter` 这个辅助容器都已经成功。辅助容器常被叫作 sidecar；它陪着主容器提供监控、代理等能力。如果 `game-api` image pull 失败就全部推倒：
 
 - 会重复调用 CNI/IPAM，制造地址与网络抖动；
 - 会反复停止已经正常运行的 sidecar；
@@ -264,47 +297,51 @@ CRI 因此把 Pod 级运行环境抽象成 `PodSandbox`，再让多个 container
 - 会把一个 registry credential 问题放大成整 Pod 网络重建；
 - 多容器 Pod 的一个局部故障会变成全局抖动。
 
-runtime manager 选择保留能证明仍符合期望的事实。下一轮重新比较 desired 与 actual，只补缺口。代价是要维护 `PodStatus`、action plan、per-action result、reason cache、GC 和重试逻辑。
+runtime manager 选择保留还能用的成果。下一轮重新比较 desired 与 actual，只补缺口。代价是要维护现场快照、本轮施工单、单项结果、最近失败原因缓存、后台清理和重试逻辑。
 
 ### 3.4 错误方案四：kubelet核心代码直接依赖 containerd 和 CNI
 
 如果 `kubelet` 直接 import containerd、CRI-O、每一种 CNI 的客户端：
 
-- runtime 升级会扩大 kubelet编译与发布耦合；
+- runtime 会和 kubelet 绑得更紧：runtime 一升级，kubelet 也更可能要改代码、重新编译和发布；
 - 新 runtime 必须修改 Kubernetes 核心；
 - PodSandbox 在 namespace 型和 VM 型 runtime 中无法保留统一接口；
 - runtime 与 image service 的超时、错误和观测难以统一。
 
-官方 CRI 设计让 kubelet作为 gRPC client，只依赖 CRI v1 契约；具体 runtime 再解释 `RunPodSandbox`、网络 setup 和 container 生命周期。收益是插件化；代价是 Kubernetes 核心源码走到 CRI client 后就到达责任边界，继续追 CNI 必须切换到具体 runtime 仓库。
+官方 CRI 设计让 kubelet作为 gRPC client，只依赖 CRI v1 契约（双方约定好的请求和返回格式）。gRPC 是 CRI 这扇标准窗口实际使用的通信方式；具体 runtime 再解释 `RunPodSandbox`、网络 setup 和 container 生命周期。好处是更换 runtime 时不用把它的实现塞进 kubelet；代价是 Kubernetes 核心源码走到 CRI client 后就到达责任边界，继续追 CNI 必须切换到具体 runtime 仓库。
 
 ### 3.5 错误方案五：Create 和 Start 合并，只有一个成功点
 
 container runtime object 的创建和进程真正运行是两个不同事实。分开以后，kubelet可以：
 
-- 先生成完整 `ContainerConfig`；
-- 在 Create 前执行 internal PreCreate；
+- 先生成完整 `ContainerConfig`，也就是交给 runtime 的单容器启动参数单；
+- 在 Create 前执行 internal PreCreate，对配置做最后的内部检查或补充；
 - Create 成功拿到 container ID；
-- 在 Start 前调用 internal PreStart；当前 stock Linux 实现只登记 CPU、memory、topology manager 状态，然后固定返回 nil；
+- 在 Start 前调用 internal PreStart；它是 kubelet内部的启动前登记点，当前 stock（这里指 Kubernetes 上游原版）Linux 实现只登记 CPU、内存和 NUMA 拓扑（硬件资源靠近关系）等内部状态，然后固定返回 nil（没有错误）；
 - 把 `Created` 与 `Started` 作为不同证据；
-- Start 成功后再执行应用 PostStart，并在失败时 kill 已启动 container。
+- Start 成功后再执行应用 PostStart，也就是用户声明的“进程启动后动作”；失败时 kill 已启动 container。
 
 代价是可能留下 `CREATED` 但没有 RUNNING 的部分状态；当前 stock 实现里最直接的可达路径是 `StartContainer` 失败，而不是 internal PreStart 返回 error。这类状态不靠同步全量 rollback，而由后续对账和 runtime GC 收敛。
 
-## 4. 先建立状态所有者、契约和十条不变量
+## 4. 先弄清“谁管哪份记录”，再记十条不会轻易破坏的规则
+
+源码里常说 owner、contract、invariant。这里分别理解成：**谁负责这份状态、两边约定怎样交接、代码无论怎么分支都要守住什么规则。**
 
 ### 4.1 谁拥有哪本账
 
+先记住：这里不是有九套互相打架的数据库，而是同一件事在不同阶段留下的九种记录。表格每一行从左到右读：**这份记录是什么 -> 谁负责它 -> 排障时拿它判断什么。**
+
 | 状态 | 主要所有者 | 本章作用 |
 | --- | --- | --- |
-| `v1.Pod` desired spec | apiserver / 控制面 | 两个 container、镜像、RuntimeClass、security、resource、volume 等期望 |
-| `kubecontainer.PodStatus` | kubelet runtime observation / podCache | 当前有哪些 Sandbox、container、IP、exit state |
-| `podActions` | `computePodActions` 本轮生成 | 本轮应该 kill、建 Sandbox、启动哪些 container |
-| `PodSyncResult` | runtime manager 本轮执行 | 每个 action 成功或失败，以及未绑定到具体 action 的 SyncError |
-| `PodSandboxConfig` | kubelet生成、CRI runtime 消费 | Pod identity、网络、namespace、DNS、日志目录、runtime handler 上下文 |
-| `ContainerConfig` | kubelet生成、CRI runtime 消费 | image、command、env、mount、resource、device、security、log path |
+| `v1.Pod` desired spec | API Server / 控制面 | 用户想要两个什么容器、什么镜像、资源和卷 |
+| `kubecontainer.PodStatus` | kubelet 从容器运行时读到的现场快照 / podCache | 节点上现在有哪些 Sandbox、容器、IP 和退出状态 |
+| `podActions` | `computePodActions` 本轮临时生成 | 比较前两行以后得到的“本轮施工单”：杀什么、建什么、启动什么 |
+| `PodSyncResult` | runtime manager 本轮执行 | “本轮施工结果单”：每个动作成功还是失败；`SyncError` 是无法归到某一个具体动作的整轮错误 |
+| `PodSandboxConfig` | kubelet生成、CRI runtime 消费 | “建 Pod 公共环境的参数单”：Pod 身份、网络隔离、DNS、日志目录、runtime handler 等 |
+| `ContainerConfig` | kubelet生成、CRI runtime 消费 | “建单个容器的参数单”：镜像、命令、环境变量、挂载、资源、设备、安全和日志路径 |
 | Sandbox/container actual state | CRI runtime | READY/NOTREADY、CREATED/RUNNING/EXITED、ID 与 IP |
-| per-container latest failure | kubelet `reasonCache` | 把 `ImagePullBackOff` 等 StartContainer action 结果传播到 container status |
-| Pod worker 重试时机 | `podWorkers` / workQueue | Error、NetworkNotReady、backoff 与正常 resync 的下一轮时间 |
+| per-container latest failure | kubelet `reasonCache` | 一小块“最近启动失败原因缓存”，把 `ImagePullBackOff` 等原因带到容器状态 |
+| Pod worker 重试时机 | `podWorkers` / workQueue | Pod worker 是按 UID 串行推进 Pod 的后台工人；workQueue 是它的待办队列，决定何时再试 |
 
 ### 4.2 十条设计不变量
 
@@ -315,7 +352,7 @@ container runtime object 的创建和进程真正运行是两个不同事实。�
 5. **健康 Sandbox 不因单个普通 container 失败而自动删除。**
 6. **同一轮多个普通 container 可以部分成功；一个失败不会终止普通 container 循环。**
 7. **image 成功是 Create 的前置，Create 成功是 Start 的前置，Start 成功不是 Ready。**
-8. **非 restartable init container 启动失败会阻断普通 container；普通 container 彼此不采用同一阻断规则。**
+8. **普通 init container 启动失败会阻断普通 container；restartable init 是可持续运行、行为更像辅助容器的 init，本章二遍再看。**
 9. **PostStart 失败发生在 Start 成功之后，必须显式 kill 作为补偿。**
 10. **本轮 Error 不要求回滚全部成果；下一轮重新读取 actual state，只执行仍有差距的动作。**
 
@@ -324,55 +361,54 @@ container runtime object 的创建和进程真正运行是两个不同事实。�
 | 设计选择 | 得到什么 | 付出什么 |
 | --- | --- | --- |
 | Sandbox 与 container 分层 | 稳定 Pod IP、共享 namespace、多容器独立重启 | 多一层状态与失败域 |
-| 先 planner 后 executor | 可重放、可测试、避免看到 Event 就盲目创建 | action 计算分支复杂 |
-| CRI 接口 | runtime 可替换、核心代码解耦 | 追具体 CNI/OCI 时必须跨仓库 |
-| 分步 RPC | 失败可定位、可保留部分成功 | 不是原子事务，会出现中间态 |
-| per-action result | 多容器部分成功与错误可分别记录 | 外层必须聚合 Error 并安排重试 |
+| 先计算施工单，再按单执行 | 可以安全重做、容易测试、避免看到 Event 就盲目创建 | 施工单计算分支复杂 |
+| CRI 接口 | runtime 可替换，kubelet 核心代码不用跟着每种 runtime 改 | 追具体 CNI/OCI 时必须跨仓库 |
+| 分步 RPC | 失败可定位、可保留部分成功 | 不能保证“要么全部成功、要么一点也没做”，会出现中间态 |
+| 每个施工项单独记结果 | 多容器部分成功与错误可分别记录 | 外层必须汇总 Error 并安排重试 |
+
+<a id="ch12-map"></a>
 
 ## 5. 白板总图：先看状态流，再进入函数
 
 ### 5.1 主执行链
 
-```text
-Kubelet.SyncPod
-  -> 节点级 NetworkReady 门
-  -> volume 已 mounted
-  -> containerRuntime.SyncPod
-     -> computePodActions(desired Pod, runtime PodStatus)
-     -> 必要时 kill 旧 runtime 现场
-     -> 必要时 PrepareDynamicResources
-     -> createPodSandbox
-        -> PodSandboxConfig
-        -> Pod 日志目录
-        -> RuntimeClass handler
-        -> instrumented RuntimeService
-        -> remoteRuntimeService.RunPodSandbox
-        -> CRI v1 gRPC
-        -> runtime implementation / 网络实现
-     -> PodSandboxStatus / Pod IP
-     -> OnPodSandboxReady
-     -> 对每个待启动 container：
-        -> image backoff / pull
-        -> ContainerConfig
-        -> internal PreCreate
-        -> CRI CreateContainer
-        -> internal PreStart（stock 实现登记内部状态后返回 nil）
-        -> CRI StartContainer
-        -> PostStart
+**读法：从左往右。** 实线是本轮同步调用；最后的虚线表示结果要等状态刷新或下一轮重试后，才会再次成为“节点现场”。首遍只跟粗体问题走：**Sandbox 能不能复用 -> 缺哪个容器 -> 卡在哪一道门。**
+
+```mermaid
+flowchart LR
+    A["Pod 配置<br/>想要什么"] --> C["比较两边<br/>列本轮施工单"]
+    B[("节点现场<br/>现在有什么")] --> C
+    C --> D{"现有 Sandbox<br/>还能用吗？"}
+    D -->|不能| E["先创建 Pod 公共环境<br/>Sandbox + 网络"]
+    D -->|能| F["保留现有 Sandbox"]
+    E --> G["逐个处理仍缺失的容器"]
+    F --> G
+    G --> H["1. 检查/拉取镜像"]
+    H --> I["2. 生成容器配置"]
+    I --> J["3. CreateContainer<br/>创建运行时对象"]
+    J --> K["4. StartContainer<br/>真正启动进程"]
+    K --> L["5. PostStart<br/>启动后的应用钩子"]
+    L -.-> B
 ```
+
+图里故意先不放 RuntimeClass、DRA、CNI 内部和各种回调。它们是某一道门里的细节，不应遮住主线。
 
 ### 5.2 结果与反馈链
 
-```text
-每个 action
-  -> SyncResult(Action, Target, Error, Message)
-  -> PodSyncResult 聚合
-  -> reasonCache.Update 只挑 StartContainer action，传播每个容器最近启动失败
-  -> result.Error() 聚合 SyncError 与所有失败 action
-  -> Kubelet.SyncPod 返回 err / postSync
-  -> podWorker.completeWork 安排下一轮
-  -> 下一轮重新读取 runtime actual state
+**仍然从左往右读。** 实线表示本轮记账，虚线表示“稍后再来一轮”，不是当前函数原地死循环。
+
+```mermaid
+flowchart LR
+    A["每个施工项的结果<br/>例如 game-api 拉镜像失败"] --> B["SyncResult<br/>单项结果"]
+    B --> C["PodSyncResult<br/>整轮结果单"]
+    C --> D["reasonCache<br/>只保存各容器最近的启动失败"]
+    C --> E["result.Error()<br/>汇总本轮错误"]
+    E --> F["Pod worker<br/>安排下一次检查"]
+    F -.-> G[("容器运行时当前状态")]
+    G -.-> A
 ```
+
+这张图最重要的边界是：`game-api` 的失败可以留在结果单里，同时 `jmx-exporter` 的成功已经留在容器运行时里。整轮有错误，不等于整轮做过的事都回滚。
 
 ### 5.3 本章的停止线
 
@@ -387,7 +423,7 @@ CRI StartContainer 成功或失败
 本章不继续展开：
 
 ```text
-PLEG / runtime event
+PLEG / runtime event（kubelet 内部的状态变化通知，不是上面的 Kubernetes Event）
   -> podCache
   -> probe result
   -> statusManager
@@ -395,6 +431,52 @@ PLEG / runtime event
 ```
 
 这条状态回传链留给第 13 课。
+
+<a id="ch12-core-source"></a>
+
+### 5.4 先读最关键的两段源码：为什么主容器失败，辅助容器还能成功
+
+不要先钻进 NetworkReady、RuntimeClass 或 DRA。先看直接解释本案的源码。
+
+本案的待启动清单来自按 `pod.Spec.Containers` 顺序逐个加入下标，所以这里是 `[game-api index 0, jmx-exporter index 1]`；第 7.3 节会再手算这张清单。
+
+源码：`pkg/kubelet/kuberuntime/kuberuntime_manager.go:1790-1793`，`SyncPod` 启动普通容器循环的**连续完整摘录，教学注释版**。
+
+```go
+// 按本轮施工单，遍历所有“还缺少、需要启动”的普通容器下标。
+for _, idx := range podContainerChanges.ContainersToStart {
+	// 逐个尝试启动；metrics.Container 只是“普通容器”指标标签。
+	// 这里故意不接住 start 返回的 error，也没有 return。
+	// 单个失败已经写入本轮结果单，因此循环仍会继续尝试下一个普通容器。
+	start(ctx, "container", metrics.Container, containerStartSpec(&pod.Spec.Containers[idx]))
+}
+```
+
+**大白话总结：** `game-api` 在列表里排第一也没关系。它失败后，这里不会退出整个 `SyncPod`，所以还能继续尝试 `jmx-exporter`。
+
+**顺手学 Go：** `for _, idx := range ...` 表示依次遍历列表；`_` 是“不使用当前位置编号”，`idx` 才是容器在 Pod 配置中的下标。函数有返回值却不接住，在 Go 里是允许的；这里是有意忽略直接返回，不是源码忘了处理错误。
+
+再看 `game-api` 为什么连 JVM 都没启动。源码：`pkg/kubelet/kuberuntime/kuberuntime_container.go:212-219`，`startContainer` 镜像失败分支的**连续完整摘录，教学注释版**。
+
+```go
+// CreateContainer 之前，先保证镜像在节点上可用；需要时会去镜像仓库拉取。
+imageRef, msg, err := m.imagePuller.EnsureImageExists(ctx, ref, pod, container.Image, pullSecrets, podSandboxConfig, podRuntimeHandler, container.ImagePullPolicy)
+// 镜像检查或拉取失败，就在这里结束当前这个容器的启动尝试。
+if err != nil {
+	// 把底层错误整理成适合 Event 展示的文字。
+	s, _ := grpcstatus.FromError(err)
+	// 记录 Warning Event；这一步没有创建容器运行时对象。
+	m.recordContainerEvent(ctx, pod, container, "", v1.EventTypeWarning, events.FailedToCreateContainer, "Error: %v", s.Message())
+	// 把错误交回上面的 start；后面的 CreateContainer 和 StartContainer 都不会执行。
+	return msg, err
+}
+```
+
+**大白话总结：** 本案卡在镜像这道门，而 `CreateContainer` 在后面。因此 `game-api` 没有 container ID、没有 JVM、也还没有开始 startup probe；这和“Java 启动慢”是两个完全不同的阶段。
+
+**顺手学 Go：** `imageRef, msg, err := ...` 一次接住三个返回值；`err != nil` 就是“这一步失败了”。`return msg, err` 只结束当前容器的 `startContainer`，外面的普通容器循环仍会处理下一个容器。
+
+到这里，首遍已经拿到本章最关键的源码证据。后面的第 6～13 节，是把“为什么能这样设计、每种失败怎么记账和重试”逐层补齐。
 
 ## 6. 第一层源码：为什么节点级网络错误会挡在 runtime manager 外面
 
@@ -416,7 +498,8 @@ if err := kl.runtimeState.networkErrors(); err != nil && !kubecontainer.IsHostNe
 		err,
 	)
 	// 本轮在进入 kl.containerRuntime.SyncPod 之前结束。
-	// false 表示 Pod 尚未进入 terminal；nil postSync 表示没有成功动作后的立即 relist。
+	// false 表示 Pod 尚未进入结束状态；nil postSync 表示没有“成功后再做的小函数”。
+	// relist 指请求 PLEG 再扫描一次容器运行时现场；本分支连这个请求也没有。
 	return false, nil, fmt.Errorf("%s: %v", NetworkNotReadyErrorMsg, err)
 }
 ```
@@ -626,7 +709,9 @@ if podContainerChanges.KillPod {
 
 ### 8.2 DRA 准备失败为什么与 `FailedCreatePodSandBox` 不同
 
-源码：`pkg/kubelet/kuberuntime/kuberuntime_manager.go:1572-1599`，Sandbox 创建分支的 **连续摘录**。Java 主案没有 ResourceClaim，本段用于划清以后 GPU/DRA 的前置边界。
+**这一节属于二遍。** DRA 是 Dynamic Resource Allocation，直译是“动态资源分配”：Pod 先用 ResourceClaim（可以先理解成“我要一份特殊设备资源的申请单”）申请设备，再由对应驱动准备资源。Java 主案没有这种申请单，所以首遍跳过不影响主线。
+
+源码：`pkg/kubelet/kuberuntime/kuberuntime_manager.go:1572-1599`，Sandbox 创建分支的 **连续摘录**。本段只用于划清以后 GPU/DRA 的前置边界。feature gate 就是 Kubernetes 的“功能开关”，关闭时整段 DRA 分支不会进入。
 
 ```go
 // 先建立一个 CreatePodSandbox 子结果，后续真正的 Sandbox 错误会写进它。
@@ -661,7 +746,7 @@ if utilfeature.DefaultFeatureGate.Enabled(features.DynamicResourceAllocation) {
 podSandboxID, msg, err = m.createPodSandbox(ctx, pod, podContainerChanges.Attempt)
 ```
 
-**大白话总结：** DRA 是 Sandbox 前置依赖。失败时有专门 Event，而且当前代码没有把 `createSandboxResult` 标成 Fail；现有测试也明确期望 `SyncPod` 聚合 Error 可以仍为 nil。它属于“已记录并提前停止的前置失败”，不能只用 `result.Error()!=nil` 判断所有失败。因为 `createSandboxResult` 已经加入结果却没有 error，外层 Kubelet 还会把本轮当成“有 action 且无聚合 error”，返回 `postSync` 请求一次 PLEG relist；这条特殊反馈会在 13.3～13.4 合起来解释。
+**大白话总结：** DRA 失败发生在建 Sandbox 之前。它会记一条专门 Event，然后提前 `return`（结束本轮），不会伪装成 CNI 或 Sandbox 创建失败。当前代码还有一个容易忽略的特殊点：这条分支没有把本轮结果标成 error，所以外层会通过 `postSync`（成功路径结束后要执行的小函数）请求 PLEG 再刷新一次运行时现场。这个细节到 13.3～13.4 再看，首遍不要求记。
 
 **顺手学 Go：** `if err := call(); err != nil` 把 `err` 限定在当前 `if`。内部再次写 `ref, referr :=` 时，`referr` 是新变量，`ref` 在当前更内层作用域被重新声明；读 Go 时要特别留意作用域，而不是只看变量名相同。
 
@@ -769,11 +854,13 @@ if err != nil { // 只有四道门任一道失败才进入这里。
 
 | 失败层 | 发生位置 | 是否已经发出 `RunPodSandbox` |
 | --- | --- | --- |
-| RuntimeClass API/admission | Pod 进入 kubelet之前 | 否 |
+| RuntimeClass API/admission（API 接收 Pod 时的校验和补全） | Pod 进入 kubelet之前 | 否 |
 | kubelet `LookupRuntimeHandler` | `createPodSandbox` 第三道门 | 否 |
 | runtime 不认识 handler | CRI `RunPodSandbox` | 是 |
 
 RuntimeClass 是“选择 runtime 配置”的机制，不是所有 GPU Pod 的必填字段。很多 GPU 集群仍使用默认 runc handler，通过 NVIDIA Container Toolkit、经典 Device Plugin 或 CDI 注入设备；是否需要 RuntimeClass 必须以具体平台配置为准。
+
+<a id="ch12-cri-boundary"></a>
 
 ## 9. 第四层源码：CRI 为什么是一条契约边界，而不是 containerd 的别名
 
@@ -782,7 +869,7 @@ RuntimeClass 是“选择 runtime 配置”的机制，不是所有 GPU Pod 的�
 源码：`pkg/kubelet/kuberuntime/kuberuntime_sandbox.go:82-98`，`generatePodSandboxConfig` 的 **连续摘录**。后续 hostname、port mapping、Linux/Windows security 与 sandbox resource 字段留给二遍阅读。
 
 ```go
-// API Pod 的 UID 要转成 CRI protobuf 使用的 string。
+// API Pod 的 UID 要转成 CRI protobuf（接口传输用的数据结构）使用的 string。
 podUID := string(pod.UID)
 // 创建 Pod 级 CRI config；它不是把完整 v1.Pod 原样传给 runtime。
 podSandboxConfig := &runtimeapi.PodSandboxConfig{
@@ -814,6 +901,8 @@ podSandboxConfig.DnsConfig = dnsConfig
 
 ### 9.2 指标包装层为什么不负责真正创建 namespace
 
+这里的 instrumented service 没有神秘含义，就是“在真正调用前后顺手记耗时、记成功失败，再把请求原样转发”的包装层。
+
 源码：`pkg/kubelet/kuberuntime/instrumented_services.go:180-192`，`instrumentedRuntimeService.RunPodSandbox` **完整函数，教学注释版**。
 
 ```go
@@ -842,9 +931,11 @@ func (in instrumentedRuntimeService) RunPodSandbox(ctx context.Context, config *
 
 **大白话总结：** instrumented service 是“记账后转发”的装饰层。它能证明 kubelet为哪类 CRI 操作记了耗时和错误，却不拥有 CNI、namespace 或 container 创建逻辑。
 
-**顺手学 Go：** `defer f()` 把调用安排到当前函数返回前执行，多个 defer 按后进先出执行。`const` 定义编译期常量。`in.service` 是 interface 字段，只要底层对象实现同一组方法，上层不需要知道它是 remote client 还是 fake。
+**顺手学 Go：** `defer f()` 把调用安排到当前函数返回前执行，多个 defer 按后进先出执行。`const` 定义编译期常量。`in.service` 是 interface（只约定要有哪些方法）字段；底层可以放真正的远端客户端，也可以放测试用的 fake（假实现），上层调用方式不变。
 
 ### 9.3 remote CRI client 为什么只发一次 RPC，不在本函数内部重试
+
+remote client 就是“负责把请求发到容器运行时的客户端”；它不是另一套控制器。
 
 源码：`staging/src/k8s.io/cri-client/pkg/remote_runtime.go:220-253`，`remoteRuntimeService.RunPodSandbox` **完整函数，教学注释版**。
 
@@ -893,7 +984,7 @@ func (r *remoteRuntimeService) RunPodSandbox(ctx context.Context, config *runtim
 
 **大白话总结：** remote client 的职责是加 request timeout、组装 protobuf request、发一次 gRPC、校验 response。RPC 失败后的“重试”不在这里原地循环，而是回到 kubelet的下一轮 Pod sync；这样重试前能重新观察 runtime 是否其实已经产生部分状态。
 
-**顺手学 Go：** `ctx, cancel := context.WithTimeout(ctx, timeout)` 左边的 `ctx` 是新变量与外层同名遮蔽，后续代码使用带 deadline 的新 context。`err := errors.New(...)` 位于 `if` 内，只在该块中可见。
+**顺手学 Go：** `ctx, cancel := context.WithTimeout(ctx, timeout)` 左边的 `ctx` 是新变量与外层同名遮蔽，后续代码使用带 deadline（最晚必须结束的时间点）的新 context。`err := errors.New(...)` 位于 `if` 内，只在该块中可见。
 
 ### 9.4 kubelet为什么不直接调用 CNI
 
@@ -907,9 +998,13 @@ kubelet runtime manager
   -> 对普通 Linux 非 hostNetwork Pod，常见实现再调用 CNI/IPAM
 ```
 
+IPAM 是 CNI 里负责“从地址池挑一个 IP 给 Pod”的环节。
+
 因此 `FailedCreatePodSandBox` 的 message 若明确出现 `plugin type=... failed (add)`、IPAM、网桥或网络 agent 错误，才进入具体 runtime/CNI 责任域。不能从 kubelet源码虚构一条固定的 `kubelet -> libcni.AddNetworkList` 调用，因为 containerd、CRI-O、VM 型 runtime 和 hostNetwork 的内部路径并不相同。
 
 ### 9.5 RuntimeService 与 ImageService 可以配置为不同 endpoint
+
+endpoint 就是服务连接地址，例如某个 containerd socket。这里要分清两个窗口：RuntimeService 管 Sandbox 和容器生命周期，ImageService 管镜像。
 
 源码：`pkg/kubelet/kubelet.go:403-415`，`PreInitRuntimeService` 的 **连续摘录**。函数后面的 cAdvisor 兼容判断与本章无关，未摘录。
 
@@ -921,7 +1016,7 @@ if remoteImageEndpoint == "" && kubeCfg.ContainerRuntimeEndpoint != "" {
 	remoteImageEndpoint = kubeCfg.ContainerRuntimeEndpoint
 }
 var err error
-// 当前 feature gate 决定 list 类 CRI 是否启用 streaming 能力。
+// 当前 feature gate 决定 list 类 CRI 是否启用 streaming（把结果分批传回）能力。
 useStreaming := utilfeature.DefaultFeatureGate.Enabled(features.CRIListStreaming)
 // 创建 RuntimeService client，供 Sandbox、container 与 status RPC 使用。
 if kubeDeps.RemoteRuntimeService, err = remote.NewRemoteRuntimeService(ctx, kubeCfg.ContainerRuntimeEndpoint, kubeCfg.RuntimeRequestTimeout.Duration, kubeDeps.TracerProvider, useStreaming); err != nil {
@@ -983,16 +1078,19 @@ if !kubecontainer.IsHostNetworkPod(pod) {
 // Sandbox、network、volume 与 DRA 前置已满足，通知 kubelet尽快更新 condition。
 logger.V(4).Info("Pod sandbox and network ready, invoking callback", "pod", klog.KObj(pod), "podIPs", podIPs)
 if err := m.runtimeHelper.OnPodSandboxReady(ctx, pod); err != nil {
-	// callback 属于状态通知；失败只记录，不阻断后续 image/container 创建。
+	// callback 是“这一步完成后，再通知另一个函数”的回调；这里只负责状态通知。
+	// 通知失败只记录，不阻断后续 image/container 创建。
 	logger.Error(err, "Failed to invoke sandbox ready callback, continuing with pod creation", "pod", klog.KObj(pod))
 }
 ```
 
-**大白话总结：** `RunPodSandbox` 成功只是“runtime 声称创建成功”。kubelet还要查 status 和 IP。RPC error 会有 Event；status=nil 没有同样 Event，但仍让本轮失败。即使 condition callback 报错，容器创建也继续，因为状态通知不应反向阻塞实际 workload。
+**大白话总结：** `RunPodSandbox` 成功只是“runtime 声称创建成功”。kubelet还要查 status 和 IP。RPC error 会有 Event；status=nil 没有同样 Event，但仍让本轮失败。callback 就是“Sandbox 好了以后顺手通知 kubelet 更新 Pod 条件”。即使这个通知报错，容器创建也继续，因为状态展示不应反过来卡住真正的容器启动。
 
-**顺手学 Go：** `resp.GetStatus()` 是 protobuf getter。`result.Fail(err)` 写的是 `PodSyncResult.SyncError`，不同于某个 `SyncResult.Fail`。两者最终都会被 `result.Error()` 聚合，但 reasonCache 只读取 StartContainer 子结果。
+**顺手学 Go：** `resp.GetStatus()` 是 protobuf 自动生成的取值方法；可以先把它当成“安全读取 response 里的 status”。`result.Fail(err)` 写的是整轮错误，某个 `SyncResult.Fail` 写的是单项错误。两者最后都会汇总，但 reasonCache 只读取“启动某个容器”的单项结果。
 
 ### 10.2 当前 Kubelet 的 callback 为什么异步，而且始终返回 nil
+
+异步的意思是：先让另一个小任务去更新状态，当前启动容器的主线不站在原地等待。`nil` 在 Go 里表示“没有错误”。
 
 源码：`pkg/kubelet/kubelet.go:3546-3578`，`Kubelet.OnPodSandboxReady` **完整函数，教学注释版**。
 
@@ -1046,7 +1144,9 @@ func (kl *Kubelet) OnPodSandboxReady(ctx context.Context, pod *v1.Pod) error {
 
 **顺手学 Go：** `go func() { ... }()` 立即启动一个匿名函数 goroutine；调用方不等待它完成。`DeepCopy()` 返回独立对象，避免并发修改共享缓存。goroutine 只表示并发执行，不保证 API 立刻看到结果。
 
-### 10.3 Sandbox READY 后还有两个 container 前置 early return
+### 10.3 Sandbox READY 后还有两个“提前结束本轮”的前置检查
+
+这一节属于二遍。`early return` 没有特殊机制，就是条件不满足时提前执行 `return`。image volume 是“把镜像内容作为卷使用”的功能，不是本案 `game-api` 的普通业务镜像；本案可先跳过它。
 
 源码：`pkg/kubelet/kuberuntime/kuberuntime_manager.go:1667-1680`，`SyncPod` **连续摘录**。
 
@@ -1097,7 +1197,9 @@ Pod network namespace 条件满足；
 
 ## 11. 第六层源码：为什么 `game-api` 失败后，`jmx-exporter` 仍能成功
 
-### 11.1 共用 start closure 先处理 container 重启退避，再进入单容器流水线
+### 11.1 共用的 `start` 小函数先检查重启等待，再进入单容器流水线
+
+源码里这个小函数属于 closure（闭包）：它能直接使用外层的 `pod`、`result` 等变量。先把它理解成“为每个容器重复使用的一段启动模板”就够了。
 
 源码：`pkg/kubelet/kuberuntime/kuberuntime_manager.go:1687-1741`，`SyncPod` 内局部 `start` 的 **完整 closure，教学注释版**。
 
@@ -1140,7 +1242,8 @@ start := func(ctx context.Context, typeName, metricLabel string, spec *startSpec
 	// 根据结果记录 image volume 挂载指标。
 	incrementImageVolumeMetrics(err, msg, spec.container, imageVolumes)
 	if err != nil {
-		// 错误码作为低基数 label，用于区分 image、config、create、start、hook 等失败。
+		// 错误码作为低基数 label：错误类别只有有限几种，不会因 Pod 名不断产生新标签。
+		// 这样指标系统可以安全地区分 image、config、create、start、hook 等失败。
 		metrics.StartedContainersErrorsTotal.WithLabelValues(metricLabel, err.Error()).Inc()
 		if sc.HasWindowsHostProcessRequest(pod, spec.container) {
 			metrics.StartedHostProcessContainersErrorsTotal.WithLabelValues(metricLabel, err.Error()).Inc()
@@ -1172,13 +1275,13 @@ start := func(ctx context.Context, typeName, metricLabel string, spec *startSpec
 }
 ```
 
-**大白话总结：** closure 为每个 container 单独记 action result。它把 CrashLoop backoff 和 image pull backoff 分开：前者在 `doBackOff`，后者在 `startContainer -> EnsureImageExists`。一个 container 返回 error，只代表这个 `start` 调用失败；是否阻断后续 container 由外层不同循环决定。
+**大白话总结：** 这个 `start` 小函数为每个 container 单独记一份结果。它把两种“先等一会再试”分开：`CrashLoopBackOff` 是容器启动后退出太多次，`ImagePullBackOff` 是镜像还没拉下来。一个 container 返回 error，只代表这一次启动失败；是否停止后面的容器，要看外层循环。
 
 **顺手学 Go：** closure 会捕获外层 `pod`、`podStatus`、`result`、`backOff` 等变量。`switch { case condition: }` 是无表达式 switch，相当于按顺序判断多个布尔条件。`err.Error()` 这里作为指标 label，依赖上游定义的低基数错误常量。
 
 ### 11.2 三类 container 的失败传播规则并不相同
 
-源码：`pkg/kubelet/kuberuntime/kuberuntime_manager.go:1743-1762,1790-1793`，同一 `SyncPod` 的 **非连续检查点**。两段之间省略 init 完成时间与 resize；代码块不可独立编译。
+源码：`pkg/kubelet/kuberuntime/kuberuntime_manager.go:1743-1762,1790-1793`，同一 `SyncPod` 的 **非连续检查点**。两段之间省略 init 完成时间与 resize；代码块不可独立编译。ephemeral container 是排障时临时加进 Pod 的容器；restartable init 是可以持续运行的 init 容器，行为更像辅助容器。这两类都属于二遍内容。
 
 ```go
 // ephemeral container 的 start 返回值没有用于中止循环；失败已写进 result，后续动作继续。
@@ -1276,7 +1379,7 @@ if err != nil {
 
 image backoff 还有一条独立账：`pkg/kubelet/images/image_manager.go:317-381` 的 `pullImage` 使用 `<podUID>_<image>` 作为 key。首次 pull 失败会 `backOff.Next` 并保存原错误；退避期内返回 `ErrImagePullBackOff`，不会每一轮都重新向 registry 发完整 pull。它与容器退出后的 `CrashLoopBackOff` 不是同一本 backoff。
 
-当前 `remoteImageService.PullImage` 使用 `context.WithCancel`，不像 `RunPodSandbox/CreateContainer/StartContainer` 在同一函数里增加 `r.timeout`。镜像 pull 是长操作，实际取消与超时还受上游 image puller、runtime 和发行版配置影响；不能把普通 runtime request timeout 机械套成镜像下载 SLA。
+当前 `remoteImageService.PullImage` 使用 `context.WithCancel`，不像 `RunPodSandbox/CreateContainer/StartContainer` 在同一函数里增加 `r.timeout`。镜像 pull 是长操作，实际取消与超时还受上游 image puller、runtime 和发行版配置影响；不能把普通 runtime request timeout 机械套成镜像下载 SLA（服务承诺或期望的完成时限）。
 
 ### 12.2 Config、PreCreate、CRI Create 与接口级 PreStart 防御分支
 
@@ -1315,7 +1418,7 @@ if err != nil {
 	return s.Message(), ErrCreateContainerConfig
 }
 
-// 在真正创建 container 前，把本轮资源视为准备执行的 actuated state。
+// 在真正创建 container 前，更新 kubelet内部“这些资源马上要生效”的记录。
 if err := m.setActuatedContainerResources(pod, container); err != nil {
 	m.recordContainerEvent(ctx, pod, container, "", v1.EventTypeWarning, events.FailedToCreateContainer, "Error: %v", err)
 	return err.Error(), ErrCreateContainerConfig
@@ -1397,7 +1500,7 @@ generateContainerConfig
 
 ### 12.3 `Created`、`Started` 和 PostStart 为什么不能混成一个成功点
 
-源码：`pkg/kubelet/kuberuntime/kuberuntime_container.go:290-338`，`startContainer` 尾部的 **连续摘录**。日志兼容 symlink 逻辑完整保留，因为它解释了 Start 成功后仍可能没有预期文件日志；中文注释只强调本章相关边界。
+源码：`pkg/kubelet/kuberuntime/kuberuntime_container.go:290-338`，`startContainer` 尾部的 **连续摘录**。日志兼容 symlink（符号链接，可以先理解成文件快捷方式）逻辑完整保留，因为它解释了 Start 成功后仍可能没有预期文件日志；中文注释只强调本章相关边界。
 
 ```go
 // 第二次 container CRI：让已经创建的 runtime object 真正启动进程。
@@ -1475,7 +1578,7 @@ if container.Lifecycle != nil && container.Lifecycle.PostStart != nil {
 return "", nil
 ```
 
-**大白话总结：** 观察到 `Created` Event，说明代码已经越过 CRI Create 和 stock internal PreStart 的 nil 返回，并调用了 Event recorder；它仍不等于进程已运行。`Started` 才说明 CRI Start 成功；PostStart 之后仍可能失败。反过来，缺少 Event 不能证明相应代码没执行，因为 Event 是 best-effort 诊断信息。
+**大白话总结：** 观察到 `Created` Event，说明代码已经越过 CRI Create 和 stock internal PreStart 的 nil 返回，并调用了 Event recorder；它仍不等于进程已运行。`Started` 才说明 CRI Start 成功；PostStart 之后仍可能失败。反过来，缺少 Event 不能证明相应代码没执行，因为 Event 是 best-effort（尽力记录，但允许延迟、合并或丢失）的诊断信息。
 
 **顺手学 Go：** `if container.Lifecycle != nil && ...` 用短路保护嵌套指针访问。`kubecontainer.ContainerID{Type: ..., ID: ...}` 是按字段构造值。内层 `if err := m.killContainer(...); err != nil` 的 `err` 不会覆盖外层 `handlerErr`。
 
@@ -1506,6 +1609,8 @@ CRI CreateContainer 成功
 - 没有 `Started`。
 
 这正是为什么不能只凭 Event reason 做全链路判断。
+
+<a id="ch12-retry-loop"></a>
 
 ## 13. 第八层源码：错误怎样进入 status，又怎样决定下一轮
 
@@ -1559,7 +1664,7 @@ func (p *PodSyncResult) Error() error {
 			)
 		}
 	}
-	// 多个错误形成 aggregate；空列表得到 nil。
+	// 把多个错误汇总成一个 aggregate；列表为空时得到 nil。
 	return utilerrors.NewAggregate(errlist)
 }
 ```
@@ -1691,6 +1796,8 @@ default:
 
 DRA 也采用保留准备结果的边界：`PrepareDynamicResources` 成功后，后续 Sandbox、image 或 container 失败时，本条运行路径不会立刻 `Unprepare`；`UnprepareDynamicResources` 位于 Pod 终止链，并要求在所有 container 停止后、API terminal status 更新前执行。它说明可恢复启动失败不等于 Pod 生命周期结束。
 
+<a id="ch12-java-recovery"></a>
+
 ## 14. 回到 Java 现场：为什么只修镜像凭据，不重建 Pod
 
 ### 14.1 事故这一轮实际发生了什么
@@ -1764,7 +1871,22 @@ startup probe 需要一个已经运行的 container 作为探测目标。本案�
 
 ### 14.3 修复 credential 后，下一轮为什么只补 `game-api`
 
-只改变一个输入：有效 registry credential 已经可用。其他状态保持不变。
+credential 就是访问私有镜像仓库的认证凭据。现在只改变这一个输入：有效凭据已经可用，其他状态保持不变。
+
+**变化图从左往右读。** 实线表示修复后下一轮需要执行的动作；虚线表示前一轮已经成功、这一轮只复用不重做的成果。
+
+```mermaid
+flowchart LR
+    A["修复前<br/>game-api 镜像失败"] --> B["更新有效镜像凭据"]
+    B --> C["下一轮重新读取节点现场"]
+    C -.-> D["Sandbox READY<br/>保留，不重建"]
+    C -.-> E["jmx-exporter RUNNING<br/>保留，不重启"]
+    C -->|缺失| F["game-api 仍缺失<br/>只补这一项"]
+    F --> G["镜像成功"]
+    G --> H["CreateContainer"]
+    H --> I["StartContainer"]
+    I --> J["JVM 启动后<br/>startup probe 才开始"]
+```
 
 下一轮重新观察：
 
@@ -1800,9 +1922,13 @@ EnsureImageExists 成功
 
 ### 14.4 这条恢复结论的证据边界
 
-同 UID、同 Node 最终恢复，能证明 kubelet具备原地继续收敛能力；但仅凭 API 最终状态，不能区分每一次内部 retry 的精确时间，也不能证明 registry pull 只调用了一次。要重建时间线，必须组合 Event series、kubelet/runtime 日志与 CRI 当前/历史数据。
+同 UID、同 Node 最终恢复，能证明 kubelet具备原地继续收敛能力；但仅凭 API 最终状态，不能区分每一次内部 retry 的精确时间，也不能证明 registry pull 只调用了一次。要重建时间线，必须组合 Event series（同类重复 Event 合并后的记录）、kubelet/runtime 日志与 CRI 当前/历史数据。
+
+<a id="ch12-counterfactual"></a>
 
 ## 15. 改一个输入，源码会走哪条反事实分支
+
+“反事实”不是玄学，就是把现场里的一个条件改掉，再预测代码会改走哪条分支。这样能检查你是真的理解控制流，还是只记住了本案答案。
 
 ### 15.1 节点 runtime 上报 `NetworkReady=false`
 
@@ -1838,7 +1964,7 @@ runtime 中可能已经留下 Sandbox。kubelet记录 `FailedPodSandBoxStatus`�
 
 ### 15.5 `game-api` image 已在节点本地
 
-`EnsureImageExists` 的 precheck 可以直接返回 imageRef，不走远端 pull。它仍必须继续经过 ContainerConfig、PreCreate、Create、stock internal PreStart、Start；“镜像已缓存”不等于容器已运行。
+`EnsureImageExists` 的 precheck（正式拉取前的本地检查）可以直接返回 imageRef，不走远端 pull。它仍必须继续经过 ContainerConfig、PreCreate、Create、stock internal PreStart、Start；“镜像已缓存”不等于容器已运行。
 
 ### 15.6 `game-api` runtime 状态为 Unknown
 
@@ -1882,6 +2008,8 @@ Normal Started 已可能出现
 DRA 资源不会在这条可恢复启动路径立刻 Unprepare；它们为后续重试保留。只有 Pod 进入终止链、container 全部停止后，才进入 `UnprepareDynamicResources`。经典 Device Plugin 与 DRA 是两套不同资源准备路径，不能混写。
 
 ## 16. 统一失败语义：no-op、等待、Error 和补偿不是一回事
+
+这里的 no-op 是“检查后发现已经符合期望，所以正常地什么也不做”；它不是漏执行，也不是失败。补偿则是前一步已经产生影响后，再做一个动作尽量收拾现场，例如 PostStart 失败后尝试 kill。
 
 | 类型 | 本章示例 | 当前轮含义 | 主要后续 |
 | --- | --- | --- | --- |
@@ -1945,6 +2073,8 @@ API PodStatus 是异步快照，可能落后于目标 Node 当前 runtime。它�
 
 ### 17.3 Event 侧：reason、message、series 和报告者一起看
 
+series 是 Kubernetes 把同一种重复 Event 合并后的计数和最近发生时间；它能减少刷屏，所以不能只看 Event 对象第一次创建的时间。
+
 要验证的变量：失败属于 Sandbox、image、Create、Start 还是 hook，以及由哪个 Node 报告。
 
 ```powershell
@@ -1957,7 +2087,7 @@ kubectl get events -n $ns `
 
 时间边界：
 
-- Event 是 best-effort 诊断信息，可能被聚合、限流或 TTL 清理；缺失不证明分支没执行。
+- Event 是 best-effort 诊断信息，可能被聚合、限流或按 TTL（保留期限）清理；缺失不证明分支没执行。
 - `metadata.creationTimestamp` 是 Event 对象创建时间，不一定是聚合 series 最近发生时间。
 - 新旧 Event API 字段可能使用 `eventTime`、`lastTimestamp`、`series.lastObservedTime` 与不同 count。
 - 当前 `FailedToCreateContainer`、`FailedToStartContainer` 常量的字面 reason 都是 `Failed`，必须继续读 message 和 waiting reason。
@@ -2047,13 +2177,15 @@ Kubelet.SyncPod
   -> CRI CreateContainer / StartContainer
 ```
 
+这里只先认三个角色：经典 Device Plugin 是“向 kubelet报告有哪些 GPU、分配时返回哪些设备信息”的插件；DeviceManager 是 kubelet内部保存和使用这份分配结果的模块；DRA 是另一套较新的动态资源申请路径。三者的源码以后专讲，本课只看它们插入容器启动链的哪个位置。
+
 | 本章 Java 维度 | GPU 迁移后新增/替换 | 哪条逻辑不变 |
 | --- | --- | --- |
 | 私有业务镜像 | CUDA/runtime/model image 可能更大、拉取更慢 | image 仍在 CreateContainer 前 |
 | env/mount/resource | device env、mount、CDI device、annotation | 最终都汇入 ContainerConfig |
 | 无 ResourceClaim | DRA Pod 可在 Sandbox 前 PrepareDynamicResources | DRA 失败仍不等于 CNI/Sandbox error |
 | CPU/memory 运行条件 | 经典 Device Plugin 的 device ID 与 DeviceManager 注入 | 普通 Sandbox/network 主线不跳过 |
-| JVM/probe | CUDA context、模型加载、推理 server probe | Start 成功仍不等于业务 Ready |
+| JVM/probe | CUDA context（GPU 程序运行时环境）、模型加载、推理 server probe | Start 成功仍不等于业务 Ready |
 
 必须分清：
 
@@ -2072,20 +2204,20 @@ Kubelet.SyncPod
 - `NetworkNotReady` 与单 Pod `RunPodSandbox` 网络失败的边界；
 - Sandbox config/logdir/RuntimeClass/CRI 四道门；
 - Sandbox status、Pod IP、`PodReadyToStartContainers` 的证据边界；
-- image -> config -> Create -> stock internal PreStart bookkeeping -> Start -> PostStart，并能识别接口防御分支不等于 stock 可达故障；
+- image -> config -> Create -> 上游原版 internal PreStart 内部登记 -> Start -> PostStart，并能识别“调用方写了防御分支”不等于“当前标准实现真会报这个错”；
 - 普通 container 部分成功与普通 init 阻断的差异；
 - reasonCache 只处理 StartContainer action；
 - `result.Error -> completeWork` 的重试闭环；
-- PostStart best-effort kill 补偿。
+- PostStart 失败后尝试 kill 的补偿，并知道这次 kill 也不保证成功。
 
 ### 20.2 首遍知道边界，二遍再看实现
 
-- RuntimeClass admission、lookup 与 runtime unknown handler；
+- RuntimeClass 在 API 接入时的校验、kubelet查询 handler、runtime 不认识 handler；
 - Sandbox attempt 与多 Sandbox 收敛；
-- instrumented wrapper 的各类 metrics；
+- 只负责计时和转发的指标包装层；
 - CRI request timeout 与 PullImage 取消边界；
 - DRA prepare/unprepare；
-- image volume、user namespace、in-place resize；
+- image volume、user namespace、in-place resize（不重建 Pod 的原地资源调整）；
 - restartable init 与 ephemeral container；
 - StopPodSandbox 与 GC Remove 的分工。
 
@@ -2102,42 +2234,57 @@ Kubelet.SyncPod
 
 ## 21. 验收题：改变输入，预测源码分支
 
-### 21.1 题目
+<a id="ch12-first-check"></a>
 
-1. `NetworkReady=false` 时，为什么 `crictl` 查不到新 Sandbox不能直接证明 `RunPodSandbox` 失败？
+### 21.1 首遍验收：这是进入第 13 课的门槛
+
+1. `PodReadyToStartContainers=True`、Pod IP 已有，但 `game-api containerID=""` 且为 `ImagePullBackOff`，为什么不该先查 JVM 和 startup probe？
+2. `game-api` 拉镜像失败后，为什么 `jmx-exporter` 仍可能 Running？
+3. Normal `Created` 和 Normal `Started` 分别能证明到哪一步？
+4. `Started` 已出现、随后 `FailedPostStartHook`，kubelet会怎样补偿？补偿一定成功吗？
+5. 修复 imagePullSecret 后，为什么不应该删除 READY Sandbox 和 Running 的辅助容器？
+6. 请不用函数名，只用人话画出“想要的 Pod -> 节点现场 -> 本轮施工单 -> 逐个启动容器 -> 记录结果 -> 安排下一轮”。
+
+首遍通过标准：前 5 题至少答对 4 题，并能画出第 6 题；回答必须说清“卡在哪一步、后一步有没有发生、已成功的部分是否保留”。做到这里就可以进入第 13 课，不要求先掌握 DRA、callback 和 context。
+
+<a id="ch12-second-check"></a>
+
+### 21.2 二遍加深：检查边界，不作为进入下一课的门槛
+
+1. `NetworkReady=false` 时，为什么查不到新 Sandbox 不能直接证明 `RunPodSandbox` 失败？
 2. 最新 Sandbox READY、network object 非 nil、IP 非空时，`PodSandboxChanged` 返回什么？
-3. `game-api` image pull 失败后，为什么 `jmx-exporter` 仍可能 Running？
-4. DRA Prepare 失败为什么可能有 Warning Event，但 `result.Error()` 仍为 nil？
-5. `PodSandboxStatus` RPC 成功但 status=nil，会不会记录 `FailedPodSandBoxStatus`？
-6. 有 CRI CREATED container、没有 Normal Created，能不能直接判断 stock internal PreStart 失败？应先查什么？
-7. Normal Created 已出现、Started 未出现、waiting=`RunContainerError`，断点在哪里？
-8. Started 已出现、随后 `FailedPostStartHook`，kubelet会怎样补偿？补偿一定成功吗？
-9. 修复 imagePullSecret 后，为什么不应该删除 READY Sandbox 和 Running sidecar？
-10. reasonCache 会不会保存 `FailedCreatePodSandBox`？为什么？
-11. `context.WithoutCancel` 意味着删除 Pod 可以立刻取消正在进行的所有 CRI 调用吗？
-12. GPU Pod 使用经典 Device Plugin 时，为什么不一定进入 DRA Prepare 分支？
+3. DRA Prepare 失败为什么可能有 Warning Event，但 `result.Error()` 仍为 nil？
+4. `PodSandboxStatus` RPC 成功但 status=nil，会不会记录 `FailedPodSandBoxStatus`？
+5. 有 CRI CREATED container、没有 Normal Created，能不能直接判断上游原版 kubelet 的 internal PreStart 失败？应先查什么？
+6. `context.WithoutCancel` 是否意味着删除 Pod 能立刻取消所有正在进行的 CRI 调用？
 
-### 21.2 折叠答案
+### 21.3 折叠答案
 
 <details>
-<summary>展开参考答案</summary>
+<summary>展开首遍参考答案</summary>
 
-1. 因为节点级网络门在 runtime manager 外，非 hostNetwork Pod 会在调用 `containerRuntime.SyncPod` 前返回，根本没发 RunPodSandbox。
-2. 返回 `false、当前 attempt、当前 Sandbox ID`，表示复用；但实际代码还会检查 READY 数量与 namespace 模式。
-3. 普通 container 外层循环不使用单次 `start` error 来 return；错误已写入各自 SyncResult，所以继续尝试下一个普通 container。
-4. 当前 DRA early return 记录 `FailedPrepareDynamicResources`，却没有对 `createSandboxResult` 调 Fail，也没有 `result.Fail`；现有测试期望 SyncPod 聚合成功。
-5. 不会。RPC error 分支记录 Event；status=nil 分支只写 SyncError 后返回。
-6. 不能。固定提交的 stock internal PreStart 固定返回 nil；应先查 Event best-effort/异步、kubelet在 Create 后的进程窗口、Start 调用日志和 CRI current state。只有非标准实现才把 internal PreStart error 当候选。
-7. stock internal PreStart 已返回 nil，代码已调用 Created Event recorder，随后 CRI StartContainer 返回 error。
-8. kubelet记录 FailedPostStartHook，并尝试 kill 已启动 container；kill 失败只记录二次日志，仍返回 ErrPostStartHook。
-9. 下一轮 planner会看到 Sandbox 与 sidecar 仍符合 desired，只把缺失的 game-api 加入 start plan；全量删除会放大局部 registry 故障。
-10. 不会。reasonCache.Update 只处理 Action=StartContainer 的子结果；Sandbox error 要靠 PodSyncResult、Event 和日志。
-11. 不能。当前 runtime SyncPod 不继承 Pod worker cancel；remote Run/Create/Start 使用各自 timeout。删除竞态只在特定 Sandbox error 分支有终止请求特判。
-12. 经典 Device Plugin/DeviceManager 与 DRA 是不同资源路径；只有 DRA feature 与 ResourceClaim 相关处理才进入 PrepareDynamicResources。
+1. `ImagePullBackOff` 发生在 `CreateContainer` 之前；没有 container ID 就没有运行时容器，更没有 JVM 进程。startup probe 要等容器真正 Start 后才开始。
+2. 普通容器循环会逐个调用 `start`。单个错误已经记进自己的结果，不会让循环 `return`，所以还会继续尝试 `jmx-exporter`。
+3. `Created` 说明 CRI 已经创建容器对象并拿到 ID，不保证进程已经运行；`Started` 说明 CRI Start 成功，但仍不保证 PostStart 和业务 Ready 成功。
+4. kubelet记录 `FailedPostStartHook`，并尝试 kill 已启动容器；kill 本身也可能失败，失败时另记日志，不能写成“一定清理成功”。
+5. 下一轮看到 Sandbox 和 `jmx-exporter` 仍符合期望，只把缺失的 `game-api` 放进启动清单。全量删除会把一个镜像凭据故障放大成网络和健康容器重建。
+6. 一条合格主线是：“读取 Pod 配置和节点现场 -> 比较差距 -> 保留可用 Sandbox -> 逐个启动缺失容器 -> 分别记录成功失败 -> 有错误就安排下一轮 -> 下一轮重新读现场，只补缺口。”
 
 </details>
 
-通过标准：不看正文，能在白板画出“desired Pod -> runtime PodStatus -> podActions -> Sandbox -> per-container start -> PodSyncResult -> reasonCache/result.Error -> worker retry”，并能把上述 12 题至少 10 题解释到状态所有者、失败是否中止和下一步补偿，而不是只报函数名。
+<details>
+<summary>展开二遍参考答案</summary>
+
+1. 节点级网络门在 runtime manager 外；非 hostNetwork Pod 会在调用 `containerRuntime.SyncPod` 前返回，因此可能根本没有发出 `RunPodSandbox`。
+2. 返回 `false、当前 attempt、当前 Sandbox ID`，表示复用；完整判断还会检查 READY 数量与 namespace 模式。
+3. 当前 DRA 分支记 `FailedPrepareDynamicResources` 后提前返回，却没有给 `createSandboxResult` 或整轮结果写 error，因此聚合结果仍可能为 nil。
+4. 不会。RPC error 分支记录 Event；response 的 status=nil 分支只写整轮错误后返回。
+5. 不能。固定提交的上游原版 internal PreStart 固定返回 nil；应先查 Event 可能延迟或丢失、kubelet 是否在 Create 后中断、Start 调用日志和 CRI 当前状态。只有替换过实现时才把 internal PreStart error 当候选。
+6. 不能。当前 runtime SyncPod 不继承 Pod worker 的取消信号；远端 Run/Create/Start 使用各自超时。删除竞态只在特定 Sandbox 失败分支有额外判断。
+
+</details>
+
+二遍通过标准：6 题至少答对 5 题，并能指出每个结论来自 API 快照、CRI 当前态、Event、日志还是源码分支；二遍没通过不影响继续第 13 课，可以以后回补。
 
 ## 22. 本章 Go 语法快速索引
 
@@ -2246,8 +2393,8 @@ go test ./pkg/kubelet -run 'TestReasonCache|TestCompleteWork' -count=1
 实际执行结果：**两组命令都在读取 `go.work` 时停止，尚未进入 package 编译，更没有运行到任何测试函数。** 本机是 `go1.19.4`，当前源码工作区要求 `go 1.26.0`，旧工具链无法识别该版本声明和 `godebug` 指令：
 
 ```text
-reading go.work: <KUBERNETES_SRC>\go.work:3: invalid go version '1.26.0': must match format 1.23
-<KUBERNETES_SRC>\go.work:5: unknown directive: godebug
+reading go.work: D:\datou\devops\kubernetes-master\kubernetes\go.work:3: invalid go version '1.26.0': must match format 1.23
+D:\datou\devops\kubernetes-master\kubernetes\go.work:5: unknown directive: godebug
 ```
 
 因此本章的验证强度应准确写成：

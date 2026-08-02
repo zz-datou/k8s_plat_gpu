@@ -1,70 +1,115 @@
 # 第 10 课：game-api 因 `2000m > 1500m` 失败后，scheduler 为什么不空转，却能在释放 `1000m` 后继续
 
-> 从一次 Spring Boot 滚动发布的 `FailedScheduling`，读懂失败插件、事件驱动重试、in-flight 防漏事件、backoff 和抢占边界。
+> 从一次 Spring Boot 滚动发布的 `FailedScheduling`，看懂一件事：调度失败后，为什么先等“可能有用的变化”，而不是不停重算；资源真的释放后，它又为什么能继续。
 
-第 09 课已经算清：admission 后的 `game-api-new-x` 不是主容器写着的 `1200m`，而是整个 Pod 的 `2000m/2Gi`。现在三台候选 Node 都只有 `1500m` CPU request 余额，于是 NodeResourcesFit 返回 `Insufficient cpu`。
+第 09 课已经算清：经过 admission（Pod 保存前的统一补默认值、注入和校验）后，`game-api-new-x` 不是主容器写着的 `1200m`，而是整个 Pod 的 `2000m/2Gi`。这里的 request 是 scheduler 用来预留容量的数字，不是容器此刻的实时使用量。现在三台候选 Node 都只剩 `1500m` CPU request 余额，于是 NodeResourcesFit——scheduler 内置的“节点资源够不够”检查——返回 `Insufficient cpu`。
 
 新的问题不是“为什么失败”，而是失败之后怎么办。
 
-假设这是一个 Spring Boot 服务的滚动发布：JVM 冷启动、类加载、JIT 和 readiness 预热约需 45 秒，所以平台使用 `maxSurge=1`、`maxUnavailable=0`，宁愿暂时多一个 Pod，也不先缩掉旧副本。新 Pod 因容量不足 Pending 了。
+假设这是一个 Spring Boot 服务的滚动发布：JVM 冷启动、类加载、JIT（运行时逐步优化热点代码）和 readiness（应用通过就绪检查、可以接流量）约需 45 秒，所以平台使用 `maxSurge=1`、`maxUnavailable=0`，宁愿暂时多一个 Pod，也不先缩掉旧副本。新 Pod 因容量不足 Pending 了。
 
 此时先不要执行命令，也不要先背队列名。你先预测四件事：
 
 1. 资源账本完全没变化时，scheduler 应不应该每毫秒重算一次？
-2. `worker-05` 上一个已绑定 Pod 释放 `1000m` request 后，删除事件能不能直接把新 Pod 绑定到该节点？
-3. 如果这个释放事件恰好发生在新 Pod 已被取出、但失败处理还没结束的窗口里，scheduler 会不会永远错过它？
-4. 新旧 Java Pod 都没有 PriorityClass、优先级都是 0 时，新 Pod 能不能抢占旧 Pod？
+2. `worker-05` 上一个已绑定 Pod 释放 `1000m` request 后，这个变化能不能直接把新 Pod 绑定到该节点？
+3. 如果资源释放恰好发生在新 Pod 已被取出、但失败处理还没结束的窗口里，scheduler 会不会永远错过它？
+4. 新旧 Java Pod 都没有 PriorityClass（给 Pod 写入优先级整数的集群级配置）、优先级都是 0 时，新 Pod 能不能抢占旧 Pod？
 
-本课会沿下面这条因果链回答：
+先把本章最容易混淆的“事件”说清楚。本章会出现两种完全不同的东西：
+
+- **ClusterEvent（集群对象变化通知）：** scheduler 内部把“某个 Pod 删除了”“某个 Node 的可分配资源变了”归成一种变化信号，用它判断失败 Pod 是否值得重算。它不是一个保存到 API Server 的对象。
+- **Kubernetes Event 对象：** `kubectl get events` 或 `kubectl describe pod` 能看到的公开记录，例如 `FailedScheduling`。它主要给人排障看，不负责把 Pod 从内部队列叫醒。
+
+后文写“ClusterEvent”或“对象变化通知”时指第一种；写“公开 Event”时指第二种。
+
+下面按**从上往下**读。箭头表示因果顺序，不表示这些步骤一定处在同一个函数里，更不表示组件间同步 RPC（程序 A 直接远程调用程序 B，并等它返回）：
 
 ```text
 Java 滚动发布制造临时副本
-  -> NodeResourcesFit 记录“谁拒绝了 Pod”
-  -> 没有相关变化时进入等待，而不是热循环
-  -> 相关对象先更新 scheduler cache，再产生 ClusterEvent
-  -> 只有上次拒绝插件的 QueueingHint 认为值得重试，Pod 才离开等待区
-  -> backoff 计算失败 Pod 相对让路顺序；activeQ 空时当前版本仍可提前取出
-  -> 无论何时再次 Pop，完整 Filter 才决定这次能否成功
-  -> 若普通重试无解，PostFilter 才评估抢占能否为未来一轮创造条件
+  -> “节点资源够不够”检查拒绝 Pod，并记住拒绝者叫 NodeResourcesFit
+  -> 资源账没变化时先等着，不反复做同一道题
+  -> 相关对象变化后，先改 scheduler 内存里的资源账，再发 ClusterEvent
+  -> NodeResourcesFit 的 QueueingHint（“这次变化值得重算吗”）返回值得，Pod 才离开等待区
+  -> backoff（失败后短暂让路）避免它连续挤占新 Pod；没有别的工作时当前版本也可提前再试
+  -> 再次取出 Pod 后，完整 Filter（所有节点条件检查）才决定这轮能否成功
+  -> 普通检查仍无解时，PostFilter（失败后的补救阶段）才评估抢占能否为下一轮创造条件
 ```
 
-整章只有一个中心命题：
+整章先记住这句人话：
 
-> **调度失败后的重试不是定时轮询，也不是事件直接给答案。scheduler 把“什么事实可能改变上次失败”交给拒绝插件判断，用 backoff 降低连续失败 Pod 相对新工作负载的重试优先级，把最终正确性仍交给下一轮完整调度；in-flight 事件账本负责保证这个反馈环不丢信号。**
+> **没变化就别白算；有变化只是把 Pod 叫回来重算，并不直接指定节点；同优先级 Pod 也不能靠抢占互相挤掉。**
+
+对应到源码：拒绝 Pod 的插件负责判断某次对象变化是否可能有用，backoff 让连续失败的 Pod 暂时给新工作让路，下一轮完整调度负责给最终答案；Pod 已经被取走、正在计算时，in-flight（“正在处理”记录）负责把中途发生的有用变化先记下来。
 
 ## 0. 本课定位、深度与阅读路线
 
-这是 scheduler 失败反馈环的 **S3 深读**。你已经用了几年 Kubernetes，本课不重新解释 Pod Pending、Event 或 PriorityClass 的基础用法，而是回答它们背后的状态所有权和并发设计。
+这是 scheduler 失败反馈环（失败 -> 等变化 -> 被叫醒 -> 再计算这一圈）的 **S3 深读**。S3 的意思不是“先背很多函数”，而是能从生产现象一路追到关键判断源码。你已经用了几年 Kubernetes，所以本课不重复教 `kubectl get pod` 的基本操作；但源码里第一次出现的概念，仍按新手方式说明“它是谁、做什么、为什么需要”。
+
+### 0.1 先把本章高频词翻成人话
+
+这些词先认用途，不用背英文：
+
+| 源码里的词 | 本章中的大白话 | 它解决什么问题 |
+|---|---|---|
+| scheduler / kube-scheduler | 给还没选 Node 的 Pod 挑节点的控制面进程 | 把 Pod 的要求与 Node 条件做匹配 |
+| scheduling cycle | scheduler 取出一个 Pod，并尝试为它选 Node 的一轮计算 | 区分“这一轮失败”和“以后永远失败” |
+| request / Allocatable | Pod 要预留多少；Node 最多可承诺多少 | scheduler 算的是承诺账，不是实时使用率 |
+| plugin | scheduler 里各管一项检查的小模块 | 资源、污点、亲和性、存储等判断可以各自演进 |
+| Filter / PostFilter | Filter 是正常节点检查；PostFilter 是全部节点都失败后的补救阶段 | 先判断能不能放，再考虑抢占等补救办法 |
+| scheduler cache / snapshot | scheduler 内存里的对象账本；某一轮计算使用的只读视图 | 不必每次判断都远程查询 API Server，又能让一轮计算看到一致视图 |
+| informer / lister | informer 持续接收对象变化并维护本地副本；lister 从这份副本读取 | 让控制器和 scheduler 高效读取最新已知状态 |
+| `activeQ` | 可以马上取出来尝试的队列 | 保存当前值得调度的 Pod |
+| in-flight | 已从队列取走、但这一轮还没完成的 Pod 记录 | 防止计算中途发生的有用变化被漏掉 |
+| `unschedulablePods` | 上次失败，暂时等相关变化的 Pod 集合 | 避免在条件没变时反复空算 |
+| backoff / `backoffQ` | 连续失败后短暂让路，以及保存这类 Pod 的队列 | 防止少数失败 Pod 挤占调度吞吐；它不会凭空增加资源 |
+| QueueingHint | 拒绝插件回答“这次对象变化值不值得重算” | 只叫醒可能受这次变化影响的失败 Pod |
+| `FitError` / rejector plugin | “所有候选 Node 都不合适”的结构化结果；里面记着每台 Node 为什么失败、哪些 plugin 拒绝 | 不靠解析一行公开 Event 文本，也能知道该问谁的 QueueingHint |
+| UID / Condition | UID 是这一份对象的唯一身份证；Condition 是 API 上公开的某项判断记录 | 区分同名重建的新 Pod，也避免把公开状态误当内部队列位置 |
+| scheduler profile | 由 `Pod.spec.schedulerName` 选中的一套 plugin 配置 | 同一个 kube-scheduler 可以让不同 Pod 使用不同插件组合 |
+| 吞吐 / 活性 | 吞吐是单位时间能处理多少 Pod；活性是 Pod 最终还会再获得处理机会 | 一个关注处理效率，一个防止 Pod 永久睡住 |
+| 竞态 / 原子 | 竞态是并发先后不同可能改变结果；原子表示外部看不到操作做到一半的中间状态 | 解释为什么要加锁、重查对象，以及为什么跨 API 动作不能假装一次完成 |
+| nomination / `nominatedNodeName` | 抢占后记录的“下轮优先再看这台 Node” | victim 退出需要时间，不能当场假装已经绑定成功 |
+| victim / PDB | victim 是抢占准备删除的低优先级 Pod；PDB 是业务允许同时少掉多少副本的预算 | 控制抢占对象及可用性破坏，但 PDB 在 scheduler 抢占中不是绝对锁 |
 
 本课会读深：
 
 - API 中的 Pending 与 scheduler 内部四种状态为什么不能一一对应；
 - `Pop` 后为什么还要登记 in-flight；
 - Filter 失败后为什么先运行 PostFilter，再进入 FailureHandler；
-- `FitError.Diagnosis.UnschedulablePlugins` 为什么是一份重试契约；
+- `FitError.Diagnosis.UnschedulablePlugins`（记住本轮哪些正常检查拒绝了 Pod）为什么是一份重试依据；
 - 失败处理为何重新检查 informer cache、`spec.nodeName`、UID 和对象副本；
 - ClusterEvent、QueueingHint、三种 `queueingStrategy` 与 backoff 怎样分工；
-- 事件发生在 scheduling cycle 中间时，怎样避免丢唤醒；
-- 5 分钟 flush 为什么是活性安全网，不是主要重试机制；
+- ClusterEvent 发生在 scheduling cycle 中间时，怎样避免丢唤醒；
+- 5 分钟 flush（定期把等待过久的 Pod 兜底叫醒）为什么只是活性安全网，不是主要重试机制；
 - 当前固定提交中 DefaultPreemption 的候选、victim、PDB、异步执行和 `nominatedNodeName` 边界。
 
 本课只建立边界、不展开：
 
 - 自定义 scheduler plugin 的开发与发布；
-- PodGroup、Workload-aware preemption、DRA Pending plugin 的完整实现；
-- scheduler extender 的网络协议；
+- PodGroup（把一组 Pod 当成整体等待）、Workload-aware preemption（按工作负载整体考虑抢占）、DRA Pending plugin（动态资源分配尚未完成时让 Pod 等待）的完整实现；
+- scheduler extender（scheduler 调用的外部扩展程序）的网络协议；
 - Cluster Autoscaler 如何决定扩容；
 - Device Plugin 怎样上报 GPU、kubelet 怎样选择 GPU UUID；这些留给第 15～17 课。
 
-建议分两遍读：
+### 0.2 首遍只走六站，不要从头到尾硬啃
 
-- **首遍抓主线：** 读 `2～5 -> 7～8 -> 10.1～10.4、10.7 -> 11.1、11.2、11.7 -> 12 -> 13.1、13.3～13.4、13.9～13.10 -> 14～16 -> 18 中未标“二遍进阶”的题`。目标是能从 `FailedScheduling` 推导“等待什么事件、失败 Pod 怎样给新工作让路、下一轮为什么可能成功”，并解释默认同优先级为什么不能抢占。
-- **二遍补并发与抢占实现：** 再读 `6、9、10.5～10.6、11.3～11.6、13.2、13.5～13.8、13.11、19～21`，重点是 in-flight 链表、三种 queueing strategy、timeout flush、victim reprieve 与当前默认异步抢占。Go 语法不需要先单独学完。
+| 站点 | 章节锚点 | 这一站学会什么 |
+|---:|---|---|
+| 1 | 第 2 节 | 用 `2000m > 1500m` 和释放 `1000m` 固定 Java 发布现场 |
+| 2 | 第 3～4 节 | 说明为什么不能热循环、不能所有变化都全量唤醒、不能由删除通知直接指定 Node |
+| 3 | 第 5 节与第 5.1 节 | 先看总图，再用本章第一段 Go 源码验证“已绑定 Pod 删除只表示值得重算” |
+| 4 | 第 7～8 节；第 10.1～10.4、10.7～10.8 节 | 看 scheduler 怎样记住拒绝者，以及 NodeResourcesFit 怎样筛选真正相关的变化 |
+| 5 | 第 11.1、11.2、11.7 节；第 12 节 | 看 backoff 怎样让路，再把资源释放前后按时间走一遍 |
+| 6 | 第 13.1、13.3、13.4、13.9、13.10 节；第 14～16 节 | 判断本例为什么不能同优先级抢占，并把源码结论落回生产证据和 GPU 短映射 |
+
+走完六站，完成第 18 节“首遍验收”，就可以进入下一课。
+
+**第二遍再读：** 第 6、9、10.5～10.6、11.3～11.6、13.2、13.5～13.8、13.11、19～21 节。重点是 in-flight 链表、三种内部迁移策略、超时安全网、victim 赦免与当前默认异步抢占。Go 语法遇到阻碍时就地补，不需要先学完整本 Go 教程。
 
 ## 1. 当前源码基线与阅读约定
 
 ```text
-源码目录：<KUBERNETES_SRC>
+源码目录：D:\datou\devops\kubernetes-master\kubernetes
 commit：301946d15e67a4a2e8a5fb8292eb836acd366d78
 describe：v1.37.0-alpha.0-280-g301946d15e6
 源码 go.mod：go 1.26.0
@@ -91,7 +136,7 @@ kubernetes/pkg/scheduler/framework/plugins/defaultpreemption/default_preemption.
 
 ## 2. 先不执行命令：把 Java 发布现场固定下来
 
-以下是教学整理的生产场景，不是某个真实集群的原始 Event。数字沿用第 09 课，目的是让同一个 Pod request 从失败计算一直走到重试成功。
+以下是教学整理的生产场景，不是某个真实集群的原始公开 Event。数字沿用第 09 课，目的是让同一个 Pod request 从失败计算一直走到重试成功。
 
 ### 2.1 为什么滚动发布会在短时间多要一份 request
 
@@ -163,11 +208,19 @@ Reason=Unschedulable
 Message=0/3 nodes are available: 3 Insufficient cpu.
 ```
 
-Event 文本随版本、插件和聚合方式变化，不能把这一行当稳定 API。本章真正依赖的是 FitError 中保存的插件身份与 Node 状态，而不是解析英文字符串。
+公开 Event 的文本随版本、插件和聚合方式变化，不能把这一行当稳定 API。本章真正依赖的是 FitError 中保存的插件身份与 Node 状态，而不是解析英文字符串。
 
 ### 2.3 唯一改变题目的事实：释放 `1000m` request
 
 稍后，`worker-05` 上已经绑定的 `prod/batch-temp-x` 正常完成并从 scheduler cache 删除。它释放的是 `1000m` request，不是“CPU usage 降低了 1000m”。
+
+下图**从左往右**读。方框是三个时间点的资源账，实线箭头写的是“发生了什么”；它只画数值变化，不表示组件间同步调用：
+
+```mermaid
+flowchart LR
+    B["变化前<br/>Requested=6000m<br/>余额=1500m<br/>2000m 放不下"] -->|"batch-temp-x 删除<br/>scheduler cache 减去 1000m request"| A["变化后<br/>Requested=5000m<br/>余额=2500m"]
+    A -->|"下一轮重跑全部 Filter"| R["CPU 这一关能通过<br/>其他条件仍要重新检查"]
+```
 
 ```text
 worker-05 Requested：6000m -> 5000m
@@ -183,9 +236,9 @@ worker-05 余额：      1500m -> 2500m
 
 | 变化 | 你应预测的动作 |
 |---|---|
-| 什么都没变 | 不应热循环；Pod 等待可能改变拒绝结论的事件 |
+| 什么都没变 | 不应热循环；Pod 等待可能改变拒绝结论的对象变化 |
 | 一个无关 ConfigMap 更新 | NodeResourcesFit 不应因此唤醒本 Pod |
-| `worker-05` 的已绑定 Pod 删除 | 值得重试，但事件本身不能直接 Bind |
+| `worker-05` 的已绑定 Pod 删除 | 值得重试，但 ClusterEvent 不能直接 Bind |
 | 新增 Node，但它总 Allocatable 只有 1000m | NodeResourcesFit hint 应认为仍不值得重试 |
 | 新 Pod request 改成 8000m，Node 总 Allocatable 7500m | 属于总容量无解，抢占也不能制造 CPU |
 | 旧、新 Java Pod 都是 priority 0 | 旧 Pod 不是严格低优先级 victim，默认抢占无效 |
@@ -198,28 +251,32 @@ worker-05 余额：      1500m -> 2500m
 
 如果集群状态没变，第二轮 Filter 会得到同一个 `Insufficient cpu`。立刻再放回去只会形成：
 
+下面从左往右读，每个箭头表示同一个 Pod 进入下一步；它描述的是重复计算，不是网络调用：
+
 ```text
 Pop -> Filter 失败 -> 立刻入队 -> Pop -> 同样失败
 ```
 
 一个永远放不下的 Pod 可以持续消耗 scheduler CPU，挤压本来能成功的其他 Pod。集群越大，每轮扫描和插件计算越贵。
 
-### 3.2 错误方案二：任何集群事件都唤醒所有失败 Pod
+### 3.2 错误方案二：任何 ClusterEvent 都唤醒所有失败 Pod
 
-Node 心跳、Pod label、ConfigMap、EndpointSlice 等事件非常频繁。`game-api-new-x` 是被 NodeResourcesFit 拒绝的，绝大多数对象变化不可能增加它的 CPU request 余额。全量唤醒虽然不容易漏信号，却把事件风暴变成无效 scheduling cycle。
+Node 心跳、Pod label、ConfigMap、EndpointSlice 等对象变化非常频繁。`game-api-new-x` 是被 NodeResourcesFit 拒绝的，绝大多数变化不可能增加它的 CPU request 余额。全量唤醒虽然不容易漏信号，却会让变化风暴制造大量无效 scheduling cycle。
 
-### 3.3 错误方案三：资源释放事件直接指定 Node
+### 3.3 错误方案三：资源释放通知直接指定 Node
 
-删除事件只能说明某份旧状态可能改变了。它不知道：
+删除这项对象变化只能说明某份旧状态可能改变了。它不知道：
 
 - informer 与 scheduler snapshot 的时间差；
 - 另一个 Pod 是否已经占了刚释放的容量；
 - taint、affinity、volume、拓扑等其他 Filter 是否仍通过；
 - 抢占或 nomination 是否改变了 Node 上的逻辑占用。
 
-所以事件只适合回答“值得不值得再算”，不能替代调度算法回答“最终放哪里”。
+所以 ClusterEvent 只适合回答“值得不值得再算”，不能替代调度算法回答“最终放哪里”。
 
 ## 4. 先建立状态所有者和七条不变量
+
+“状态所有者”就是这份状态到底由谁保存、谁能修改；“不变量”就是不管并发先后和局部失败怎样变化，设计都必须守住的底线。先把这两件事分清，后面的队列名才不会串在一起。
 
 ### 4.1 API Pending 不是某个内部队列的名字
 
@@ -230,15 +287,15 @@ Node 心跳、Pod label、ConfigMap、EndpointSlice 等事件非常频繁。`gam
 | `PodScheduled=False` | Pod Condition | 最近一次公开调度判断失败 | 不能说明下一次重试的内部时间 |
 | `activeQ` | kube-scheduler 内存 | Pod 可以被 `Pop` 进入 scheduling cycle | 不等于 API Pending 的全部集合 |
 | in-flight | kube-scheduler 内存 | Pod 已被取出，覆盖 scheduling cycle 以及成功路径上的 Permit 等待 | 成功路径在 Permit 通过后就 `Done`，不覆盖后续 PreBind/Bind；API 也没有同名字段 |
-| `unschedulablePods` | kube-scheduler 内存 | 上次失败后，尚无事件证明值得再试 | 不是一个 Kubernetes API 对象 |
+| `unschedulablePods` | kube-scheduler 内存 | 上次失败后，尚无 ClusterEvent 证明值得再试 | 不是一个 Kubernetes API 对象 |
 | `backoffQ` | kube-scheduler 内存 | 已值得重试，正常应等退避窗口；当前特性下 activeQ 为空时也可能被提前取出 | 不代表根因仍然存在 |
 
 ### 4.2 七条设计不变量
 
 1. **无有用变化，不热循环。** 上次失败条件没有可能改变时，不重复浪费完整调度计算。
-2. **事件只给 hint，不给最终答案。** 任何唤醒后都必须重新走 scheduling cycle。
+2. **ClusterEvent 只给 hint，不给最终答案。** 任何唤醒后都必须重新走 scheduling cycle。
 3. **cache 先变，通知后发。** 否则 Pod 被唤醒后仍可能立刻读取旧账。
-4. **in-flight 窗口不能丢事件。** Pod 已 Pop 但尚未重新入队时发生的有用变化，必须在失败落队时被补看见。
+4. **in-flight 窗口不能丢 ClusterEvent。** Pod 已 Pop 但尚未重新入队时发生的有用变化，必须在失败落队时被补看见。
 5. **失败身份比错误字符串更重要。** 只有知道是哪一个插件拒绝，才能调用正确的 QueueingHint。
 6. **值得重试与失败 Pod 怎样让路分离。** QueueingHint 判断相关性；backoff 计算相对让路和排序。当前版本 activeQ 空时，普通 backoffQ Pod 可以提前被取出。
 7. **抢占只能改变未来可用条件。** 它只能移除严格低优先级的可删除 Pod，不能创造 Node 总容量，也不能绕过其他 Filter。
@@ -248,39 +305,40 @@ Node 心跳、Pod label、ConfigMap、EndpointSlice 等事件非常频繁。`gam
 | 设计选择 | 收益 | 代价 |
 |---|---|---|
 | 记录拒绝插件 | 精准调用相关 hint，减少无效轮次 | `QueuedPodInfo` 要保存更多失败上下文 |
-| 记录 in-flight 事件 | 防止并发窗口丢唤醒 | scheduler 需要额外内存和清理逻辑 |
-| QueueingHint | 事件过滤精细到“这个 Pod + 这个变化” | 插件 hint 写错可能让 Pod 等太久 |
+| 记录 in-flight ClusterEvent | 防止并发窗口丢唤醒 | scheduler 需要额外内存和清理逻辑 |
+| QueueingHint | 对象变化过滤精细到“这个 Pod + 这个变化” | 插件 hint 写错可能让 Pod 等太久 |
 | backoff | 让持续失败 Pod 在有新工作时先让路，防止垄断调度吞吐 | activeQ 有工作时，条件已变好的 Pod 仍可能短等；activeQ 空时当前版本可提前取出 |
 | 定期 flush | hint 漏判时仍有最终活性 | 会周期性制造少量保守重试 |
 | nomination 而非直接 Bind | victim 优雅退出期间保持调度正确性 | 抢占成功到真正调度之间存在时间窗 |
 
 ## 5. 白板状态机与源码总图
 
-先用人话看状态：
+先用人话看状态。下面**从上往下**读；缩进表示下一步可能走的分支，不是组件调用：
 
 ```text
 可尝试
   -> 正在计算
-       -> 成功：Assume / Reserve / Permit -> Done（结束 in-flight）-> PreBind / Bind
+       -> 成功：Assume（先在内存占位）/ Reserve（插件预留）/ Permit（最后放行）
+                 -> Done（结束 in-flight）-> PreBind / Bind（绑定前处理与写入 Node）
        -> 失败且无有用变化：等待相关变化
        -> 计算期间已有有用变化：进入重试节流或直接可尝试
 
 等待相关变化
-  -> 无关事件：继续等待
-  -> 相关事件：进入重试节流
+  -> 无关 ClusterEvent：继续等待
+  -> 相关 ClusterEvent：进入重试节流
 
 重试节流
   -> backoff 到期，或当前版本 activeQ 为空时机会性取出：再次可尝试
 ```
 
-再映射到当前实现名：
+再映射到当前实现名。下图**从左往右**读：方框代表 scheduler 内部状态，实线代表常见状态迁移，虚线代表“特性开启且 activeQ 为空”时的优化路径，箭头文字代表触发条件。它不是组件拓扑图，任何箭头都不表示网络 RPC：
 
 ```mermaid
 flowchart LR
     A["activeQ：可以尝试"] -->|Pop| F["in-flight：正在计算"]
     F -->|成功：Assume、Reserve、Permit 后 Done| B["PreBind / Bind：已不在 in-flight"]
-    F -->|失败且无有用事件| U["unschedulablePods：等待变化"]
-    F -->|失败但 in-flight 期间已有相关事件| K["backoffQ 或 activeQ"]
+    F -->|失败且无有用 ClusterEvent| U["unschedulablePods：等待变化"]
+    F -->|失败但 in-flight 期间已有相关 ClusterEvent| K["backoffQ 或 activeQ"]
     U -->|相关 ClusterEvent + QueueingHint=Queue| K
     U -->|QueueingHint=QueueSkip| U
     K -->|backoff 完成，经 activeQ| A
@@ -290,7 +348,7 @@ flowchart LR
 
 这张图先表达稳定状态关系。当前默认开启的 `SchedulerPopFromBackoffQ` 还有一个吞吐优化：当 activeQ 没有新工作时，可直接从普通 backoffQ 提前取 Pod；第 11.5 节会按源码修正“backoff 是绝对睡眠定时器”的直觉。
 
-主调用链：
+主调用链按**从上往下**读。这里的箭头表示 kube-scheduler 进程内的调用或返回路径，不是不同服务间的远程请求：
 
 ```text
 PriorityQueue.Pop
@@ -308,7 +366,7 @@ PriorityQueue.Pop
             -> requeuePodWithQueueingStrategy
 ```
 
-反馈事件链：
+对象变化反馈链也按**从上往下**读。这里的箭头表示“对象变化被 informer 看见后，数据和通知依次产生影响”；它跨越异步 watch/informer 传播，不是一条同步调用栈：
 
 ```text
 已绑定 Pod 删除或 Node 变化
@@ -319,11 +377,72 @@ PriorityQueue.Pop
   -> 下一次 Pop 后重新跑完整 Filter
 ```
 
+### 5.1 第一段源码先看核心判断：删掉一个 Pod 后，为什么只说“值得再算”
+
+这段代码只回答一个问题：`game-api-new-x` 上次因为资源不足失败，现在收到“另一个 Pod 被删除”的对象变化通知，NodeResourcesFit 会不会建议把它叫回来重算？它**不负责移动队列，也不负责选择 Node**。
+
+源码位置：[`pkg/scheduler/framework/plugins/noderesources/fit.go:380-394`](https://github.com/kubernetes/kubernetes/blob/301946d15e67a4a2e8a5fb8292eb836acd366d78/pkg/scheduler/framework/plugins/noderesources/fit.go#L380-L394)。
+
+读代码前先认变量：
+
+| 变量 | 本例是谁 | 作用 |
+|---|---|---|
+| `pod` | 正在等待重试的 `game-api-new-x` | 这次要不要叫醒的目标 Pod |
+| `oldObj` / `newObj` | 对象变化前后的通用输入；删除时通常从旧对象取值 | 同一套回调接口要兼容新增、更新和删除 |
+| `deletedPod` | 被删除的 `batch-temp-x` | 判断它是否曾占用某台 Node 的调度账 |
+| `Queue` | “可能有帮助，值得重算” | 只是建议，不等于调度成功 |
+| `QueueSkip` | “这个删除不可能释放 Node 上的账，先别重算” | 避免无效调度轮次 |
+
+下面是**完整函数，教学注释版**。中文 `//` 是讲义新增；每条有判断或返回含义的语句都已解释。
+
+```go
+// 判断“另一个 Pod 被删除”是否可能解除当前 Pod 的资源不足。
+func (f *Fit) isSchedulableAfterAssignedPodDelete(logger klog.Logger, pod *v1.Pod, oldObj, newObj interface{}) (fwk.QueueingHint, error) {
+	// 把通用事件对象安全转换成 Pod 指针；删除场景通常从 oldObj 取得对象。
+	deletedPod, _, err := schedutil.As[*v1.Pod](oldObj, newObj)
+	// 对象类型异常时宁可建议重算，同时把 error 交给调用者记录，避免 Pod 因一次转换问题长期睡住。
+	if err != nil {
+		return fwk.Queue, err
+	}
+
+	// 既没绑定 Node，也没被抢占逻辑提名到 Node，就没有占任何 Node 的调度账。
+	if deletedPod.Spec.NodeName == "" && deletedPod.Status.NominatedNodeName == "" {
+		// 写高详细度日志，说明为何这次删除无关。
+		logger.V(5).Info("the deleted pod was unscheduled and it wouldn't make the unscheduled pod schedulable", "pod", klog.KObj(pod), "deletedPod", klog.KObj(deletedPod))
+		// 告诉队列：不用因为这次删除叫醒目标 Pod。
+		return fwk.QueueSkip, nil
+	}
+
+	// 删除对象曾绑定或被提名到 Node，可能减少某台 Node 的资源竞争账。
+	logger.V(5).Info("another scheduled pod was deleted, and it may make the unscheduled pod schedulable", "pod", klog.KObj(pod), "deletedPod", klog.KObj(deletedPod))
+	// 只说“值得重算”；不承诺释放量够，也不指定目标 Node。
+	return fwk.Queue, nil
+}
+```
+
+**大白话总结：** 被删除的 Pod 如果从未绑定、也没被提名到任何 Node，它没有释放 Node 调度账，返回 `QueueSkip`；只要它曾绑定或被提名，就保守返回 `Queue`。这个函数只发“值得重算”的建议，不直接移动队列，更不直接绑定 Node。
+
+按“输入、判断、动作、结果”收束：
+
+| 项目 | 本例结论 |
+|---|---|
+| 输入 | 等待中的 `game-api-new-x`，以及被删除的 `batch-temp-x` |
+| 判断 | `batch-temp-x.spec.nodeName=worker-05`，说明它曾占用 Node 调度账 |
+| 动作 | 函数只返回 `Queue`；调用者随后决定进入 activeQ 还是 backoffQ |
+| 结果 | `game-api-new-x` 获得下一轮机会；只有下一轮完整 Filter 通过后才可能 Bind |
+
+**顺手学 Go：**
+
+- `(f *Fit)` 是 receiver，可先类比 Java 方法里的 `this`；它表示该方法属于 `Fit` 这个实现，但 Go 没有 Java class 继承。
+- `interface{}` 表示这里先接收通用对象；`schedutil.As[*v1.Pod]` 中方括号里的 `*v1.Pod` 是类型参数，意思是“请转换成 Pod 指针”。
+- `(fwk.QueueingHint, error)` 是两个返回位置。`return fwk.QueueSkip, nil` 的 `nil` 只表示没有程序错误，不表示“没有 Pod”。
+- 函数名里的 `isSchedulable` 容易让人误会：它没有运行全部 Filter，只是在保守判断“这次删除是否可能让结果改变”。
+
 ## 6. 【二遍】为什么 `Pop` 后不能直接“从队列消失”
 
 ### 6.1 最危险的窗口
 
-想象这个时间顺序：
+想象这个时间顺序。下面按**从上往下**读，`t0～t4` 只是先后标记，不代表等间隔：
 
 ```text
 t0  game-api-new-x 从 activeQ 被 Pop
@@ -384,7 +503,7 @@ func (aq *activeQueue) unlockedMovePodToInFlight(pInfo *framework.QueuedPodInfo)
 
 ### 6.3 链表怎样表达“发生在我之后”
 
-如果两个 Pod 先后被 Pop，中间发生两个事件，链表可能是：
+如果两个 Pod 先后被 Pop，中间发生两个 ClusterEvent，链表可能是下面这样。它按**从左往右的时间顺序**读，方括号是链表元素，箭头只是“下一个元素”的指针，不是 RPC：
 
 ```text
 [Pod A] -> [Node update E1] -> [Pod B] -> [AssignedPod delete E2]
@@ -399,9 +518,9 @@ func (aq *activeQueue) unlockedMovePodToInFlight(pInfo *framework.QueuedPodInfo)
 
 ### 6.4 成功路径的 `Done` 在哪里：Permit 之后，PreBind/Bind 之前
 
-in-flight 不是“从 Pop 一直包到 API Bind 完成”。成功路径在此前已经完成 Assume、Reserve 和 Permit；`WaitOnPermit` 成功后，scheduler 就认为后续失败不再属于“Pod 被调度条件拒绝”，于是先清理 in-flight，再进入 PreBind/Bind。
+in-flight 不是“从 Pop 一直包到 API Bind 完成”。成功路径在此前已经完成 Assume、Reserve 和 Permit；`WaitOnPermit` 成功后，scheduler 就认为后续失败不再属于“Pod 被调度条件拒绝”，于是先清理 in-flight，再进入 PreBind/Bind。代码里的 `assumedPod` 是已经在 scheduler cache 中临时占好节点资源、但还没有把 Bind 写进 API Server 的 Pod 副本。
 
-源码位置：`pkg/scheduler/schedule_one.go:447-465`。
+源码位置：`pkg/scheduler/schedule_one.go:447-466`。
 
 下面是成功路径的**连续摘录，教学注释版**。区间之前 `WaitOnPermit` 已成功；区间之后才调用 Bind。
 
@@ -441,7 +560,7 @@ if status := schedFramework.RunPreBindPlugins(ctx, state, assumedPod, scheduleRe
 
 ### 7.1 真实执行顺序
 
-旧式讲法常把 FailureHandler 放在最前面讲，容易让人误以为 `FitError -> 直接 unschedulablePods`。当前真实顺序是：
+旧式讲法常把 FailureHandler 放在最前面讲，容易让人误以为 `FitError -> 直接 unschedulablePods`。下面按**从上往下**读；箭头是同一个 kube-scheduler 内的控制顺序：
 
 ```text
 Filter 得到 FitError
@@ -452,7 +571,7 @@ Filter 得到 FitError
 
 ### 7.2 `schedulingAlgorithm` 的失败连续摘录
 
-源码位置：`pkg/scheduler/schedule_one.go:270-307`。
+源码位置：`pkg/scheduler/schedule_one.go:270-308`。
 
 下面是**连续摘录，教学注释版**。区间开始前，函数已经取得 `pod`、`state`、`schedFramework` 和 `podInfo`；区间结束后只剩成功返回。这里完整保留 `ErrNoNodesAvailable`、非 FitError、无 PostFilter、PostFilter Error 与 nomination 分支。
 
@@ -488,7 +607,7 @@ if err != nil {
 
 	// 把原 Filter 的逐 Node 状态交给 PostFilter；默认实现会评估抢占。
 	result, status := schedFramework.RunPostFilterPlugins(ctx, state, pod, fitError.Diagnosis.NodeToStatus)
-	// 保存 PostFilter 人话消息，最终 Event 可以同时解释 Filter 与补救结果。
+	// 保存 PostFilter 人话消息，最终公开 Event 可以同时解释 Filter 与补救结果。
 	msg := status.Message()
 	fitError.Diagnosis.PostFilterMsg = msg
 	// PostFilter 自己 Error 才进入错误处理；正常找不到 victim 不属于进程故障。
@@ -525,7 +644,7 @@ if err != nil {
 `handleSchedulingFailure` 同时处理三类责任：
 
 1. 把 framework Status 分类成 API 可见的 `Unschedulable` 或 `SchedulerError`；
-2. 把 FitError 中的拒绝插件身份写回 `QueuedPodInfo`，为事件驱动重试服务；
+2. 把 FitError 中的拒绝插件身份写回 `QueuedPodInfo`，为 ClusterEvent 驱动的重试服务；
 3. 在改变内部队列前重新确认 Pod 身份：已绑定则不再重入队，同名但 UID 已变化则整条旧失败处理直接停止。
 
 为了让每行都能读懂，下面把同一个完整函数拆成三个连续区间。三个区间合起来覆盖函数全部业务语句。
@@ -574,10 +693,10 @@ func (sched *Scheduler) handleSchedulingFailure(ctx context.Context, podFwk fram
 	pod := podInfo.Pod
 	// 从 Status 还原 error，供 FitError 类型判断。
 	err := status.AsError()
-	// 保留完整消息，稍后用于日志、Event 和 Condition。
+	// 保留完整消息，稍后用于日志、公开 Event 和 Condition。
 	errMsg := status.Message()
 
-	// 清空上一轮失败插件，避免陈旧身份污染这一轮的事件订阅。
+	// 清空上一轮失败插件，避免陈旧身份污染这一轮的 ClusterEvent 订阅。
 	podInfo.ClearRejectorPlugins()
 
 	// 没有 Node 时只记录等待，不会凭空编造拒绝插件。
@@ -602,7 +721,7 @@ func (sched *Scheduler) handleSchedulingFailure(ctx context.Context, podFwk fram
 	}
 ```
 
-**大白话总结：** Event 中的 `Insufficient cpu` 是给人看的结果，`UnschedulablePlugins={NodeResourcesFit}` 才是给重试系统用的机器上下文。清空旧集合再写新集合，保证下一次事件只问这一轮真正拒绝过 Pod 的插件。若是 API 临时错误等非正常拒绝，没有插件身份，队列会采用更保守的退避重试，避免永远卡住。
+**大白话总结：** 公开 Event 中的 `Insufficient cpu` 是给人看的结果，`UnschedulablePlugins={NodeResourcesFit}` 才是给重试系统用的机器上下文。清空旧集合再写新集合，保证下一次 ClusterEvent 只问这一轮真正拒绝过 Pod 的插件。若是 API 临时错误等非正常拒绝，没有插件身份，队列会采用更保守的退避重试，避免永远卡住。
 
 **顺手学 Go：**
 
@@ -633,14 +752,14 @@ func (sched *Scheduler) handleSchedulingFailure(ctx context.Context, podFwk fram
 		} else {
 			// 同名 Pod 可能被删除后重建；UID 才标识对象实例。
 			if cachedPod.UID != podInfo.Pod.UID {
-				// 新实例不能继承旧实例的失败结果、Event 或 nomination。
+				// 新实例不能继承旧实例的失败结果、公开 Event 或 nomination。
 				logger.V(2).Info("Pod was recreated while handling scheduling failure. Skip requeueing and status updates.", "pod", klog.KObj(pod), "oldUID", podInfo.Pod.UID, "newUID", cachedPod.UID)
 				// 提前返回；最外层 defer 仍会清理旧 UID 的 in-flight 状态。
 				return
 			}
 			// informer 返回对象按约定只读；DeepCopy 后才能交给可变的队列状态。
 			podInfo.PodInfo, _ = framework.NewPodInfo(cachedPod.DeepCopy())
-			// 让后续 Event 和 Condition 使用最新副本。
+			// 让后续公开 Event 和 Condition 使用最新副本。
 			pod = podInfo.Pod
 			// 结合 in-flight 期间事件，选择 unschedulable、backoff 或 active 状态。
 			if err := sched.SchedulingQueue.AddUnschedulableIfNotPresent(logger, podInfo, sched.SchedulingQueue.SchedulingCycle()); err != nil {
@@ -668,7 +787,7 @@ func (sched *Scheduler) handleSchedulingFailure(ctx context.Context, podFwk fram
 下面是函数末尾的**连续摘录，教学注释版**。
 
 ```go
-	// 先更新 scheduler 内存中的 nominator，堵住 API status 更新到达 informer 之前的竞态。
+	// 先更新 scheduler 内存中的 nominator（nomination 索引表），堵住 API status 更新到达 informer 之前的竞态。
 	if sched.SchedulingQueue != nil {
 		// nominatingInfo 可能设置、清空或保持 nominatedNodeName。
 		sched.SchedulingQueue.AddNominatedPod(logger, podInfo.PodInfo, nominatingInfo)
@@ -676,26 +795,27 @@ func (sched *Scheduler) handleSchedulingFailure(ctx context.Context, podFwk fram
 
 	// 只有测试可能把 nil error 的 Status 送到失败处理。
 	if err == nil {
-		// 避免为不存在的失败写 Event 和 Condition。
+		// 避免为不存在的失败写公开 Event 和 Condition。
 		return
 	}
 
-	// Event 有长度上限，只截断展示文本，不改变前面保存的插件身份。
+	// 公开 Event 有长度上限，只截断展示文本，不改变前面保存的插件身份。
 	msg := truncateMessage(errMsg)
 	// 记录 Warning/FailedScheduling；这是可观察证据，不是内部队列的状态源。
 	podFwk.EventRecorder().WithLogger(logger).Eventf(pod, nil, v1.EventTypeWarning, "FailedScheduling", "Scheduling", msg)
 	// 更新 PodScheduled=False，并同时按 nominatingInfo 处理 nominatedNodeName。
+	// APICacher 是可选的异步 API 调用路径：先按“调用会成功”更新 scheduler cache；未启用时 updatePod 改用普通 client patch。
 	if err := updatePod(ctx, sched.client, podFwk.APICacher(), pod, &v1.PodCondition{
 		// 这个 Condition 描述的是调度阶段。
-		Type: v1.PodScheduled,
+		Type:               v1.PodScheduled,
 		// 记录该 Condition 对应的 Pod generation。
 		ObservedGeneration: podutil.CalculatePodConditionObservedGeneration(&pod.Status, pod.Generation, v1.PodScheduled),
 		// 写入“这次调度尝试失败”；注意已绑定的 extender 超时角落分支也会走到这里。
-		Status: v1.ConditionFalse,
+		Status:             v1.ConditionFalse,
 		// 正常拒绝为 Unschedulable，内部错误为 SchedulerError。
-		Reason: reason,
-		// 保存完整错误消息，不使用 Event 的截断版本。
-		Message: errMsg,
+		Reason:             reason,
+		// 保存完整错误消息，不使用公开 Event 的截断版本。
+		Message:            errMsg,
 	// updatePod 失败只记录错误；内部队列处理已经完成，不能假装一切回滚。
 	}, nominatingInfo); err != nil {
 		// API 更新失败是外部可见性问题，交给统一错误处理器。
@@ -704,9 +824,9 @@ func (sched *Scheduler) handleSchedulingFailure(ctx context.Context, podFwk fram
 }
 ```
 
-**大白话总结：** 失败处理有两套输出。内部输出决定 Pod 接下来在 scheduler 内存中怎么等、何时再试；外部输出写 Event、Condition 和可能的 `nominatedNodeName`，方便其他组件与人观察。API 写失败不会神奇撤销已经发生的队列变化或 victim 删除，因此线上不能只凭一条 Event 推断内部状态。
+**大白话总结：** 失败处理有两套输出。内部输出决定 Pod 接下来在 scheduler 内存中怎么等、何时再试；外部输出写公开 Kubernetes Event、Condition 和可能的 `nominatedNodeName`，方便其他组件与人观察。API 写失败不会神奇撤销已经发生的队列变化或 victim 删除，因此线上不能只凭一条公开 Event 推断内部状态。
 
-还有一个反直觉角落：如果 extender 实际已 Bind，只是响应超时，lister 中的 `cachedPod.spec.nodeName` 已非空。FailureHandler 此时只跳过重入队，并没有 `return`；随后仍会更新内部 nominator、发送 `FailedScheduling` Event，并尝试写 `PodScheduled=False`。它不会清掉已经存在的 `spec.nodeName`，但短时间内可能出现“已有 NodeName，同时还有本次失败证据”。所以已绑定判断保护的是**不把 Pod 再塞回调度队列**，不是承诺后续外部失败记录全部跳过。
+还有一个反直觉角落：如果 extender 实际已 Bind，只是响应超时，lister 中的 `cachedPod.spec.nodeName` 已非空。FailureHandler 此时只跳过重入队，并没有 `return`；随后仍会更新内部 nominator、发送公开的 `FailedScheduling` Event，并尝试写 `PodScheduled=False`。它不会清掉已经存在的 `spec.nodeName`，但短时间内可能出现“已有 NodeName，同时还有本次失败证据”。所以已绑定判断保护的是**不把 Pod 再塞回调度队列**，不是承诺后续外部失败记录全部跳过。
 
 **顺手学 Go：**
 
@@ -720,21 +840,21 @@ func (sched *Scheduler) handleSchedulingFailure(ctx context.Context, podFwk fram
 |---|---|---|---|---|
 | NodeResourcesFit 拒绝 | 有 `NodeResourcesFit` | 按其事件与 hint 等待/重试 | `Unschedulable` | 正常业务拒绝，不是 scheduler 崩溃 |
 | API 临时错误 | 通常无 | 保守 backoff 重试 | `SchedulerError` | 没有插件可精确判断事件 |
-| Pod 已绑定 | 不再落队；defer 清理 in-flight | 仍更新 nominator，并继续失败 Event/Condition 路径 | `spec.nodeName` 不会被清掉，但可能同时看到本次 `FailedScheduling` / `PodScheduled=False` | extender 已 Bind、返回超时的角落场景 |
+| Pod 已绑定 | 不再落队；defer 清理 in-flight | 仍更新 nominator，并继续公开 Event/Condition 路径 | `spec.nodeName` 不会被清掉，但可能同时看到本次 `FailedScheduling` / `PodScheduled=False` | extender 已 Bind、返回超时的角落场景 |
 | 同名 Pod 已重建 | 不再处理旧实例 | 清理旧 UID | 不给新 UID 写旧错误 | name 相同不代表同一对象 |
 
-## 9. 【二遍】失败落队时，怎样补看计算期间发生的事件
+## 9. 【二遍】失败落队时，怎样补看计算期间发生的 ClusterEvent
 
-第 6 节只解释了为什么 Pop 时要登记 in-flight。现在把反馈环闭合：失败处理进入 `AddUnschedulableIfNotPresent` 时，必须回看 Pod 标记之后发生过的事件，再决定它究竟该进入等待区、backoff，还是直接 active。
+第 6 节只解释了为什么 Pop 时要登记 in-flight。现在把反馈环闭合：失败处理进入 `AddUnschedulableIfNotPresent` 时，必须回看 Pod 标记之后发生过的 ClusterEvent，再决定它究竟该进入等待区、backoff，还是直接 active。
 
-### 9.1 `clusterEventsForPod`：只取“我的标记之后”的事件
+### 9.1 `clusterEventsForPod`：只取“我的标记之后”的 ClusterEvent
 
 源码位置：`pkg/scheduler/backend/queue/active_queue.go:394-417`。
 
 下面是**完整函数，教学注释版**。
 
 ```go
-// pInfo 是已经 Pop、仍处于 in-flight 的 Pod；返回它计算期间发生的事件切片。
+// pInfo 是已经 Pop、仍处于 in-flight 的 Pod；返回它计算期间发生的 ClusterEvent 切片。
 func (aq *activeQueue) clusterEventsForPod(logger klog.Logger, pInfo *framework.QueuedPodInfo) ([]*clusterEvent, error) {
 	// 这里只读 map 与链表，使用读锁允许其他只读操作并发。
 	aq.lock.RLock()
@@ -762,23 +882,23 @@ func (aq *activeQueue) clusterEventsForPod(logger klog.Logger, pInfo *framework.
 			// 另一个 Pod 的标记不影响本 Pod 的事件时间线。
 			continue
 		}
-		// 真正的事件才加入返回切片。
+		// 真正的 ClusterEvent 才加入返回切片。
 		events = append(events, e)
 	}
-	// 返回按发生顺序收集的事件；nil error 表示链表契约正常。
+	// 返回按发生顺序收集的 ClusterEvent；nil error 表示链表契约正常。
 	return events, nil
 }
 ```
 
-**大白话总结：** 这不是查询“集群最近所有事件”，而是查询“从我被 Pop 之后，调度队列认为有插件关注并记下了哪些事件”。只看 Pod 标记之后，可以避免把早于本轮快照的旧变化再次当成新唤醒。遇到另一个 Pod 标记直接跳过，因为多个 in-flight Pod 共用同一条时间线。
+**大白话总结：** 这不是查询“集群最近所有公开 Event”，而是查询“从我被 Pop 之后，调度队列记下了哪些 ClusterEvent”。只看 Pod 标记之后，可以避免把早于本轮快照的旧变化再次当成新唤醒。遇到另一个 Pod 标记直接跳过，因为多个 in-flight Pod 共用同一条时间线。
 
 **顺手学 Go：**
 
 - `RLock/RUnlock` 是读写锁的读侧；多个读者可并发，但写者要等。
-- `event.Value.(*clusterEvent)` 是类型断言；链表 Value 是 `interface{}`，具体值可能是 Pod，也可能是事件。
+- `event.Value.(*clusterEvent)` 是类型断言；链表 Value 是 `interface{}`，具体值可能是 Pod 标记，也可能是 ClusterEvent。
 - `var events []*clusterEvent` 的零值是 nil slice；可以直接 `append`，返回 nil slice 也可以安全 range。
 
-### 9.2 `determineSchedulingHintForInFlightPod`：多个事件取最积极策略
+### 9.2 `determineSchedulingHintForInFlightPod`：多个 ClusterEvent 取最积极策略
 
 源码位置：`pkg/scheduler/backend/queue/scheduling_queue.go:804-847`。
 
@@ -850,6 +970,8 @@ func (p *PriorityQueue) determineSchedulingHintForInFlightPod(logger klog.Logger
 
 源码位置：`pkg/scheduler/backend/queue/scheduling_queue.go:435-445`。
 
+下面是**完整类型声明和完整 const 组，教学注释版**。它们不是函数；这 11 行就是三种内部迁移策略的全部定义。
+
 ```go
 // 内部枚举只在 scheduling queue 中使用。
 type queueingStrategy int
@@ -900,7 +1022,7 @@ func (p *PriorityQueue) AddUnschedulableIfNotPresent(logger klog.Logger, pInfo *
 	}
 	// 最后检查 backoffQ。
 	if p.backoffQ.has(pInfo) {
-		// 同一 Pod 也不能重复进入 backoff heap。
+		// 同一 Pod 也不能重复进入 backoff heap（按到期时间排序的内部结构）。
 		return fmt.Errorf("Pod %v is already present in the backoff queue", klog.KObj(pod))
 	}
 
@@ -966,9 +1088,9 @@ func (p *PriorityQueue) AddUnschedulableIfNotPresent(logger klog.Logger, pInfo *
 func (aq *activeQueue) unlockedDone(pod types.UID) {
 	// 找到 Pod 在事件链表中的标记。
 	inFlightPod, ok := aq.inFlightPods[pod]
-	// 找不到表示它已经 Done；幂等地直接返回。
+		// 找不到表示它已经 Done；幂等（重复调用效果与调用一次相同）地直接返回。
 	if !ok {
-		// close 与异步完成可能重复到达，no-op 比报错更安全。
+		// close 与异步完成可能重复到达；no-op（安全地什么也不做）比报错更合适。
 		return
 	}
 	// 先从 UID 索引删除，表示不再有处理责任。
@@ -1032,18 +1154,18 @@ func (aq *activeQueue) unlockedDone(pod types.UID) {
 第三层：那个拒绝插件认为这个具体 oldObj/newObj 能否改变该 Pod 的结论？
 ```
 
-本例的答案是：AssignedPodDelete 是 NodeResourcesFit 注册的事件；`game-api-new-x` 上轮确实被 NodeResourcesFit 拒绝；删除的是已绑定 Pod，所以 hint 保守返回 Queue。
+本例的答案是：AssignedPodDelete 是 NodeResourcesFit 注册的 ClusterEvent；`game-api-new-x` 上轮确实被 NodeResourcesFit 拒绝；删除的是已绑定 Pod，所以 hint 保守返回 Queue。
 
-### 10.1 为什么事件处理必须先减 cache 账，再移动队列
+### 10.1 为什么对象变化处理必须先减 cache 账，再移动队列
 
 源码位置：`pkg/scheduler/eventhandlers.go:412-423`。
 
 下面是**完整函数，教学注释版**。
 
 ```go
-// 处理一个已有 spec.nodeName 的 Pod 删除事件。
+// 处理一个已有 spec.nodeName 的 Pod 删除通知。
 func (sched *Scheduler) deleteAssignedPodFromCache(pod *v1.Pod) {
-	// 函数退出时记录 AssignedPodDelete 事件处理总延迟。
+	// 函数退出时记录 AssignedPodDelete 这类对象变化的处理总延迟。
 	defer metrics.EventHandlingLatency.ObserveSince(time.Now(), framework.EventAssignedPodDelete.Label())()
 
 	// 使用 Scheduler 自带 logger。
@@ -1051,9 +1173,9 @@ func (sched *Scheduler) deleteAssignedPodFromCache(pod *v1.Pod) {
 
 	// 记录被删除的已调度 Pod。
 	logger.V(3).Info("Delete event for scheduled pod", "pod", klog.KObj(pod))
-	// 第一件事：从 scheduler Cache 移除 Pod，让 NodeInfo.Requested 先减少。
+	// 第一件事：从 scheduler Cache 移除 Pod，让 NodeInfo.Requested（这台 Node 已承诺的 request 合计）先减少。
 	if err := sched.Cache.RemovePod(logger, pod); err != nil {
-		// cache 删除异常要记录，但事件链仍继续，后续完整 Filter 会守住正确性。
+		// cache 删除异常要记录，但对象变化通知仍继续；通知本身不会直接绑定 Pod。
 		utilruntime.HandleErrorWithLogger(logger, err, "Scheduler cache RemovePod failed", "pod", klog.KObj(pod))
 	}
 
@@ -1062,18 +1184,18 @@ func (sched *Scheduler) deleteAssignedPodFromCache(pod *v1.Pod) {
 }
 ```
 
-**大白话总结：** 顺序是“账本先变、再通知重试”。若反过来，`game-api-new-x` 可能被叫醒后仍读到 Requested=6000m，再次白跑一轮。即使 RemovePod 报错也继续发事件，是因为事件只是 hint，最终 Filter 仍会读取实际 snapshot；这属于可恢复性取舍，不是声称 cache 一定已经正确。
+**大白话总结：** 正常顺序是“账本先变、再通知重试”。若反过来，`game-api-new-x` 可能被叫醒后仍读到 Requested=6000m，再次白跑一轮。即使 `RemovePod` 报错，源码也继续发对象变化通知，目的是别把等待 Pod 永久漏掉；但这不表示 cache 已修好。下一轮 Filter 只能读取当时从 cache 生成的 snapshot：若旧账仍在，它会保守地再次失败，等待后续状态恢复或其它重试机会，而不会因为这条通知直接错绑。
 
 **顺手学 Go：** `defer f()()` 看起来有两对括号，是因为 `ObserveSince(...)` 先返回一个函数，后面的 `()` 表示把这个返回函数登记为 defer 调用。
 
-### 10.2 NodeResourcesFit 注册的不是“所有事件”
+### 10.2 NodeResourcesFit 注册的不是“所有 ClusterEvent”
 
 源码位置：`pkg/scheduler/framework/plugins/noderesources/fit.go:358-376`。
 
-下面是**完整函数，教学注释版**。首遍只看前两个事件；DRA 与原地缩容分支是当前版本边界。
+下面是**完整函数，教学注释版**。首遍只看前两个 ClusterEvent；DRA 与原地缩容分支是当前版本边界。
 
 ```go
-// 返回可能让 NodeResourcesFit 失败 Pod 变得可调度的事件及回调。
+// 返回可能让 NodeResourcesFit 失败 Pod 变得可调度的 ClusterEvent 及回调。
 func (f *Fit) EventsToRegister(_ context.Context) ([]fwk.ClusterEventWithHint, error) {
 	// 基础事件只有已绑定 Pod 删除、Node 新增或 allocatable 更新。
 	events := []fwk.ClusterEventWithHint{
@@ -1103,7 +1225,7 @@ func (f *Fit) EventsToRegister(_ context.Context) ([]fwk.ClusterEventWithHint, e
 }
 ```
 
-**大白话总结：** ConfigMap 更新不在列表里，Node heartbeat 若没有对应的 scheduling property 变化也不会成为本插件的有效事件。插件不是订阅“集群变化”这个大筐，而是声明哪些资源与动作理论上可能改变自己的判定。
+**大白话总结：** ConfigMap 更新不在列表里，Node heartbeat 若没有对应的调度属性变化也不会成为本插件的有效 ClusterEvent。插件不是订阅“集群变化”这个大筐，而是声明哪些资源与动作理论上可能改变自己的判定。
 
 **顺手学 Go：**
 
@@ -1113,42 +1235,21 @@ func (f *Fit) EventsToRegister(_ context.Context) ([]fwk.ClusterEventWithHint, e
 
 ### 10.3 为什么已绑定 Pod 删除只返回“可能”
 
-源码位置：`pkg/scheduler/framework/plugins/noderesources/fit.go:380-394`。
+这个完整函数已经在第 5.1 节作为本章第一段源码逐行读过。下面按**从上往下**读；箭头表示过滤条件继续收窄，不是函数间 RPC。放到三层过滤链里，它的职责只有最后一步：
 
-下面是**完整函数，教学注释版**。
-
-```go
-// 判断一个 Pod 删除是否可能解除 NodeResourcesFit 的失败。
-func (f *Fit) isSchedulableAfterAssignedPodDelete(logger klog.Logger, pod *v1.Pod, oldObj, newObj interface{}) (fwk.QueueingHint, error) {
-	// Delete 通常从 oldObj 取 Pod；工具函数也统一处理对象转换错误。
-	deletedPod, _, err := schedutil.As[*v1.Pod](oldObj, newObj)
-	// 类型不符合预期时 fail-open：返回 Queue 和 error，防止目标 Pod 永久卡住。
-	if err != nil {
-		return fwk.Queue, err
-	}
-
-	// 既未绑定也未 nominated 的 Pod 删除不会释放任何 Node 上的调度承诺。
-	if deletedPod.Spec.NodeName == "" && deletedPod.Status.NominatedNodeName == "" {
-		// 记录无关删除。
-		logger.V(5).Info("the deleted pod was unscheduled and it wouldn't make the unscheduled pod schedulable", "pod", klog.KObj(pod), "deletedPod", klog.KObj(deletedPod))
-		// 不值得为它重跑 NodeResourcesFit。
-		return fwk.QueueSkip, nil
-	}
-
-	// 只要删除对象曾绑定或 nominated，就保守认为可能释放资源。
-	logger.V(5).Info("another scheduled pod was deleted, and it may make the unscheduled pod schedulable", "pod", klog.KObj(pod), "deletedPod", klog.KObj(deletedPod))
-	// Queue 不承诺同 Node、同资源维度或释放量一定足够。
-	return fwk.Queue, nil
-}
+```text
+NodeResourcesFit 注册了“已分配 Pod 删除”
+  -> 本 Pod 上轮确实被 NodeResourcesFit 拒绝
+  -> 检查删除对象是否曾占 Node 调度账
+       ├─ 曾绑定或被提名到 Node：返回 Queue
+       └─ 从未绑定且从未被提名：返回 QueueSkip
 ```
 
-**大白话总结：** 这个 hint 没有逐 Node、逐资源精算删除量。删除一个已经占 Node 账本的 Pod 就值得保守重试；下一轮 Filter 才会发现它是在 `worker-06`、只释放 100m，还是本例 `worker-05` 释放 1000m。hint 偏保守会多算一轮，偏激进漏掉事件却可能让 Pod 等很久，因此这里选择安全侧。
-
-**顺手学 Go：** `schedutil.As[*v1.Pod]` 使用 Go 泛型，方括号中的 `*v1.Pod` 是类型参数，告诉工具函数期望把事件对象转成 Pod 指针。
+`Queue` 仍只是“值得重算”。这个 hint 不逐 Node、逐资源精算删除量；下一轮 Filter 才会发现它是在 `worker-06` 只释放 100m，还是本例在 `worker-05` 释放 1000m。保守返回 Queue 最坏多算一轮；错误地 Skip 却可能让 Pod 等很久，所以这里偏向不漏唤醒。
 
 ### 10.4 Node 新增或 allocatable 更新，为什么能更精细地 Skip
 
-Node 事件自带新 Node 对象，NodeResourcesFit 可以先做两个廉价判断：
+Node ClusterEvent 自带新 Node 对象，NodeResourcesFit 可以先做两个成本很低的判断：
 
 1. 这台 Node 的**总 Allocatable** 是否至少能容纳目标 Pod；
 2. 若是更新，Node 可容纳的 Pod 数是否增加，或目标 Pod 请求的某个资源维度是否真的增加了 Allocatable。
@@ -1202,7 +1303,7 @@ func (f *Fit) isSchedulableAfterNodeChange(logger klog.Logger, pod *v1.Pod, oldO
 	// 组装与当前插件 feature 配置一致的 request 计算选项。
 	opts := ResourceRequestsOptions{
 		// 是否启用 Pod-level resources。
-		EnablePodLevelResources: f.enablePodLevelResources,
+		EnablePodLevelResources:   f.enablePodLevelResources,
 		// 是否把 DRA 暴露的 extended resource 纳入。
 		EnableDRAExtendedResource: f.enableDRAExtendedResource,
 	}
@@ -1233,7 +1334,7 @@ func (f *Fit) isSchedulableAfterNodeChange(logger klog.Logger, pod *v1.Pod, oldO
 }
 ```
 
-**大白话总结：** Node hint 比 Pod 删除 hint 更精细，因为 old/new Node 直接提供 Allocatable 差异。`haveAnyRequestedResourcesIncreased` 先比较 allowed pod number，再只比较目标 Pod 真正请求的 CPU、memory、ephemeral-storage、scalar resource，当前 DRA 分支还有委托判断。它仍不读取完整当前 Requested，所以 `Queue` 只表示“总容量门槛和相关增量都合理”，实际余额必须等下一轮 snapshot + Filter 再算。
+**大白话总结：** Node hint 比 Pod 删除 hint 更精细，因为 old/new Node 直接提供 Allocatable 差异。`haveAnyRequestedResourcesIncreased` 先比较允许的 Pod 数，再只比较目标 Pod 真正请求的 CPU、memory、临时磁盘和 scalar resource（用整数计数的资源，例如 `nvidia.com/gpu`）；当前 DRA 分支还有委托判断。它仍不读取完整当前 Requested，所以 `Queue` 只表示“总容量门槛和相关增量都合理”，实际余额必须等下一轮 snapshot + Filter 再算。
 
 **顺手学 Go：**
 
@@ -1245,7 +1346,7 @@ func (f *Fit) isSchedulableAfterNodeChange(logger klog.Logger, pod *v1.Pod, oldO
 
 源码位置：`pkg/scheduler/backend/queue/scheduling_queue.go:476-563`。
 
-下面是**完整函数，教学注释版**。首遍重点看“合并拒绝插件 -> 匹配事件 -> 只调用拒绝插件 -> Error 按 Queue -> 翻译策略”；wildcard 和 Pending 分支二遍再读。
+下面是**完整函数，教学注释版**。首遍重点看“合并拒绝插件 -> 匹配对象变化 -> 只调用拒绝插件 -> Error 按 Queue -> 翻译策略”；wildcard（特殊的全匹配/强制激活变化）和 Pending plugin（等待外部条件完成的插件）分支二遍再读。
 
 ```go
 // 判断一个具体事件是否值得让这个具体 Pod 离开 unschedulable pool。
@@ -1312,7 +1413,7 @@ func (p *PriorityQueue) isPodWorthRequeuing(logger klog.Logger, pInfo *framework
 			start := time.Now()
 			// 把目标 Pod 和事件的 old/new 对象交给插件。
 			hint, err := hintfn.QueueingHintFn(logger, pod, oldObj, newObj)
-			// hint 自己报错时采用 fail-open，而不是相信 Skip。
+			// hint 自己报错时采用 fail-open（出错也按值得重算处理），而不是相信 Skip。
 			if err != nil {
 				// 尝试提取日志友好的对象 metadata。
 				oldObjMeta, newObjMeta, asErr := util.As[klog.KMetadata](oldObj, newObj)
@@ -1365,6 +1466,8 @@ func (p *PriorityQueue) isPodWorthRequeuing(logger klog.Logger, pInfo *framework
 - 泛型 `util.As[klog.KMetadata]` 与前面的 Pod 转换同理，只是目标是日志 metadata 接口。
 
 ### 10.6 真正迁移状态时，gating、in-flight 与 broadcast 都不能漏
+
+这里的 gating 是“某个 PreEnqueue plugin 暂时不让 Pod 进入可调度队列”；broadcast 是“唤醒正在等待队列条件的 `Pop`”，不是向集群广播网络消息。两者都是 kube-scheduler 进程内状态。
 
 先看单 Pod 的最终去向。源码位置：`pkg/scheduler/backend/queue/scheduling_queue.go:1166-1188`。
 
@@ -1467,7 +1570,7 @@ func (p *PriorityQueue) movePodsToActiveOrBackoffQueue(logger klog.Logger, podIn
 
 ### 10.7 本例与四个反事实的 hint 结果
 
-| 事件 | NodeResourcesFit 判断 | 内部策略 | 原因 |
+| 对象变化 | NodeResourcesFit 判断 | 内部策略 | 原因 |
 |---|---|---|---|
 | `worker-05` 已绑定 Pod 删除 1000m | `Queue` | `queueAfterBackoff` | 删除可能释放 Node 账本；下一轮实际变成 2500m 余额 |
 | 未调度 Pending Pod 删除 | `QueueSkip` | 留在等待区 | 它没有占任何 Node request 账 |
@@ -1475,7 +1578,22 @@ func (p *PriorityQueue) movePodsToActiveOrBackoffQueue(logger klog.Logger, podIn
 | Node 只更新 label，CPU Allocatable 不变 | `QueueSkip` | 留在等待区 | 对本插件的目标资源没有增量 |
 | QueueingHint 类型转换报错 | 按 `Queue` | `queueAfterBackoff` | fail-open，防止因插件错误永久卡住 |
 
-## 11. backoff：事件说“值得再算”，也不能让连续失败压住新工作
+### 10.8 最短返回值传播卡：`Queue` 到底传到哪里
+
+不要把内层函数的返回值直接想成“worker 收到后立刻绑定”。下面按**从上往下**读；箭头表示返回值被上一层保留或转换，全部发生在 scheduler 内部：
+
+```text
+NodeResourcesFit hint 返回 (QueueingHint, error)
+  -> isPodWorthRequeuing：error 会被记录，并按 Queue 继续，避免漏唤醒
+  -> 上轮是普通 Unschedulable plugin：Queue 被翻成 queueAfterBackoff
+  -> movePodsToActiveOrBackoffQueue：按策略把 Pod 放入 backoffQ 或 activeQ
+  -> requeuePodWithQueueingStrategy 返回的字符串只用于日志、指标和是否广播，不是调度结果
+  -> 以后 Pop 再跑完整 Filter，才产生本轮成功或再次失败
+```
+
+`QueueSkip, nil` 里的 `nil` 只表示 hint 函数没有程序错误；它不表示 Pod 已经成功，也不表示返回了空对象。`Queue, err` 也不是“出错就丢弃”，调用者会保守地把它当值得重算。
+
+## 11. backoff：ClusterEvent 说“值得再算”，也不能让连续失败压住新工作
 
 ### 11.1 backoff 解决的是吞吐公平，不是根因判断
 
@@ -1494,7 +1612,7 @@ Filter：到那一刻，最新快照是否真的满足全部约束？
 
 ### 11.2 默认退避参数与本例序列
 
-源码位置：`pkg/scheduler/backend/queue/scheduling_queue.go:59-82`。
+源码位置：`pkg/scheduler/backend/queue/scheduling_queue.go:59-83`。
 
 下面是两个 const 组的**连续摘录，教学注释版**；队列名称常量也在这个区间内，因此一并保留。
 
@@ -1503,9 +1621,9 @@ const (
 	// Pod 默认最多在 unschedulable pool 等 5 分钟，之后由安全网唤醒检查。
 	DefaultPodMaxInUnschedulablePodsDuration time.Duration = 5 * time.Minute
 	// 指标和日志使用的 active 状态名。
-	activeQ = "Active"
+	activeQ        = "Active"
 	// 指标和日志使用的 backoff 状态名。
-	backoffQ = "Backoff"
+	backoffQ       = "Backoff"
 	// 指标和日志使用的 unschedulable 状态名。
 	unschedulableQ = "Unschedulable"
 
@@ -1724,6 +1842,8 @@ func (p *PriorityQueue) flushUnschedulablePodsLeftover(logger klog.Logger) {
 
 ## 12. 把 `game-api-new-x` 的完整重入队时间线走一遍
 
+本节四条时间线都按**从上往下**读，`t0、t1...` 表示先后，不表示每一步耗时相同。它把异步对象通知、scheduler 内存状态和公开 API 证据放在一条时间轴上，不是一条同步函数调用栈。
+
 ### 12.1 没有资源变化时
 
 ```text
@@ -1771,7 +1891,7 @@ t7   直接按 queueAfterBackoff 落入 backoff/active，而不是睡进 unsched
 
 这条时间线是第 6 和第 9 节存在的真正原因。它保护的不是“队列名完整”，而是并发反馈不丢信号。
 
-### 12.4 事件有用，但释放量仍不足
+### 12.4 ClusterEvent 有用，但释放量仍不足
 
 把释放量改成 400m：
 
@@ -1788,22 +1908,41 @@ NodeResourcesFit 的 AssignedPodDelete hint 仍返回 Queue，因为它只做安
 | 时刻 | API 可能看到 | scheduler 内部 | 你能下的结论 |
 |---|---|---|---|
 | 初次创建 | Pending、`nodeName=""` | activeQ 或刚进入 in-flight | 还不能知道是否已经开始计算 |
-| Filter 失败后 | `PodScheduled=False`、FailedScheduling | unschedulable/backoff/active 之一 | Event 说明最近失败，不暴露精确内部去向 |
+| Filter 失败后 | `PodScheduled=False`、FailedScheduling | unschedulable/backoff/active 之一 | 公开 Event 说明最近失败，不暴露精确内部去向 |
 | 已有 nomination | Pending、NNN 非空、`nodeName=""` | 仍等待未来调度轮；内部 nominator 还可能影响其他 Pod 的 Filter 竞争账 | 抢占曾选定候选，不是绑定完成 |
 | 下一轮成功 Assume 但 API 尚未更新 | API 仍可能短暂 `nodeName=""` | scheduler cache 已 assumed | 只看单次 API 快照存在时间窗口 |
 | Bind 持久化 | `spec.nodeName=worker-05` | 已离开调度队列 | scheduler 已完成节点分配，后续转入 kubelet 主线 |
 
 ## 13. PostFilter 与抢占：不是“高优先级插队”，而是模拟删谁后未来能通过
 
+先翻译三个角色：发起抢占的待调度 Pod 叫 **preemptor（抢占者）**；可能被删除的低优先级 Pod 叫 **victim（牺牲者）**；模拟后看起来可行的 Node 叫 **candidate（候选节点）**。PostFilter 是普通 Filter 已经让所有 Node 出局后才进入的补救阶段，默认抢占只是其中一种实现。
+
 ### 13.1 先纠正五个常见误解
 
 1. **Priority 高不等于一定抢占。** incoming Pod 必须允许发起抢占，Node 必须属于可通过删除低优先级 Pod 解决的 `Unschedulable`，且模拟删除后所有 Filter 都要通过。
 2. **同优先级不能互抢。** victim 的 priority 必须严格小于 preemptor，不是小于等于。
-3. **PDB 不是绝对锁。** scheduler 会优先减少 PDB violation，但找不到零 violation 方案时仍可能删除会违反 PDB 的低优先级 Pod。
+3. **PDB 不是绝对锁。** PDB violation 的意思是“删掉这些 Pods 会超过 PDB 当前允许的中断数量”。scheduler 会优先找零 violation 方案，但找不到时仍可能删除会违反 PDB 的低优先级 Pod。
 4. **`nominatedNodeName` 不是 Bind，也不只是一条“本 Pod 下轮先试这里”的建议。** FailureHandler 会先把 nomination 写进 scheduler 内部 nominator；其他 Pod 做 Filter 时，会把该 Node 上同等或更高优先级的 nominated Pods 计入竞争账。它仍不是硬预留：victim 可能尚在优雅退出，本 Pod 也可能最终落到别处。
 5. **当前版本通常异步处理 victim。** 固定提交中 `SchedulerAsyncPreemption` 自 1.33 起默认开启；PostFilter 触发执行器后会继续返回 FailureHandler，不等删除完成才写失败结果。
 
+下图按**从上往下**读。菱形是必须回答的是/否问题，方框是 scheduler 的动作或结果，实线是控制判断顺序；最后的 victim 删除会异步影响 API 对象，所以整张图不是同步 RPC 调用图：
+
+```mermaid
+flowchart TD
+    A["所有 Node 都未通过 Filter"] --> B{"incoming Pod 允许主动抢占吗"}
+    B -->|"否：例如 preemptionPolicy=Never"| W["不选 victim<br/>Pod 继续等待以后条件变化"]
+    B -->|"是"| C{"失败是可通过删 Pod 改变的 Unschedulable 吗"}
+    C -->|"否：例如 request 大于 Node 总 Allocatable"| W
+    C -->|"是"| D{"是否存在严格更低优先级的 Pod<br/>且模拟删除后全部 Filter 通过"}
+    D -->|"否"| W
+    D -->|"是"| E["得到 candidate Node 和 victim 集合"]
+    E --> F["异步处理 victim<br/>返回 nomination"]
+    F --> G["下一轮仍要重跑完整 Filter<br/>通过后才可能 Bind"]
+```
+
 ### 13.2 `Evaluator.Preempt`：先验证资格，再找候选，最后只返回 nomination
+
+这段函数的 `Evaluator` 是框架共用的抢占计算器；`state`（`CycleState`）是本轮调度给插件使用的临时草稿本；`pod` 是 preemptor；`m` 保存各 Node 上轮 Filter 的结果。它返回的 `PostFilterResult` 只是 nomination 操作，`framework.Status` 是这次插件执行结果，二者都不是 Bind 结果。Extender 是可选的外部 scheduler 扩展程序，本例首遍跳过。
 
 源码位置：`pkg/scheduler/framework/preemption/preemption.go:103-170`。
 
@@ -1857,7 +1996,7 @@ func (ev *Evaluator) Preempt(ctx context.Context, state fwk.CycleState, pod *v1.
 		// 构造只用于解释 PostFilter 失败的 FitError。
 		fitError := &framework.FitError{
 			// 关联当前最新 Pod。
-			Pod: pod,
+			Pod:         pod,
 			// 保存全集群 Node 数，便于错误摘要。
 			NumAllNodes: len(allNodes),
 			// 保存抢占 dry-run 的逐 Node 失败。
@@ -2017,7 +2156,9 @@ func (ev *Evaluator) findCandidates(ctx context.Context, state fwk.CycleState, a
 
 **顺手学 Go：** `errors.New` 创建新的 error；这里三个 nil 分别对应 candidates、NodeToStatus 和 error 返回位置，必须按位置理解。
 
-### 13.5 【二遍】单个 Node 上怎样得到最小必要 victim 集
+### 13.5 【二遍】单个 Node 上怎样按既定顺序缩小 victim 集
+
+先认三个词：dry-run 是“只在内存副本里演算，不真的删 Pod”；`NodeInfo` 是 scheduler 对一台 Node 及其 Pods 的计算账；`CycleState` 是这一轮调度给各插件共用的临时草稿本。源码里的 `reprieve` 直译是“赦免”，这里就是把刚才模拟移除的 Pod 再放回副本，看看还能不能保住它。
 
 源码位置：`pkg/scheduler/framework/plugins/defaultpreemption/default_preemption.go:251-353`。
 
@@ -2040,7 +2181,7 @@ func (pl *DefaultPreemption) SelectVictimsOnNode(
 	logger := klog.FromContext(ctx)
 	// 收集严格低优先级且满足额外资格的潜在 victims。
 	var potentialVictims []fwk.PodInfo
-	// 定义“从模拟 Node 移除一个 Pod”的 closure。
+	// 定义“从模拟 Node 移除一个 Pod”的 closure（可使用外层变量的内部函数）。
 	removePod := func(rpi fwk.PodInfo) error {
 		// 先更新模拟 NodeInfo 的 Pod 列表与资源账。
 		if err := nodeInfo.RemovePod(logger, rpi.GetPod()); err != nil {
@@ -2162,7 +2303,7 @@ func (pl *DefaultPreemption) SelectVictimsOnNode(
 }
 ```
 
-**大白话总结：** 算法不是从所有 Pod 组合中做指数级穷举，而是“先移除所有合格低优先级 Pod，验证有解；再按重要性逐个加回，能保就保”。它先尝试保住会导致 PDB violation 的 Pod，再保其他 Pod，最终留下刚好不能再赦免的集合。这个贪心过程追求可用的最小必要 victim 集与性能平衡，不应宣传成数学意义上的全局组合最优。
+**大白话总结：** 算法不是从所有 Pod 组合中做指数级穷举，而是“先移除所有合格低优先级 Pod，验证有解；再按既定顺序逐个加回，能保就保”。它先尝试保住会导致 PDB violation 的 Pod，再保其他 Pod，最后得到这一轮赦免顺序下留下的 victim 集。这里追求的是在可接受计算成本下少破坏一些 Pod，不保证 victim 数量是所有可能组合中的数学最小值。
 
 **顺手学 Go：**
 
@@ -2216,7 +2357,7 @@ PDB 在上面的算法中有两次影响：
 1. 单个 Node 内优先赦免会导致 PDB violation 的 Pod；
 2. 多个 candidate 间优先选 violation 数更少的 Node。
 
-但如果所有可行方案都必须违反 PDB，算法仍可能返回这样的 candidate。对于普通已绑定 victim，当前执行器先补 `DisruptionTarget=True/PreemptionByScheduler`，再直接调用 Pod DELETE；它不是通过会受 PDB admission 拒绝的 eviction subresource。
+但如果所有可行方案都必须违反 PDB，算法仍可能返回这样的 candidate。对于普通已绑定 victim，当前执行器先补 `DisruptionTarget=True/PreemptionByScheduler`，再直接调用 Pod DELETE；它没有走 eviction subresource（专门的驱逐 API 路径），因此不会由该路径的 PDB admission 再拦一次。
 
 源码位置：`pkg/scheduler/framework/preemption/executor.go:124-159`。
 
@@ -2228,15 +2369,15 @@ if !skipAPICall {
 	// 构造“它是 scheduler 抢占目标”的 Pod Condition。
 	condition := &v1.PodCondition{
 		// 通用 disruption target condition。
-		Type: v1.DisruptionTarget,
+		Type:               v1.DisruptionTarget,
 		// 绑定当前 victim generation。
 		ObservedGeneration: apipod.CalculatePodConditionObservedGeneration(&victim.Status, victim.Generation, v1.DisruptionTarget),
 		// 明确标记为 true。
-		Status: v1.ConditionTrue,
+		Status:             v1.ConditionTrue,
 		// 原因是 scheduler preemption。
-		Reason: v1.PodReasonPreemptionByScheduler,
+		Reason:             v1.PodReasonPreemptionByScheduler,
 		// 消息说明 scheduler/profile 与高优先级对象类型。
-		Message: fmt.Sprintf("%s: preempting to accommodate a higher priority %s", preemptor.SchedulerName(), preemptor.Type()),
+		Message:            fmt.Sprintf("%s: preempting to accommodate a higher priority %s", preemptor.SchedulerName(), preemptor.Type()),
 	}
 	// 深拷贝 status，避免原地改 informer 对象。
 	newStatus := victim.Status.DeepCopy()
@@ -2275,7 +2416,7 @@ if !skipAPICall {
 	eventMessage += " (in kube-scheduler memory)."
 }
 
-// 只有前面的内存处理或 API 调用没有提前报错返回，才记录 Preempted Event。
+// 只有前面的内存处理或 API 调用没有提前报错返回，才记录公开的 Preempted Event。
 fh.EventRecorder().WithLogger(logger).Eventf(victim, preemptor.Obj(), v1.EventTypeNormal, "Preempted", "Preempting", eventMessage)
 
 // nil 表示这一个 victim 处理成功。
@@ -2304,7 +2445,7 @@ func (e *Executor) actuatePodPreemption(ctx context.Context, targetNode string, 
 		// dry-run 得出的 victims 与 PDB violation 统计。
 		victims: victims,
 		// 将要写入 nomination 的目标 Node。
-		name: targetNode,
+		name:    targetNode,
 	}
 
 	// 把 API Pod 包成 ExecutorPreemptor。
@@ -2402,7 +2543,7 @@ func (pl *DefaultPreemption) PreEnqueue(ctx context.Context, p *v1.Pod) *fwk.Sta
 
 为什么 `preempting` 集合还没清理，PreEnqueue 有时已经允许 Pod 通过？要看它实际调用的检查函数。
 
-源码位置：`pkg/scheduler/framework/preemption/executor.go:359-383`。
+源码位置：`pkg/scheduler/framework/preemption/executor.go:359-384`。
 
 下面是**完整函数，教学注释版**。
 
@@ -2427,7 +2568,7 @@ func (e *Executor) isRunningPreemption(uid types.UID) bool {
 	}
 	// 从 informer lister 读取最后一个 victim 的最新对象。
 	victimPod, err := e.podLister.Pods(victim.namespace).Get(victim.name)
-	// lister 已找不到 victim，说明删除已经完成，不必等 goroutine 清理 map 才放行。
+	// lister Get 返回任何 error 都走这里；源码把它按“victim 已不可见”处理，不向上继续传播该 error。
 	if err != nil {
 		return false
 	}
@@ -2440,7 +2581,7 @@ func (e *Executor) isRunningPreemption(uid types.UID) bool {
 }
 ```
 
-**大白话总结：** 异步抢占提高 scheduler 主循环吞吐，但引入“victim 操作还在后台进行”的状态。PreEnqueue 在前半段阻止同一个 Pod 重复抢占；等最后一个 victim 已从 lister 消失或已经带 `DeletionTimestamp`，即使 goroutine 还没来得及从 `preempting` map 清理 UID，也提前放行。这段尾部窗口是为了避免“删除事件先到、内部清理稍后才完成”导致 preemptor 错过唤醒。若后台 API 调用失败，执行器最终清理状态并主动 Activate preemptor；已经成功发生的部分删除不会事务回滚。
+**大白话总结：** 异步抢占提高 scheduler 主循环吞吐，但引入“victim 操作还在后台进行”的状态。PreEnqueue 在前半段阻止同一个 Pod 重复抢占；当最后一个 victim 的 lister 查询报错（常见是对象已删除）或对象已经带 `DeletionTimestamp` 时，即使 goroutine 还没来得及从 `preempting` map 清理 UID，也提前放行。注意源码没有区分 NotFound 与其他 lister error，这个 error 也不会继续传给上层；这是本函数真实的保守结束边界。若后台 API 调用失败，执行器最终清理状态并主动 Activate preemptor；已经成功发生的部分删除不会事务回滚。
 
 **顺手学 Go：** `p.GetUID()` 来自对象接口方法，等价于读取 metadata UID；接口让 Pod 与 PodGroup 执行器复用同一套追踪逻辑。
 
@@ -2494,11 +2635,11 @@ if len(feasibleNodes) == 1 {
 	// 直接把唯一 Node 作为 SuggestedHost 返回；这里不会进入后面的 prioritizeNodes/Score。
 	return ScheduleResult{
 		// 后续 Assume 使用的目标 Node。
-		SuggestedHost: node,
+		SuggestedHost:  node,
 		// 统计本轮已评估 Node 数；包含 diagnosis 中已有状态的 Node。
 		EvaluatedNodes: 1 + diagnosis.NodeToStatus.Len(),
 		// 可行 Node 数明确为 1。
-		FeasibleNodes: 1,
+		FeasibleNodes:  1,
 	// nil 表示节点选择没有算法错误。
 	}, nil
 }
@@ -2531,15 +2672,15 @@ if len(feasibleNodes) == 1 {
 
 ### 13.11 抢占这条链的补偿边界
 
-抢占不是数据库事务：
+这里的“补偿”不是把时间倒回去，而是某一步失败后，用重新入队、再次观察和下一轮计算继续修正。抢占也不是数据库事务，不能保证“要么全部成功，要么全部回滚”：
 
 - 多个 victim 可以并行处理；一部分删除成功、另一部分失败时，成功的删除不会恢复；
 - 清理同一 Node 上较低优先级 nominated Pods 失败只记录错误，不撤销已经触发的 victim 处理；
-- 异步失败会 Activate preemptor，避免它只因后台错误永久留在等待区；
+- 异步失败会 Activate preemptor（把抢占者重新放回可尝试状态），避免它只因后台错误永久留在等待区；
 - 已发出的 Pod DELETE 与最终对象消失之间有优雅退出窗口；
-- 所有不确定性最终仍由下一轮 Filter 和 scheduler cache 状态收敛。
+- 所有不确定性最终仍由下一轮 Filter 重新核对，让 scheduler cache 中的判断逐步回到最新对象事实。
 
-这正是 Kubernetes 控制循环常见的设计：动作可重入、失败可补偿、状态最终收敛，而不是把跨 API、跨 goroutine 的一串动作伪装成原子事务。
+这正是 Kubernetes 控制循环常见的设计：同一动作可以安全地再次尝试，局部失败靠后续步骤修正，状态经过多轮观察逐步接近真实情况。它不会把跨 API、跨 goroutine 的一串动作伪装成一次不可分割、还能整体回滚的操作。
 
 ## 14. 现在才回到生产证据：每条命令必须对应一个源码变量
 
@@ -2563,7 +2704,7 @@ kubectl -n prod get pod game-api-new-x -o yaml
 # 只读：把 Condition 与最近关联 Event 放在一起看。
 kubectl -n prod describe pod game-api-new-x
 
-# 只读：按对象 UID 过滤 Event，避免同名重建后混入旧实例事件。
+# 只读：按对象 UID 过滤公开 Event，避免同名重建后混入旧实例记录。
 kubectl -n prod get events --field-selector involvedObject.uid=<pod-uid> --sort-by=.metadata.creationTimestamp
 ```
 
@@ -2575,9 +2716,9 @@ kubectl -n prod get events --field-selector involvedObject.uid=<pod-uid> --sort-
 | `PodScheduled=False/Unschedulable` | 最近公开调度结果是正常拒绝 | 不能证明 scheduler 进程健康的全部维度，也不能推出下次重试时间 |
 | `Message` 含 `Insufficient cpu` | 最近 FitError 摘要包含 CPU 不足 | 不能单独证明哪一个模板字段造成 2000m request |
 | NNN 非空 | 抢占曾给出未来优先候选 | 不能证明 victim 已消失或 Pod 已 Bind |
-| UID 改变 | 同名 Pod 已是新实例 | 旧 Event、失败次数与 nomination 不能继续套用 |
+| UID 改变 | 同名 Pod 已是新实例 | 旧的公开 Event、失败次数与 nomination 不能继续套用 |
 
-时间边界：Event recorder、Pod status patch 与内部队列迁移不是同一个原子写入；短时间内顺序可能与人类直觉不同。
+时间边界：Event recorder（公开 Event 记录器）、Pod status patch 与内部队列迁移不是同一个原子写入；短时间内顺序可能与人类直觉不同。
 
 ### 14.2 第二组：复算 scheduler 真正看到的 Pod request
 
@@ -2645,6 +2786,8 @@ kubectl get pods -A --field-selector spec.nodeName=worker-07 -o custom-columns='
 
 ### 14.5 第五组：用 scheduler metrics 判断是单 Pod 容量问题还是系统性队列压力
 
+metrics 是组件持续暴露的数字指标；PromQL 是在 Prometheus 中查询这些指标的表达式。下面看的是集群总体趋势，不是某个 Pod 的精确队列位置。
+
 以下是 PromQL 示例，不是 Pod 级队列查询接口：
 
 ```promql
@@ -2668,7 +2811,7 @@ rate(scheduler_preemption_victims_sum[5m])
 rate(scheduler_pod_scheduled_after_flush_total[15m])
 ```
 
-说明：Histogram 在 Prometheus 暴露时会有 `_bucket`、`_sum`、`_count` 序列；这里用 `scheduler_preemption_victims_sum` 观察所选 victim 数的增长，`_count` 只表示采集了多少次抢占 victim 样本。不同发行版可能裁剪 Alpha metrics，必须以目标集群 `/metrics` 与对应版本文档为准。
+说明：Histogram（直方图，一类用来统计数值分布的指标）在 Prometheus 暴露时会有 `_bucket`、`_sum`、`_count` 序列；这里用 `scheduler_preemption_victims_sum` 观察所选 victim 数的增长，`_count` 只表示采集了多少次抢占 victim 样本。不同发行版可能裁剪 Alpha metrics，必须以目标集群 `/metrics` 与对应版本文档为准。
 
 这些指标能说明队列总体形态和插件维度，不能告诉你 `game-api-new-x` 此刻精确位于哪一个内部结构。不要把集群级 gauge 反推成单 Pod 事实。
 
@@ -2685,7 +2828,7 @@ kubectl -n kube-system logs kube-scheduler-<control-plane> --since=15m --timesta
 kubectl -n kube-system get pod kube-scheduler-<control-plane> -o yaml
 ```
 
-前文出现的 `"Pod moved to an internal scheduling queue"`、`"Event received while pods are in flight"` 等日志有较高 verbosity；默认生产日志级别未必包含。为了临时提高日志级别去修改控制面参数属于有状态、高风险变更，不能把它当普通排障命令。优先使用已有 metrics、Event、审计与当前日志；确需变更时走控制面变更流程和回退计划。
+前文出现的 `"Pod moved to an internal scheduling queue"`、`"Event received while pods are in flight"` 等日志有较高 verbosity（日志详细度等级）；这里日志文本中的 Event 指对象变化通知。默认生产日志级别未必包含这些信息。为了临时提高日志级别去修改控制面参数属于有状态、高风险变更，不能把它当普通排障命令。优先使用已有 metrics、公开 Event、审计与当前日志；确需变更时走控制面变更流程和回退计划。
 
 ### 14.7 证据链怎样闭环，而不是堆截图
 
@@ -2694,7 +2837,7 @@ kubectl -n kube-system get pod kube-scheduler-<control-plane> -o yaml
 ```text
 对象事实：game-api-new-x UID 未变化，最终 request=2000m，priority=0。
 Node 事实：worker-05 allocatable=7500m；失败时已承诺 request 约 6000m。
-源码映射：NodeResourcesFit 记录为 rejector，等待 AssignedPodDelete/相关 Node allocatable 事件。
+源码映射：NodeResourcesFit 记录为 rejector，等待 AssignedPodDelete/相关 Node allocatable ClusterEvent。
 变化事实：batch-temp-x 是已绑定 Pod，request=1000m，随后对象删除并从 scheduler cache 移除。
 预测：NodeResourcesFit hint 返回 Queue；Pod 仍受剩余 backoff；下一轮 CPU 余额为 2500m。
 结果：下一轮完整 Filter 通过后才 Bind；若仍失败，继续检查其他 Filter 和 assumed/nominated 账。
@@ -2708,7 +2851,7 @@ Node 事实：worker-05 allocatable=7500m；失败时已承诺 request 约 6000m
 
 Spring Boot 冷启动较慢，`maxUnavailable=0` 有明确可用性收益，但 `maxSurge=1` 要求集群在发布窗口多容纳一份 request。合理选择包括：
 
-- 为 Node pool 保留可量化的 rollout headroom；
+- 为 Node pool 保留可量化的 rollout headroom（发布时的额外容量余量）；
 - 在业务允许时调整 surge/unavailable 组合；
 - 用真实 JIT、GC、启动和峰值数据校准 request；
 - 让 Cluster Autoscaler 等容量系统提前响应，而不是等发布已卡住再扩；
@@ -2720,13 +2863,13 @@ Spring Boot 冷启动较慢，`maxUnavailable=0` 有明确可用性收益，但 
 
 | 现场根因 | 正确责任层 | 可能动作 | 风险与前提 |
 |---|---|---|---|
-| request 由错误 LimitRange/sidecar 注入放大 | 平台 admission/模板 | 修正默认值或显式声明 | 先评估所有 namespace/workload，避免引发 OOM 或 throttling |
+| request 由错误 LimitRange/sidecar 注入放大 | 平台 admission/模板 | 修正默认值或显式声明 | 先评估所有 namespace/workload，避免引发 OOM 或 CPU throttling（因 CPU limit 被限速） |
 | Java request 本身失真 | 应用容量治理 | 基于启动、GC、延迟和峰值重新定额 | 不能为“先调度成功”盲降 request |
 | rollout 没有 surge 余量 | 发布策略/容量 | 调整策略或预留/扩容 | 改 `maxUnavailable` 会直接影响发布可用性 |
-| 自然会很快释放 batch 资源 | 调度等待 | 让事件驱动重试收敛 | 先确认释放量、退出时长和业务期限 |
+| 自然会很快释放 batch 资源 | 调度等待 | 让 ClusterEvent 驱动重试继续推进 | 先确认释放量、退出时长和业务期限 |
 | 高优先级在线服务确需抢占 batch | 平台优先级治理 | 设计受配额约束的 PriorityClass | 错配会制造大面积删除；PDB 也非绝对保护 |
 | Pod request 超 Node 总容量 | 规格/架构 | 更大 Node、拆分 Pod 或修正 request | 抢占和缩短 backoff 均无效 |
-| hint/队列疑似异常 | 控制面/SRE | 用 metrics、日志、版本测试验证 | 不要以一次 Event 间隔直接断言 scheduler bug |
+| hint/队列疑似异常 | 控制面/SRE | 用 metrics、日志、版本测试验证 | 不要只凭两条公开 Event 的时间间隔断言 scheduler bug |
 
 ### 15.3 五个危险捷径
 
@@ -2744,7 +2887,7 @@ Spring Boot 冷启动较慢，`maxUnavailable=0` 有明确可用性收益，但 
 |---|---|---|---|
 | Pod request `cpu=2000m` | Pod request `nvidia.com/gpu=1` | NodeResourcesFit 仍可能成为 rejector；仍走 event -> hint -> backoff -> Filter | GPU 是整数 scalar extended resource，通常不能按利用率超卖 |
 | 已绑定 batch Pod 删除释放 1000m | 已绑定 GPU Job 删除后释放 1 张 GPU request | AssignedPodDelete 仍可能返回 Queue | 对象退出、cache 更新后才是 scheduler 账本释放，不是 `nvidia-smi` 利用率变 0 |
-| Node CPU Allocatable 增加 | Device Plugin/kubelet 让 GPU Allocatable 变化 | Node UpdateNodeAllocatable 可触发 NodeResourcesFit hint | 健康、注册和 checkpoint 属于 Device Plugin/DeviceManager 链 |
+| Node CPU Allocatable 增加 | Device Plugin/kubelet 让 GPU Allocatable 变化 | Node UpdateNodeAllocatable 可触发 NodeResourcesFit hint | 健康、注册和 checkpoint（设备分配恢复账本）属于 Device Plugin/DeviceManager 链 |
 | priority 0 的 Java Pods 不能互抢 | 同 priority 的 GPU Jobs 也不能互抢 | 严格低优先级、PDB、NNN、异步抢占规则相同 | GPU Job 被删可能损失长时间训练进度，优先级治理代价更高 |
 | scheduler 选 `worker-05` | scheduler 选一台有 GPU 资源的 Node | nomination 仍只是 Node 级候选 | scheduler 不在这里选择 GPU UUID；具体 device ID 由 kubelet DeviceManager/Allocate 处理 |
 
@@ -2754,7 +2897,7 @@ Spring Boot 冷启动较慢，`maxUnavailable=0` 有明确可用性收益，但 
 nvidia-smi 显示 GPU-Util=0%
   != 已绑定 Pod 的 nvidia.com/gpu request 已释放
   != Node.status.allocatable 已增加
-  != scheduler 自动得到一次有用的重入队事件
+  != scheduler 自动得到一次有用的重入队 ClusterEvent
 ```
 
 后续第 15～17 课会继续追：Device Plugin 怎样更新 Capacity/Allocatable、kubelet DeviceManager 怎样选 device ID、PodResources/checkpoint 怎样提供恢复账本。本课只要求你把“资源释放事实”和“设备此刻空闲观测”分开。
@@ -2767,9 +2910,9 @@ nvidia-smi 显示 GPU-Util=0%
 |---|---|---|
 | API Pending 与内部状态分层 | 不再用 phase 猜 active/backoff/unschedulable | GPU Pending 同样只有 API 表象 |
 | FailureHandler 保存 rejector | 能从 FitError 解释为什么只问 NodeResourcesFit hint | 自定义设备/拓扑插件也依赖失败身份 |
-| event -> hint -> strategy -> backoff -> Filter | 能预测一个具体事件是否唤醒、失败 Pod 怎样给 active 工作让路、何时可能提前重试、为何仍可能失败 | 这是所有稀缺资源的通用反馈环 |
-| cache 先更新再发事件 | 能解释反序会怎样制造旧账重试 | GPU Allocatable/Pod 删除也有缓存传播 |
-| in-flight 防漏事件 | 能画出 t2 事件发生在计算中间的时间线 | 大集群、高并发调度更容易遇到窗口 |
+| ClusterEvent -> hint -> strategy -> backoff -> Filter | 能预测一个具体对象变化是否唤醒、失败 Pod 怎样给 active 工作让路、何时可能提前重试、为何仍可能失败 | 这是所有稀缺资源的通用反馈环 |
+| cache 先更新再发 ClusterEvent | 能解释反序会怎样制造旧账重试 | GPU Allocatable/Pod 删除也有缓存传播 |
+| in-flight 防漏 ClusterEvent | 能画出 t2 对象变化发生在计算中间的时间线 | 大集群、高并发调度更容易遇到窗口 |
 | 抢占硬边界 | 能判断 priority、Never、Unresolvable、PDB、NNN | GPU 抢占成本通常远高于 Java Pod |
 
 ### 17.2 理解设计与关键分支即可，不必背实现
@@ -2796,77 +2939,89 @@ nvidia-smi 显示 GPU-Util=0%
 
 ## 18. 本章验收：不要背队列名，要能改变输入推演分支
 
-先独立回答，再展开答案。
+先独立回答，再展开答案。**首遍题通过就可以进入下一课；二遍题不是前置门槛。**
 
-### 18.1 核心推理题
+### 18.1 首遍验收：完成这九题即可进入下一课
 
 1. 没有任何相关对象变化时，为什么 `game-api-new-x` 不应持续重跑 Filter？
-2. batch Pod 删除释放 1000m 后，为什么 QueueingHint=Queue 仍不能直接 Bind？
-3. 只释放 400m 时，下一轮走到哪里、结果怎样、backoff 如何变化？
+2. batch Pod 删除释放 1000m 后，为什么 QueueingHint=`Queue` 仍不能直接 Bind？
+3. 如果只释放 400m，下一轮 CPU 余额是多少，NodeResourcesFit 会返回什么？
 4. ConfigMap 更新为什么通常不会唤醒被 NodeResourcesFit 拒绝的 Pod？
-5. 【二遍进阶】删除发生在 Pod 已 Pop、尚未失败落队时，哪个数据结构和哪两个函数保证事件不丢？
-6. `PodScheduled=False`、`status.nominatedNodeName`、`spec.nodeName` 分别能证明什么？
+5. `PodScheduled=False`、`status.nominatedNodeName`、`spec.nodeName` 分别能证明什么？
+6. incoming priority=0，三台 Node 上所有占用者 priority 都 >=0，为什么默认抢占无效？
+7. incoming priority=10000、victim priority=1000，是否必然抢占成功？还要检查什么？
+8. incoming priority 很高但 `preemptionPolicy: Never`，它能否主动抢别人，又能否被更高优先级 Pod 抢占？
+9. incoming request=8000m、所有 Node Allocatable=7500m，为什么 victim 选择不会开始？
 
 <details>
-<summary>展开核心题答案</summary>
+<summary>展开首遍答案</summary>
 
-1. 上次失败输入没有可能改变，立刻重算只会得到同样结果并消耗调度吞吐；Pod 留在 unschedulable pool 等拒绝插件关心的事件。
-2. AssignedPodDelete 只证明 Node request 账可能变化；其他 Filter、并发 assumed Pod 和最新 snapshot 仍未知，所以必须再次 Pop 并重跑完整调度。通常它先进入 `queueAfterBackoff`；有其他 active 工作时按 backoff 让路，activeQ 为空且当前特性开启时也可能提前 Pop。
-3. 余额变成 1900m，仍满足 `2000m > 1900m`，NodeResourcesFit 再次拒绝；`UnschedulableCount` 增加，默认退避序列继续增长并封顶 10 秒。
-4. NodeResourcesFit 的 `EventsToRegister` 没注册 ConfigMap；队列还只调用上轮 rejector 的匹配 hint。
-5. `inFlightPods` map + `inFlightEvents` 链表保存时间关系；事件入口 `movePodsToActiveOrBackoffQueue` 调用 `addEventIfAnyInFlight`，失败落队时 `determineSchedulingHintForInFlightPod` 回放。
-6. Condition 说明最近公开失败；NNN 说明未来优先候选，内部 nominator 还可能影响其他 Pod 的竞争账，但仍不是 Bind；`spec.nodeName` 才说明节点分配已持久化。三者都不能直接暴露 Pod 精确内部队列。
+1. 上次失败输入没有可能改变，立刻重算只会得到同样结果并消耗调度吞吐；Pod 留在 unschedulable pool，等待拒绝插件关心的对象变化。
+2. AssignedPodDelete 只说明 Node request 账**可能**变化；其他 Filter、并发 assumed Pod 和最新 snapshot 仍未知，所以必须再次 Pop 并重跑完整调度。普通资源不足会使用 `queueAfterBackoff`；有新工作时先让路，activeQ 为空且当前特性开启时也可能提前 Pop。
+3. 余额从 1500m 变成 1900m，仍有 `2000m > 1900m`，所以 NodeResourcesFit 再次返回资源不足；本轮仍失败，失败次数增加并重新计算 backoff。
+4. NodeResourcesFit 没有注册 ConfigMap 变化，而且队列只调用上轮拒绝插件中、与当前 ClusterEvent 匹配的 hint。
+5. Condition 说明最近一次公开调度判断；NNN 只说明抢占留下的未来候选，仍不是 Bind；`spec.nodeName` 才说明节点分配已经写入 API。三者都不能直接显示 Pod 精确位于哪个内部队列。
+6. victim 必须满足 `victimPriority < preemptorPriority`。本例不存在 priority 小于 0 的 Pod，因此没有合格 victim。
+7. 不必然。incoming 必须允许抢占；Node 的失败必须可通过删除 Pod 解决；模拟删除后全部 Filter 要通过；随后还要经过 candidate 选择、victim 处理和下一轮完整调度。
+8. `Never` 只禁止它主动发起抢占，不降低它自身的排队优先级；若另一个 Pod 优先级更高，它仍可能成为 victim，因为 victim 自己的 policy 不是保护条件。
+9. NodeResourcesFit 把 CPU request 超过 Node 总 Allocatable 标成 `UnschedulableAndUnresolvable`；`findCandidates` 只拿普通 `Unschedulable` Node 做 victim 模拟。删 Pod 不能创造 Node 总容量。
 
 </details>
 
-### 18.2 抢占反事实题
+### 18.2 二遍加深：检查并发窗口和异步抢占
 
-7. incoming priority=0，三台候选 Node 上所有占用者 priority 都 >=0，为什么默认抢占无效？
-8. incoming priority=10000、victim priority=1000，是否必然抢占成功？还要检查什么？
-9. incoming priority 很高但 `preemptionPolicy: Never`，它怎样排队、能否抢别人、能否被别人抢？
-10. incoming request=8000m、所有 Node Allocatable=7500m，为什么 victim 选择根本不会开始？
-11. 【二遍进阶】PDB 的 `disruptionsAllowed=0` 能否保证 Pod 绝不被 scheduler 抢占？
-12. 【二遍进阶】当前默认异步抢占中，为什么不能假设 victim 已全部退出后才写 NNN？
+1. 删除发生在 Pod 已 Pop、尚未失败落队时，哪个数据结构和哪两个关键入口保证对象变化不丢？
+2. PDB 的 `disruptionsAllowed=0` 能否保证 Pod 绝不被 scheduler 抢占？
+3. 当前默认异步抢占中，为什么不能假设 victim 已全部退出后才写 NNN？
 
 <details>
-<summary>展开抢占题答案</summary>
+<summary>展开二遍答案</summary>
 
-7. `isPreemptionAllowed` 要求 `victimPriority < preemptorPriority`；已有 Pods 都是 `>=0`，对 priority=0 的 incoming 没有一个满足严格小于。
-8. 不必然。incoming 必须允许抢占；Node 初次状态要是普通 Unschedulable；删除合格 victims 后 `RunFilterPluginsWithNominatedPods` 要全部通过；还要经过 candidate 选择、执行器与后续完整调度。
-9. 高 priority 仍影响 queue sort，但 eligibility 因 Never 返回 false，不能主动抢别人；它仍可被优先级更高的 Pod 当 victim，因为 victim 自己的 policy 不是保护条件。
-10. NodeResourcesFit 把 request 超总 Allocatable 标成 Unresolvable；`findCandidates` 只取普通 Unschedulable Node。
-11. 不能。PDB 影响 victim/candidate 偏好，是 best effort；没有零 violation 方案时仍可能删除，普通 victim 走 Pod DELETE 而非 eviction subresource。
-12. `actuatePodPreemption` 默认调用无返回值的 `prepareCandidateAsync` 后立即返回 nil，因此不会等待 victim 全部退出。还有待处理 victim 时，后台 goroutine 与 FailureHandler status patch 并发推进；若所有 victims 已有 `DeletionTimestamp`，入口甚至不会新启动 goroutine，但 nomination 仍可沿外层返回。
+1. `inFlightPods` map 与 `inFlightEvents` 链表保存时间关系；变化入口 `movePodsToActiveOrBackoffQueue` 通过 `addEventIfAnyInFlight` 记账，失败落队时 `determineSchedulingHintForInFlightPod` 回放。
+2. 不能。PDB 影响 victim/candidate 偏好，是 best effort（尽量遵守）；没有零 violation 方案时仍可能删除。普通 victim 走 Pod DELETE，不是会由 PDB admission 检查的 eviction subresource。
+3. `actuatePodPreemption` 默认调用无返回值的 `prepareCandidateAsync` 后立即返回 `nil`，不会等待 victim 全部退出。若 victims 仍需处理，后台 goroutine 与 FailureHandler 写 status 并发推进；若所有 victims 已有 `DeletionTimestamp`，入口甚至不会新开 goroutine，但 nomination 仍可沿外层返回。
 
 </details>
 
-### 18.3 GPU 迁移题
+### 18.3 GPU 迁移自测：检验能否把同一模型换到设备资源
 
-13. 一个已绑定 GPU Job 的 `nvidia-smi` 利用率从 100% 降到 0%，NodeResourcesFit 是否因此自动得到一张可用 GPU？
-14. Device Plugin 让 Node 的 `nvidia.com/gpu` Allocatable 从 3 变 4，等待 1 GPU 的 Pod 为什么只是“值得重试”？
-15. `status.nominatedNodeName=gpu-worker-01` 是否意味着 GPU UUID 已分配？
+这三题用于检验迁移，不阻塞你进入下一课：
+
+1. 一个已绑定 GPU Job 的 `nvidia-smi` 利用率从 100% 降到 0%，NodeResourcesFit 是否因此自动得到一张可用 GPU？
+2. Device Plugin 让 Node 的 `nvidia.com/gpu` Allocatable 从 3 变 4，等待 1 GPU 的 Pod 为什么只是“值得重试”？
+3. `status.nominatedNodeName=gpu-worker-01` 是否意味着 GPU UUID 已分配？
 
 <details>
 <summary>展开 GPU 题答案</summary>
 
-13. 不会。scheduler 看 extended resource request/Allocatable 账，不看瞬时 GPU-Util；绑定 Pod 的资源承诺尚未释放。
-14. Node UpdateNodeAllocatable 可以让 NodeResourcesFit hint 返回 Queue，但当前 Requested、其他 Filter、拓扑和并发 Pod 仍需下一轮验证。
-15. 不是。NNN 只有 Node 级候选语义；具体设备 ID 在 Pod 绑定后由 kubelet DeviceManager 与 Device Plugin Allocate 链处理。
+1. 不会。scheduler 看 extended resource request/Allocatable 账，不看瞬时 GPU-Util；已绑定 Pod 的资源承诺尚未释放。
+2. Node UpdateNodeAllocatable 可以让 NodeResourcesFit hint 返回 `Queue`，但当前 Requested、其他 Filter、拓扑和并发 Pod 仍需下一轮验证。
+3. 不是。NNN 只有 Node 级候选含义；具体设备 ID 在 Pod 绑定后由 kubelet DeviceManager 与 Device Plugin Allocate 链处理。
 
 </details>
 
-### 18.4 通过标准
+### 18.4 分级通过标准
 
-你不需要默写所有函数名。达到下面四点就算本课通过：
+你不需要默写函数名。
 
-- 给出任意一条失败时间线，能标出 API、scheduler cache、snapshot 与内部队列各自拥有的状态；
-- 对任意 ClusterEvent，能先找 rejector plugin，再判断 hint、backoff 和下一轮 Filter；
-- 对任意抢占题，能依次检查 policy、严格 priority、Unresolvable、全部 Filter、PDB 与 nomination；
-- 能明确说出一条证据能证明什么、不能证明什么，而不是用 Event、usage 或 NNN 过度推断。
+**首遍通过：**
 
-## 19. 附录 A：本章 Go 语法复习索引
+- 能用 `2000m > 1500m`、释放 `1000m` 后余额变 `2500m`，完整解释“失败、等待、叫醒、重算”；
+- 能分清 ClusterEvent、公开 Kubernetes Event 和 scheduler 内部队列状态；
+- 能用 policy、严格优先级、总容量与“全部 Filter 仍要通过”判断抢占边界；
+- 能说出一条生产证据能证明什么、不能证明什么。
 
-先按本章出现位置复习，不需要脱离源码背语法书：
+**二遍通过：**
+
+- 能画出 in-flight 窗口，并说明对象变化怎样记录与回放；
+- 能把 QueueingHint、三种内部策略、backoff 和 5 分钟安全网分开；
+- 能解释 PDB 的 best-effort 边界、异步 victim 处理与 nomination 为什么不等于 Bind。
+
+## 19. 【首遍只作查表】附录 A：本章 Go 语法复习索引
+
+不需要脱离源码背语法书。被某个符号挡住时再回来查。
+
+### 19.1 首遍必会
 
 | 语法 | 本章用途 | 最容易误读的点 |
 |---|---|---|
@@ -2874,14 +3029,20 @@ nvidia-smi 显示 GPU-Util=0%
 | 多返回值 | 同时返回对象、状态、error | nil/false/0 必须按返回位置解释 |
 | comma-ok | map 查询、类型断言 | `ok=false` 不一定是程序异常 |
 | `defer` | 解锁、Done、指标收尾 | 后注册先执行；匿名函数末尾还有调用括号 |
+| interface 类型断言 | 从 error 或对象变化输入中取具体类型 | 指针类型和值类型不同 |
+| 泛型调用 `As[*v1.Pod]` | 把通用对象转换成指定类型 | 方括号里是类型，不是数组下标 |
+| slice 与 `append` | 收集 events、victims、candidates | append 可能换底层数组，要接住返回值 |
+
+### 19.2 遇到二遍源码再查
+
+| 语法 | 本章用途 | 最容易误读的点 |
+|---|---|---|
 | closure | victim remove/add/reprieve | 可读写外层变量，作用域比 Java lambda 更要留心 |
 | `iota` | 内部策略枚举 | 业务代码读名字，不背 0/1/2 |
-| interface 类型断言 | 从 error/event object 取具体类型 | 指针类型和值类型不同 |
-| slice 与 `append` | 收集 events、victims、candidates | append 可能换底层数组，要接住返回值 |
 | goroutine | 异步执行 victims | 源码上下行不等于运行时严格先后 |
 | RWMutex/Cond | 队列并发与阻塞 Pop | Wait 醒来后必须重新检查条件 |
 
-### 19.1 Go 示例：pointer receiver 为什么能累计次数
+### 19.3 Go 示例：pointer receiver 为什么能累计次数
 
 下面只是**Go 语法示例**，不是 Kubernetes 源码。
 
@@ -2903,7 +3064,7 @@ func (p *PodInfo) Retry() int {
 
 **大白话总结：** 若方法需要改变队列或 PodInfo 内部状态，常使用指针 receiver。指针不是“更高级的对象”，只是让函数能通过同一地址读写原值。
 
-### 19.2 Go 示例：类型断言为什么要带 `ok`
+### 19.4 Go 示例：类型断言为什么要带 `ok`
 
 下面只是**Go 语法示例**。
 
@@ -2928,7 +3089,7 @@ func fitErrorFrom(err error) (*FitError, bool) {
 
 **大白话总结：** 不带 `ok` 的断言失败会 panic；scheduler 处理外部状态时通常使用 comma-ok，把“不属于这个正常分支”交给显式错误路径。
 
-### 19.3 Go 示例：两个 `defer` 为什么反向执行
+### 19.5 Go 示例：两个 `defer` 为什么反向执行
 
 下面只是**Go 语法示例**。
 
@@ -2952,9 +3113,9 @@ func deferredOrder() (result []string) {
 }
 ```
 
-**大白话总结：** defer 是 LIFO，这个函数最终返回 `second, first`。真实源码的锁顺序不能只看“写在上面的先释放”，必须按登记顺序反过来推演。这里特意使用命名返回值；若返回普通 slice 值，defer 中 append 可能只改局部 slice header，不能用同样方式推断返回结果。
+**大白话总结：** defer 按 LIFO（后登记的先执行），所以这个函数最终返回 `second, first`。真实源码的锁顺序不能只看“写在上面的先释放”，必须按登记顺序反过来推演。这里特意使用命名返回值；若返回普通 slice 值，defer 中 append 可能只改局部 slice header，不能用同样方式推断返回结果。
 
-### 19.4 Go 示例：goroutine 为什么不能承诺先后
+### 19.6 Go 示例：goroutine 为什么不能承诺先后
 
 下面只是**Go 语法示例**。
 
@@ -2975,7 +3136,7 @@ func startAsync() <-chan struct{} {
 
 **大白话总结：** `go` 只保证函数被安排并发执行，不保证它在下一行之前或之后完成。当前默认异步抢占正因此需要执行中集合、PreEnqueue gate 和失败 Activate 补偿。
 
-## 20. 附录 B：源码断点、测试证据与验证强度
+## 20. 【二遍深读】附录 B：源码断点、测试证据与验证强度
 
 ### 20.1 建议按这条顺序下断点或静态跟读
 
@@ -3066,7 +3227,7 @@ go test ./pkg/scheduler/framework/plugins/defaultpreemption -run 'TestDryRunPree
 
 ```text
 固定 SHA 逐函数静态核对
-+ 三路独立源码/教学审校
++ 36 组 Kubernetes Go 摘录去掉教学注释后，与所标源码区间逐组比对
 + 文档机械规则校验
 - 未完成 Go 编译与单测执行
 ```
@@ -3082,7 +3243,7 @@ go test ./pkg/scheduler/framework/plugins/defaultpreemption -run 'TestDryRunPree
 - [`default_preemption.go`：资格与 victim reprieve](https://github.com/kubernetes/kubernetes/blob/301946d15e67a4a2e8a5fb8292eb836acd366d78/pkg/scheduler/framework/plugins/defaultpreemption/default_preemption.go)
 - [`executor.go`：同步/异步 victim 执行](https://github.com/kubernetes/kubernetes/blob/301946d15e67a4a2e8a5fb8292eb836acd366d78/pkg/scheduler/framework/preemption/executor.go)
 
-## 21. 附录 C：可销毁环境中的实验设计，不在生产照抄
+## 21. 【可选实验，首遍跳过】附录 C：可销毁环境中的实验设计，不在生产照抄
 
 ### 21.1 资源释放实验为什么要先算 `F/2 < R <= F`
 

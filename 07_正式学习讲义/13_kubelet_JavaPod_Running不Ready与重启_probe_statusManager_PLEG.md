@@ -1,6 +1,6 @@
 # 第 13 课：`game-api` JVM 还活着，为什么先摘流量而不是立刻重启——probe、PLEG 与 statusManager 的三本账
 
-> 延续第 11～12 课同一个 `prod/game-api-new-x`：先从 Spring Boot 冷启动读懂 `Started`，再从数据库故障读懂 readiness 摘流量，最后从 JVM 死锁读懂 liveness、runtime 重启、PLEG 观察与 API 状态回传。
+> 延续第 11～12 课同一个 `prod/game-api-new-x`：Java 进程已经启动，但“进程活着”不等于“现在适合接流量”，更不等于“出了问题就该重启”。本课就把这三个判断拆开讲清楚。
 
 第 12 课已经把同一个 Pod 推进到：
 
@@ -8,10 +8,12 @@
 镜像凭据修复
   -> game-api CreateContainer / StartContainer 成功
   -> JVM 进程出现
-  -> startup probe 才获得执行资格
+  -> startup probe（容器进程启动后，专门给慢启动应用留时间并判断它是否启动完成）才获得执行资格
 ```
 
-但“进程已经运行”以后，Kubernetes 仍然必须回答五个不同问题：
+先说一个你值班时很容易碰到的场景：数据库短暂抖动，Spring Boot 的就绪接口返回 503，可 JVM 进程本身没有死。如果 Kubernetes 此时直接重启 JVM，不但修不好数据库，反而会让更多 Pod一起冷启动，把小故障放大成发布事故。
+
+所以“Java 进程还活着，为什么先摘流量而不是立刻重启”不是一句孤零零的规则，而是 Kubernetes 必须把下面五个问题分开回答：
 
 ```text
 进程是否存在？
@@ -21,9 +23,38 @@
 apiserver 是否已经看到节点的新结论？
 ```
 
-本章的中心命题是：
+先用大白话记住结论：
 
-> **kubelet 不能用一个 `Running/Healthy` 布尔值同时表达进程、启动、流量、重启和 API 可见性。它把应用探测结果、runtime actual state 与 API-facing PodStatus 分开记账：readiness 稳定结果进入状态链改变流量资格；startup Success还会更新 API-facing `Started`；liveness/startup Failure则不直接执行 kill，而是发布结果并请求重新对账。真正的 kill/restart 仍由 runtime manager 结合 desired/actual 与 restart policy 决定。PLEG 再观察实际容器状态，statusManager 最后异步写回 API。**
+1. **readiness（就绪探针）失败：先把 Pod从接流量名单里拿掉，不重启进程。**
+2. **liveness（存活探针）失败：只是报告“这个进程可能要重启”，不会由探针线程自己直接杀进程。**
+3. **真正决定杀不杀、杀完要不要再启动的，是 kubelet统一的 Pod同步逻辑。**它还要一起考虑 Pod期望状态、容器当前状态和重启策略。
+4. **PLEG 负责从容器运行时核实“进程真的启动或退出了吗”；statusManager 再把运行事实和 probe结论整理成 PodStatus，异步写回 API Server。**因此节点已经处理完、`kubectl` 还没看到最新状态，短时间内是可能的；readiness变化也不需要先等PLEG产生一次新事件。
+
+这里第一次出现的词，先翻成人话：
+
+| 词 | 本课里的大白话 | 它负责什么，不负责什么 |
+| --- | --- | --- |
+| probe | kubelet定期做的“健康检查” | 产生检查结果，不直接完成整套重启 |
+| startup | “应用启动完了吗” | 没通过前，先不让 readiness/liveness干活 |
+| readiness | “现在适合接新流量吗” | 改流量资格，不负责杀容器 |
+| liveness | “进程是不是已经坏到需要重启” | 提交失败结论，最终动作由统一同步逻辑决定 |
+| runtime / CRI | 容器运行时，以及 kubelet调用它的标准接口 | 真正创建、启动、停止容器；不懂 Java业务是否健康 |
+| result cache | kubelet内存里保存的“已经达到连续次数要求的稳定检查结论” | 不是每一次 HTTP检查的原始记录 |
+| threshold | 连续成功或失败多少次，才允许改变稳定结论 | 防止一次网络抖动就摘流量或重启 |
+| worker / goroutine | kubelet里长期干某一类小工作的任务；goroutine是Go启动这种并发任务的轻量方式 | 每种probe各自工作，不能把它理解成一个操作系统进程 |
+| desired / actual | Pod规格里“希望变成什么样” / runtime里“现在实际上什么样” | kubelet要比较两边再决定动作 |
+| PLEG | kubelet里的“容器现场巡查员” | 观察容器实际启动、退出；不判断数据库或 JVM业务健康 |
+| statusManager | kubelet里的“状态上报员” | 先记节点本地状态，再异步写 API Server |
+| fast-path / early return | 先走一条更快的小路 / 条件不满足就提前结束当前函数 | 都只是控制流程，不等于最终状态已经成功写到API |
+| Patch | 只把PodStatus发生变化的部分写回API Server | 写失败会重试，不会让节点主控制链一直卡住 |
+
+标题里的“**三本账**”现在也可以直接解释了：probe result cache 记“应用检查的稳定结论”，PLEG的 pod cache记“容器运行现场”，statusManager记“准备上报给API的 Pod状态”。它们不能合成一张表，因为三种信息的产生速度、身份标识和失败方式都不一样；也不能死记成固定串联顺序：readiness可以直接推动状态重算，进程自行退出则先由PLEG发现，liveness重启则要执行动作后再由PLEG核实结果。
+
+本章后面写的 Kubernetes `Event`，是 `kubectl get events` 能看到的诊断记录；它不是控制器通过 Watch/Informer 收到的“API对象变了”通知，也不是 kubelet内部通过 channel（Go进程内的消息通道）传递的 PLEG 唤醒消息。它们名字都带 event/update，但不是同一本账。
+
+> **表格读法：** 本章表格都先从上往下选一行，再在这一行里从左往右读“现象/对象 → 谁负责 → 作用或边界”。不要把同一列从上到下拼成一条调用链。
+
+> **流程图读法：** 本章带 `->` 的文字图默认从上往下读，缩进表示上一步内部的子步骤；箭头表示后一步获得处理机会，不承诺同一毫秒完成，也不一定代表一次同步RPC调用。
 
 先不要执行命令。带着六个问题读本章：
 
@@ -36,7 +67,7 @@ apiserver 是否已经看到节点的新结论？
 
 ## 0. 本课定位、深度和两遍阅读路线
 
-这是 Java 平台主线的收口课：整体按 **S2** 阅读，但以下窄链读到 **S3**：
+这是 Java 平台主线的收口课。这里的 **S2** 是“能沿关键函数找到状态怎么传”，**S3** 是“能继续追到异常分支，并用源码解释生产现象”。整体读到 S2，下面几条关键链再读到 S3：
 
 - probe 实际执行、threshold 与 result cache；
 - readiness fast-path 与正常 `SyncPod` 汇合；
@@ -46,22 +77,29 @@ apiserver 是否已经看到节点的新结论？
 
 本课不会重新讲探针 YAML 的基础用法，也不会展开：
 
-- HTTP/TCP/exec/gRPC prober 的全部 transport 实现；
-- EndpointSlice controller 的完整队列与 reconcile；
-- EventedPLEG streaming、timestamp 竞态和 fallback 的全部实现；
+- HTTP/TCP/exec/gRPC 健康检查到底怎样发请求、执行命令的全部底层实现；
+- EndpointSlice controller（维护 Service后端地址名单的控制器）的完整队列与反复对账逻辑；
+- EventedPLEG（通过事件流观察容器变化的新路径）的全部连接恢复、时间先后冲突和降级实现；
 - container GC 怎样保存或丢失所有历史退出状态；
 - Driver、CUDA、Device Plugin、DeviceManager 与 GPU UUID 分配；
 - 第 14 课以后的 NVIDIA 节点栈。
 
-建议分两遍：
+建议分两遍，不要第一次就从头硬啃到尾：
 
-- **首遍抓因果：** 读 `2～5 -> 6～11 中每段的“大白话总结” -> 12 -> 14～16 -> 18 -> 20`，第一遍可以跳过 Go 代码块。目标是能解释“Running 不等于 Ready、readiness 不杀进程、liveness 不直接 kill、PLEG/status 为什么会带来时间差”。
-- **二遍补边界：** 精读 `6～11` 的源码和“顺手学 Go”，再读 `13 -> 17 -> 19 -> 21～23`。重点是 worker 创建、kubelet重启兼容、restartPolicy 例外、Event 丢弃、API patch、测试锚点和 Go 语法。
+- **首遍抓主线：** [Java现场](#ch13-case) → [三本账](#ch13-books) → [总图](#ch13-map)（顺着读到[§5.6核心源码](#ch13-core-source)） → [回到Java现场](#ch13-java-loop) → [值班决策表](#ch13-runbook) → [首遍验收](#ch13-first-check)。一共六站，第一次可以跳过其余 Go 代码。读完要能讲清：readiness为什么只摘流量、liveness为什么要回到统一同步、PLEG和API状态为什么可能慢半拍。
+- **二遍补边界：** [精读第6～11节源码](#ch13-source-deep) → [反事实](#ch13-counterfactual) → [生产取证](#ch13-evidence) → [深度边界](#ch13-depth) → [二遍验收](#ch13-second-check) → [语法/测试/版本查表](#ch13-go-index)。重点看阈值、新旧 container ID、重启策略、Event丢失和API写入失败。
+
+两遍的合格线也分开：
+
+| 阅读遍次 | 读完后能做到什么 |
+| --- | --- |
+| 首遍 | 不看代码，也能用同一个 Java事故说清“摘流量”和“重启”为什么是两件事 |
+| 二遍 | 能指出关键判断在哪个函数，并能解释一条异常证据为什么不足以下结论 |
 
 ## 1. 当前源码基线与阅读约定
 
 ```text
-源码目录：<KUBERNETES_SRC>
+源码目录：D:\datou\devops\kubernetes-master\kubernetes
 commit：301946d15e67a4a2e8a5fb8292eb836acd366d78
 describe：v1.37.0-alpha.0-280-g301946d15e6
 源码分支：master
@@ -69,7 +107,7 @@ describe：v1.37.0-alpha.0-280-g301946d15e6
 本机 Go：go1.19.4 windows/amd64
 ```
 
-本机 Go 低于当前源码要求。本课完成固定提交静态源码核对、现有测试代码核对、三路独立审校和讲义机械校验；定向 `go test` 的真实执行结果见第 22 节，不能写成“相关测试已在本机通过”。生产排障必须切换到目标集群对应的 Kubernetes、CRI、kube-proxy/数据面与应用版本，重新核对 feature gate、Event 文本、指标稳定性和函数行号。
+本机 Go 低于当前源码要求。本课完成固定提交静态源码核对、现有测试代码核对、三路独立审校和讲义机械校验；定向 `go test` 的真实执行结果见第 22 节，不能写成“相关测试已在本机通过”。生产排障必须切换到目标集群对应的 Kubernetes、CRI、kube-proxy/数据面与应用版本，重新核对 feature gate（功能开关）、Event文本、指标稳定性和函数行号。
 
 主文件：
 
@@ -91,9 +129,11 @@ kubernetes/staging/src/k8s.io/endpointslice/utils.go
 
 > **源码阅读约定：** 标有“教学注释版”的 Go 代码，控制流、变量名、判断顺序和返回关系来自本课固定提交；中文 `//` 是讲义新增，不是 Kubernetes 上游原注释。每条影响控制或业务语义的语句都会就地解释，多行调用只解释一次，单独括号不机械标注。每个代码块会说明是完整函数、连续摘录还是非连续检查点；不会用孤立省略号冒充被删除的源码。不能独立编译的摘录会明确说明。
 
+<a id="ch13-case"></a>
+
 ## 2. 先不执行命令：固定同一个 Java 发布现场
 
-以下是为了教学整理的脱敏现场，不是生产原始证据。namespace、Pod、UID、Node、Pod IP、Sandbox 和 sidecar 都沿用第 11～12 课。
+以下是为了教学整理的脱敏现场，不是生产原始证据。namespace、Pod、UID、Node、Pod IP、Sandbox 和 sidecar（辅助容器）都沿用第 11～12 课。
 
 ### 2.1 Deployment 与 Pod 身份不变
 
@@ -164,7 +204,7 @@ spec:
 参与推理的 Java 事实：
 
 - Spring Boot 类加载、连接池建立、缓存加载与 JIT 预热约 45 秒；
-- startup 的配置预算通常被口头估算成 `5 × 24 = 120 秒`，但它不是严格墙钟 SLA：worker 调度、单次 probe 耗时、kubelet 重启抖动和 readiness 手动触发都会影响实际时刻；
+- startup 的配置预算通常被口头估算成 `5 × 24 = 120 秒`，但它不是严格墙钟 SLA（承诺的完成时限）：worker 调度、单次 probe 耗时、kubelet 重启抖动和 readiness 手动触发都会影响实际时刻；
 - readiness group 包含数据库连接池，因此数据库临时不可用时返回 HTTP 503；
 - liveness group 不包含数据库，只检查 JVM 是否仍能推进关键内部心跳；
 - 数据库故障是可逆依赖故障，杀 JVM 会扩大问题；
@@ -256,7 +296,7 @@ EndpointSlice conditions        = ready=true / serving=true / terminating=false
 4. liveness 达阈值后，probe worker 是否应该直接调用 CRI？
 5. `Killing` Event 能不能证明 `StopContainer` 已成功？
 6. PLEG `Healthy=true` 能不能证明 `game-api` 的 `GetPodStatus` 刚刚成功？
-7. API 已显示新 ID 后，为什么 `lastState` 与 `restartCount` 仍只能视为 best-effort 历史？
+7. API 已显示新 ID 后，为什么 `lastState` 与 `restartCount` 仍只能视为 best-effort（尽力汇总、但不保证永久完整）历史？
 
 ## 3. Kubernetes 在这里解决的不是“定时 curl”，而是五种事实不能混成一张表
 
@@ -301,7 +341,7 @@ Event 是 best-effort 诊断：可能聚合、限流、丢失或过期。更关�
 
 ### 3.5 错误方案五：让 PLEG 同时判断 Java 业务健康
 
-PLEG 观察的是 runtime container 状态变化。它不知道数据库连接池、Spring readiness group、JVM deadlock 心跳、GPU Xid 或业务 P99。让它判断业务健康会把 CRI 责任域与应用语义耦合，也无法替代 HTTP/exec/gRPC probe。
+PLEG 观察的是 runtime container 状态变化。它不知道数据库连接池、Spring readiness group、JVM deadlock 心跳、GPU Xid（驱动报告的GPU错误码）或业务 P99（99%请求都不超过的延迟线）。让它判断业务健康会把 CRI 责任域与应用语义耦合，也无法替代 HTTP/exec/gRPC probe。
 
 ### 3.6 错误方案六：每次本地状态变化都同步等待 apiserver
 
@@ -314,6 +354,8 @@ PLEG 观察的是 runtime container 状态变化。它不知道数据库连接�
 
 statusManager 因此先更新本地版本化 cache，再由单 goroutine即时/周期同步 API。
 
+<a id="ch13-books"></a>
+
 ## 4. 状态所有者、三本本地账和十一条不变量
 
 ### 4.1 谁拥有哪份事实
@@ -325,7 +367,7 @@ statusManager 因此先更新本地版本化 cache，再由单 goroutine即时/�
 | 稳定 probe 结果 | 三个 result manager | container ID -> Success/Failure/Unknown | readiness、kill action 输入 |
 | runtime actual state | CRI runtime | Sandbox/container ID、Running/Exited、时间、exit code | 进程真实状态 |
 | runtime podCache | Generic/Evented PLEG | Pod UID -> `kubecontainer.PodStatus` + 时间/error | pod worker 的 actual 输入 |
-| API-facing 本地状态 | statusManager | Pod UID -> `v1.PodStatus` + local version | Ready/Started/lastState 等 |
+| 准备上报给API的本地状态 | statusManager | Pod UID -> `v1.PodStatus` + local version | Ready/Started/lastState 等 |
 | API PodStatus | apiserver | 最近成功 Patch 的状态 | controller、kubectl、EndpointSlice 输入 |
 | Service backend 条件 | EndpointSlice controller | endpoint ready/serving/terminating | 数据面资格 |
 
@@ -361,7 +403,11 @@ statusManager PodStatus cache
 | PLEG 观察 runtime | 能发现主动退出、OOM、外部停止 | cache、Event 与健康有不同边界 |
 | status 异步写 API | 节点不被 API Patch阻塞、可批量重试 | kubectl 与本地事实可能暂时不同 |
 
+<a id="ch13-map"></a>
+
 ## 5. 白板总图：两条控制链、一条 runtime 观察链、一个 API 反馈链
+
+> **下面四张图都从上往下读。** `A -> B` 表示 A 发生后，B 才获得继续处理的机会；它表示因果方向，不保证两个组件在同一毫秒完成，也不表示它们之间一定是一次同步 RPC调用。
 
 ### 5.1 readiness：改变流量资格
 
@@ -416,7 +462,7 @@ Java System.exit / OOM / runtime外部停止
 probe cache + PLEG podCache
   -> generateAPIPodStatus
   -> statusManager local version
-  -> non-blocking doorbell
+  -> 不携带完整状态的非阻塞“门铃”提醒
   -> 单goroutine syncBatch
   -> GET当前Pod并核对UID
   -> PatchPodStatus
@@ -430,6 +476,45 @@ probe cache + PLEG podCache
 旁读：restartPolicy Never、kubelet restart兼容、PLEG unhealthy、status metric边界
 下一章：NVIDIA Driver/CUDA/Toolkit/containerd/CDI
 ```
+
+<a id="ch13-core-source"></a>
+
+### 5.6 第一眼先看核心源码：三种 probe 的结果，走的根本不是同一条路
+
+不要先钻进 worker、缓存和 channel。先看 kubelet收到“稳定探测结果”以后做什么，这段代码已经把本课最重要的职责分工写出来了。
+
+源码：`pkg/kubelet/kubelet.go:2758-2779`，`syncLoopIteration` 中三个相邻 `case` 的**连续摘录**。它们处在同一个 `select` 中；这里只展示 probe相关分支，代码块不能独立编译。
+
+```go
+case update := <-kl.livenessManager.Updates(): // 收到“存活检查的稳定结果变化”。
+	if update.Result == proberesults.Failure { // 只有稳定失败，才请求重新同步这个Pod。
+		handleProbeSync(ctx, kl, update, handler, "liveness", "unhealthy") // 这里只是交回统一Pod同步，不在这里调用CRI杀容器。
+	}
+case update := <-kl.readinessManager.Updates(): // 收到“是否能接流量”的稳定结果变化。
+	ready := update.Result == proberesults.Success // Success翻成true；其他结果翻成false。
+	kl.statusManager.SetContainerReadiness(logger, update.PodUID, update.ContainerID, ready) // 先尝试更新节点本地就绪状态；找不到当前UID/ID时允许提前返回。
+
+	status := "not ready" // 下面几行只是在准备日志文字。
+	if ready { // 如果稳定结果是成功，
+		status = "ready" // 日志就写ready。
+	}
+	handleProbeSync(ctx, kl, update, handler, "readiness", status) // 再让统一Pod同步做一次完整对账；这里仍不杀容器。
+case update := <-kl.startupManager.Updates(): // 收到“应用是否启动完成”的稳定结果变化。
+	started := update.Result == proberesults.Success // Success翻成true；其他结果翻成API里的started=false。
+	kl.statusManager.SetContainerStartup(logger, update.PodUID, update.ContainerID, started) // 先尝试更新节点本地启动状态；它也有身份与基线检查。
+
+	status := "unhealthy" // 默认日志文字表示启动检查未通过。
+	if started { // 如果启动检查成功，
+		status = "started" // 日志改成started。
+	}
+	handleProbeSync(ctx, kl, update, handler, "startup", status) // 最后同样回到统一Pod同步。
+```
+
+**大白话总结：** readiness先尝试改“能不能接流量”；liveness只有在稳定失败时才敲门让 Pod重新对账；startup维护“应用是否启动完成”。readiness/startup结果变化与 liveness Failure 都会唤醒统一同步，但入口动作并不一样。最关键的是：这段代码里没有任何 `StopContainer`，所以“探针失败”与“容器已经被杀”之间还隔着一次完整的动作计算。
+
+**顺手学 Go：** `case update := <-channel` 表示从 channel（可以理解成 Go里的消息通道）取出一条更新；`:=` 是声明并赋值。这里的 `select` 会等待多个消息来源，多个来源同时有消息时不承诺固定先后顺序。
+
+<a id="ch13-source-deep"></a>
 
 ## 6. 第一层源码：为什么一个 container 要有三个 worker，而不是一个“健康线程”
 
@@ -559,7 +644,7 @@ func (m *manager) isContainerStarted(pod *v1.Pod, containerStatus *v1.ContainerS
 
 ### 6.4 新 container ID 为什么通常重置结果，但 kubelet重启是例外
 
-源码：`pkg/kubelet/prober/worker.go:250-287`，`doProbe` 的 **连续摘录**。上文已经从 statusManager 找到当前 container status，并计算了 restartable init 标记；下文才进入 onHold、Running、删除和 probe 门控。
+源码：`pkg/kubelet/prober/worker.go:250-287`，`doProbe` 的 **连续摘录**。上文已经从 statusManager 找到当前 container status，并计算了 restartable init标记；下文才进入 `onHold`（当前旧实例先暂停继续探测）、Running、删除和 probe门控。
 
 ```go
 // worker 发现 status 中的 container ID 与自己上次记录不同。
@@ -778,7 +863,7 @@ func (m *manager) Get(id kubecontainer.ContainerID) (Result, bool) { // 同时�
 func (m *manager) Set(id kubecontainer.ContainerID, result Result, pod *v1.Pod) { // 写cache并在变化时发布update。
 	// 只有cache新增key或值变化，才向syncLoop发送Update。
 	if m.setInternal(id, result) { // bool告诉外层稳定值是否真的变化。
-		m.updates <- Update{id, result, pod.UID} // 这是带payload的阻塞发送。
+		m.updates <- Update{id, result, pod.UID} // 这是携带container ID、结果、Pod UID三项数据的阻塞发送。
 	}
 }
 
@@ -795,7 +880,7 @@ func (m *manager) setInternal(id kubecontainer.ContainerID, result Result) bool 
 }
 ```
 
-**大白话总结：** readiness 已经 Failure 时，后续普通 Failure仍会执行、记 metrics/Event，但不会每个 period 都给 syncLoop塞同值 update。注意它的 channel 与 statusManager 的 doorbell 不同：这里携带 container ID/result/Pod UID，容量20且发送可阻塞；statusManager 后面使用可合并的非阻塞空通知。
+**大白话总结：** readiness 已经 Failure 时，后续普通 Failure仍会执行、记 metrics/Event，但不会每个 period 都给 syncLoop塞同值 update。注意它的 channel 与 statusManager 的 doorbell（只提醒“有事待办”的门铃）不同：这里携带 container ID/result/Pod UID，容量20且发送可阻塞；statusManager 后面使用可合并的非阻塞空通知。
 
 **顺手学 Go：** `make(map[...])` 创建 map，`make(chan Update, 20)` 创建带缓冲 channel。嵌入的 `sync.RWMutex` 让 `m.RLock()` 直接可用。`Update{id, result, pod.UID}` 是按字段顺序构造值，阅读内部代码时要回到 struct 定义确认三个位置。
 
@@ -803,41 +888,12 @@ func (m *manager) setInternal(id kubecontainer.ContainerID, result Result) bool 
 
 ### 8.1 syncLoop 对三种 probe 的处理故意不对称
 
-源码：`pkg/kubelet/kubelet.go:2758-2779`，`syncLoopIteration` 的 **连续摘录**。同一个 `select` 还有 config、PLEG、housekeeping 与 container manager channel；多个 channel 同时 ready 时不存在跨 channel 的固定全局先后。
+核心代码已在 §5.6 逐行读过，这里不重复粘贴。现在只补两个边界：
 
-```go
-// liveness 只有稳定Failure才需要重新同步；Success update不触发kill链。
-case update := <-kl.livenessManager.Updates(): // 从liveness专属channel取一个带payload更新。
-	if update.Result == proberesults.Failure { // 只有Failure需要计算kill/start动作。
-		handleProbeSync(ctx, kl, update, handler, "liveness", "unhealthy") // 按UID唤醒该Pod的同步。
-	}
+- **fast-path（快速路径）**：readiness结果变化时，kubelet先尝试直接修改已有的本地 PodStatus，目的是尽快推动摘流量；“快”不等于绕过后续完整对账。
+- **early return（提前返回）**：如果 Pod已删除、本地状态还没建立、container ID已经换代，快速路径会直接结束。随后触发的正常 `SyncPod` 仍会重新读取 probe cache并生成完整状态。
 
-// readiness先尝试直接改本地Ready，再让Pod进入一次正常SyncPod。
-case update := <-kl.readinessManager.Updates(): // readiness变化进入独立分支。
-	ready := update.Result == proberesults.Success // 把枚举翻译成API bool。
-	kl.statusManager.SetContainerReadiness(logger, update.PodUID, update.ContainerID, ready) // 先尝试fast-path更新本地status。
-
-	status := "not ready" // 日志默认描述失败方向。
-	if ready { // 成功时改成正向文案。
-		status = "ready" // 只影响日志文字，不是状态库。
-	}
-	handleProbeSync(ctx, kl, update, handler, "readiness", status) // 无论fast-path是否成功，都请求正常SyncPod收敛。
-
-// startup先更新API-facing Started，再请求同一Pod重新同步。
-case update := <-kl.startupManager.Updates(): // startup稳定结果进入独立分支。
-	started := update.Result == proberesults.Success // 枚举翻译成Started bool。
-	kl.statusManager.SetContainerStartup(logger, update.PodUID, update.ContainerID, started) // 先更新本地API-facing字段。
-
-	status := "unhealthy" // 默认日志文案表示startup失败。
-	if started { // 成功则改成已启动。
-		status = "started" // 仍只是日志文字。
-	}
-	handleProbeSync(ctx, kl, update, handler, "startup", status) // 再由统一Pod同步计算后续动作和状态。
-```
-
-**大白话总结：** readiness 有本地 status fast-path；liveness 没有“SetContainerLiveness”，只在 Failure 时唤醒 SyncPod；startup直接维护 `started` 字段并同步。三者不是同一段代码换一个字符串，更不是任意 Failure 都直接 kill。
-
-**顺手学 Go：** `case update := <-channel` 从 channel接收一个值，并把它声明为当前 case 的局部变量。Go `select` 若多个 case 同时可执行，会选择其中一个；不能根据源码从上到下的书写顺序推导跨 channel 的严格时序。
+因此，readiness有“先快改、再完整核对”两层保险；liveness没有所谓 `SetContainerLiveness`，它必须进入后面的动作计算，才能决定是否停止或重启容器。
 
 ### 8.2 `SetContainerReadiness` 为什么既有 fast-path，也允许 early return
 
@@ -1185,9 +1241,9 @@ System.exit/OOM/crictl外部动作 -> PLEG观察 -> SyncPod决定是否恢复des
 
 控制器必须依赖重新观察的 actual state，而不是只依赖上一次 RPC 返回。runtime、kubelet或节点可能在任意中间点崩溃；下一轮仍要从 CRI 事实恢复。
 
-### 10.2 GenericPLEG 每轮全局列举，但只对变化/reinspect Pod取详细 status
+### 10.2 GenericPLEG 每轮全局列举，但只对变化或需复查的 Pod取详细 status
 
-源码：`pkg/kubelet/pleg/generic.go:292-329`，`GenericPLEG.Relist` **完整函数，教学注释版**。
+这里的 `reinspect` 就是“上一轮没查清楚，这一轮再详细复查一次”。源码：`pkg/kubelet/pleg/generic.go:292-329`，`GenericPLEG.Relist` **完整函数，教学注释版**。
 
 ```go
 func (g *GenericPLEG) Relist() {
@@ -1365,7 +1421,7 @@ EventedPLEG：Alpha，默认关闭
 PLEGOnDemandRelist：Beta，默认开启
 ```
 
-启用 EventedPLEG 时，GenericPLEG仍保留较低频率的 fallback/校验；cache还会按 timestamp拒绝旧状态。首遍不要把 GenericPLEG 1秒周期、Evented stream 或发行版默认值写成跨版本常量。
+启用 EventedPLEG 时，GenericPLEG仍保留较低频率的 fallback（兜底）/校验；cache还会按 timestamp拒绝旧状态。首遍不要把 GenericPLEG 1秒周期、Evented stream 或发行版默认值写成跨版本常量。
 
 ## 11. 第六层源码：statusManager 为什么先改本地，再异步写 API
 
@@ -1512,7 +1568,9 @@ versionedPodStatus.at
   -> API失败尝试不Observe
 ```
 
-因此该 Alpha 指标只能作为 Node级成功同步样本的辅助趋势，不能把某一个 bucket样本直接解释为“本次 game-api readiness用了X秒到API”；持续API故障期间还可能暂时没有新样本。单 Pod因果必须用 condition transition、kubelet日志、API resourceVersion/watch与多时钟边界交叉验证。
+因此该 Alpha 指标只能作为 Node级成功同步样本的辅助趋势，不能把某一个 bucket样本直接解释为“本次 game-api readiness用了X秒到API”；持续API故障期间还可能暂时没有新样本。单 Pod因果必须用 Condition变化时间、kubelet日志、API `resourceVersion`（只能排序的对象版本号）、watch（持续接收对象变化）与多时钟边界交叉验证。
+
+<a id="ch13-java-loop"></a>
 
 ## 12. 回到同一个 Java 现场：把四个时刻闭成一条因果链
 
@@ -1615,6 +1673,8 @@ jmx-exporter ID=jmx-001
 ```
 
 其中每一层仍有自己的时钟与保留期限，不能要求所有时间戳完全相等。
+
+<a id="ch13-counterfactual"></a>
 
 ## 13. 反事实推演：只改一个条件，源码会走向哪里
 
@@ -1831,6 +1891,8 @@ liveness让旧ID进入kill/start链
 3. 它是状态库、唤醒信号，还是短期历史？
 4. 从它到下一个组件，中间是否还有异步队列、阈值或重新计算？
 
+<a id="ch13-evidence"></a>
+
 ## 15. 生产取证：先建立身份，再按因果顺序看证据
 
 下面命令是**读模型后的取证工具**，不是本章的开场白。示例只执行只读查询；在生产节点上不要用 `crictl stop/rm` 验证猜想。
@@ -2037,10 +2099,12 @@ histogram_quantile(
 | probe worker本地时间 | worker何时开始/完成一次探测 | 调度、probe耗时、kubelet停顿 |
 | kubelet Event字段 | reporter构造/聚合该Event时记录的时间信息 | 聚合、旧/新Event API字段差异、写入失败、apiserver延迟 |
 | runtime container时间 | 进程 StartedAt/FinishedAt | runtime实现与节点时钟 |
-| API对象与观察时间 | `lastTransitionTime`由kubelet按Node时钟生成；resourceVersion只能排序；watch接收时刻属于观察端时钟 | 没有通用字段直接给出本次PodStatus/EndpointSlice服务端成功写入墙钟；精确需求要结合watch或API audit |
+| API对象与观察时间 | `lastTransitionTime`由kubelet按Node时钟生成；resourceVersion只能排序；watch接收时刻属于观察端时钟 | 没有通用字段直接给出本次PodStatus/EndpointSlice服务端成功写入墙钟；精确需求要结合watch或API audit（服务端审计日志） |
 | Prometheus时间 | `time()`来自Prometheus服务器，PLEG gauge来自Node，再经过抓取入库 | server/Node clock skew、scrape interval、ingestion延迟 |
 
 事故时间线应使用“先后约束 + 身份闭环”，例如旧 ID必须先被决定 kill，新 ID才能随后出现；不要用任意两个系统的时间戳相差 1～2 秒就武断判因。需要测量单次 API传播时，记录客户端 watch接收时刻并说明观察端时钟，或使用 API audit获得服务端证据；`resourceVersion`只能说明相对顺序，不能换算成毫秒耗时。
+
+<a id="ch13-runbook"></a>
 
 ## 16. 运维决策表：从现场症状反查哪一段源码
 
@@ -2282,10 +2346,10 @@ kubectl --context "$LAB_CONTEXT" delete namespace "$LAB_NS"
 | Java平台主案 | GPU推理服务中的对应问题 | 仍由谁负责 | 不能混淆的边界 |
 | --- | --- | --- | --- |
 | JVM进程 Running | 推理进程已启动 | runtime / PLEG | 进程启动不等于模型已加载 |
-| startup等待 Spring/JIT | startup等待权重加载、CUDA context和模型 warmup | application probe + kubelet | 不要用过短 liveness杀死正常长启动 |
+| startup等待 Spring/JIT | startup等待权重加载、CUDA context和模型 warmup（预热） | application probe + kubelet | 不要用过短 liveness杀死正常长启动 |
 | readiness检查是否能接业务 | readiness检查模型、队列和服务端口是否可服务 | application probe + status/EndpointSlice | readiness失败不等于 GPU设备应该重置 |
 | liveness判断 JVM是否失去进展 | liveness判断推理进程死锁或完全失去响应 | application probe + SyncPod | 不要把外部模型仓库或共享依赖直接变成重启风暴 |
-| PLEG观察 container退出 | PLEG观察 GPU container退出 | runtime / PLEG | PLEG不会解释 Xid、ECC、温度或显存故障 |
+| PLEG观察 container退出 | PLEG观察 GPU container退出 | runtime / PLEG | PLEG不会解释 Xid、ECC（显存纠错相关硬件错误）、温度或显存故障 |
 | JMX/业务指标 | DCGM/驱动日志/设备健康指标 | GPU telemetry栈 | 设备指标不是 Pod Ready字段的天然替代品 |
 | 同 Pod内业务 container重启 | 推理 container局部重启 | kubelet runtime manager | container重启未必修复节点级 GPU故障 |
 
@@ -2301,6 +2365,8 @@ Kubernetes资源层：Pod是否拿到设备资源、Device Plugin是否正常
 probe适合回答应用容器自己的服务健康；PLEG适合回答 runtime状态变化；Device Plugin与节点遥测回答设备供给和硬件健康。把这四层混成一个“GPU健康检查脚本”，常见后果是：外部依赖抖一下就重启模型、单 Pod问题触发整卡动作，或者节点硬件坏了却只反复重启 container。
 
 下一课进入 NVIDIA节点栈时，仍沿用今天的方法：先问事实所有者是谁、身份 key是什么、状态通过哪条异步链传播，再谈命令和组件安装。
+
+<a id="ch13-depth"></a>
 
 ## 19. 学习深度边界：哪些必须深入，哪些读懂即可
 
@@ -2341,25 +2407,34 @@ probe适合回答应用容器自己的服务健康；PLEG适合回答 runtime状
 
 ## 20. 课后推演题：先口述，再展开参考答案
 
-### 20.1 问题
+<a id="ch13-first-check"></a>
+
+### 20.1 首遍验收：这是进入下一课的门槛
 
 1. `game-api` 的 CRI状态已经 Running，为什么 API `started` 仍可能是 false？
 2. 为什么看到第一条 readiness `Unhealthy` 后，Pod仍可能保持 Ready=true？
 3. readiness达到 FailureThreshold后，为什么通常不会调用 `StopContainer`？
 4. liveness worker为什么不直接执行 kill，而只通过 result update唤醒 pod worker？
-5. 哪五类证据组合起来，才比较有把握证明“这次重启由 liveness触发”？
-6. `PLEG Healthy=true` 能证明什么，不能证明什么？
-7. statusManager本地已经把 Ready改成 false，为什么 `kubectl get pod` 仍可能短暂显示 true？
-8. 同一个 Pod name下 container ID变了，与 Pod UID变了，分别意味着什么？
-9. JVM自己 `System.exit(1)` 时，即使没有 probe Failure，kubelet为什么仍能重启它？
-10. kubelet进程重启后第一次看到旧 container ID，为什么不一定重新写三种 probe默认初值？
-11. 为什么 `restartCount` 和 `lastState` 不能作为永久审计记录？
-12. GPU推理 Pod Running但模型未加载完成，应该优先映射到哪种 probe？PLEG能不能替代它？
+5. `PLEG Healthy=true` 能证明什么，不能证明什么？
+6. statusManager本地已经把 Ready改成 false，为什么 `kubectl get pod` 仍可能短暂显示 true？
 
-### 20.2 参考答案
+首遍通过标准：6题至少答对5题，并能画出三只独立方框：“probe稳定结果账、PLEG runtime现场账、statusManager待上报账”。还要标出 readiness会直接影响状态计算，而 liveness要先让统一同步执行动作、再由PLEG观察runtime结果；不能把三本账画成每次都固定顺序直传的一条流水线。做到这里即可进入下一课。
+
+<a id="ch13-second-check"></a>
+
+### 20.2 二遍加深：检查异常边界，不作为进入下一课的门槛
+
+1. 哪几类证据组合起来，才比较有把握证明“这次重启由 liveness触发”？
+2. 同一个 Pod name下 container ID变了，与 Pod UID变了，分别意味着什么？
+3. JVM自己 `System.exit(1)` 时，即使没有 probe Failure，kubelet为什么仍能重启它？
+4. kubelet进程重启后第一次看到旧 container ID，为什么不一定重新写三种 probe默认初值？
+5. 为什么 `restartCount` 和 `lastState` 不能作为永久审计记录？
+6. GPU推理 Pod Running但模型未加载完成，应该优先映射到哪种 probe？PLEG能不能替代它？
+
+### 20.3 参考答案
 
 <details>
-<summary>展开查看参考答案</summary>
+<summary>展开首遍参考答案</summary>
 
 1. `state.running` 来自 runtime事实；若定义了 startup probe，`started` 还要等当前 container ID的 startup result为 Success。没有 startup probe时，Running通常才直接等价于 Started。
 
@@ -2369,23 +2444,32 @@ probe适合回答应用容器自己的服务健康；PLEG适合回答 runtime状
 
 4. kubelet必须在统一的 `SyncPod` 中同时考虑 desired Pod、当前 runtime status、restartPolicy、init/sidecar、backoff和删除状态。probe worker直接 kill会绕过这些约束，并产生多条并发执行路径。
 
-5. 至少核对：同一 Pod UID/Node、liveness `Unhealthy`、message明确的 `Killing`、kubelet对旧 ID发起 `StopContainer`、CRI旧 ID退出与新 ID启动、API最终 ID/restartCount变化。越靠后的证据越能证明动作真正完成。
+5. 它证明最近一次全局 `GetPods` 在阈值内成功；不证明每个变化 Pod的详细 `GetPodStatus` 成功、内部唤醒消息已投递、pod worker已同步，也不证明 API已更新。
 
-6. 它证明最近一次全局 `GetPods` 在阈值内成功；不证明每个变化 Pod的详细 `GetPodStatus` 成功、event已投递、pod worker已同步，也不证明 API已更新。
-
-7. statusManager先写本地 cache，再异步 Patch apiserver。网络、apiserver重试和下游 controller都产生传播窗口；本地控制链不为一次 API写入同步阻塞。
-
-8. UID不变而 container ID变，通常是同 Pod内实例重启；UID变化说明旧 Pod对象已经被另一个 Pod替代，即使 name相似也不是同一身份。
-
-9. PLEG会观察 runtime新旧状态差异并更新 pod cache、投递 `ContainerDied` 等事件，随后 `SyncPod` 按 restartPolicy计算是否重新启动，不依赖 probe先发现退出。
-
-10. 当前默认兼容逻辑会根据 container `StartedAt` 判断它是否是 kubelet重启前已存在的旧进程，并可能沿用旧 started语义；feature gate开启时行为又会变化。
-
-11. runtime GC、日志轮转、kubelet/节点重启和 Pod UID替换都会丢失部分旧实例信息。字段是当前可见历史的 best-effort 汇总，不是不可变审计账本。
-
-12. 长模型加载和 warmup优先放在 startup；startup成功后 readiness再表达是否可接流量。PLEG只观察 runtime状态变化，不知道模型是否加载完成，也不理解 GPU业务健康。
+6. statusManager先写本地 cache，再异步 Patch apiserver。网络、apiserver重试和下游 controller都产生传播窗口；本地控制链不为一次 API写入同步阻塞。
 
 </details>
+
+<details>
+<summary>展开二遍参考答案</summary>
+
+1. 至少核对：同一 Pod UID/Node、liveness `Unhealthy`、message明确的 `Killing`、kubelet对旧 ID发起 `StopContainer`、CRI旧 ID退出与新 ID启动、API最终 ID/restartCount变化。越靠后的证据越能证明动作真正完成。
+
+2. UID不变而 container ID变，通常是同 Pod内实例重启；UID变化说明旧 Pod对象已经被另一个 Pod替代，即使 name相似也不是同一身份。
+
+3. PLEG会观察 runtime新旧状态差异并更新 pod cache、投递 `ContainerDied` 等内部消息，随后 `SyncPod` 按 restartPolicy计算是否重新启动，不依赖 probe先发现退出。
+
+4. 当前默认兼容逻辑会根据 container `StartedAt` 判断它是否是 kubelet重启前已存在的旧进程，并可能沿用旧 started语义；feature gate开启时行为又会变化。
+
+5. runtime GC、日志轮转、kubelet/节点重启和 Pod UID替换都会丢失部分旧实例信息。字段是当前可见历史的 best-effort 汇总，不是不可变审计账本。
+
+6. 长模型加载和 warmup优先放在 startup；startup成功后 readiness再表达是否可接流量。PLEG只观察 runtime状态变化，不知道模型是否加载完成，也不理解 GPU业务健康。
+
+</details>
+
+二遍通过标准：6题至少答对5题，并能指出一条证据为什么可能因阈值、身份换代、内部消息丢失或API传播延迟而不足。没有通过时可以以后回补，不阻塞后续GPU课程。
+
+<a id="ch13-go-index"></a>
 
 ## 21. 本章 Go 语法索引：只补读这条链真正用到的部分
 

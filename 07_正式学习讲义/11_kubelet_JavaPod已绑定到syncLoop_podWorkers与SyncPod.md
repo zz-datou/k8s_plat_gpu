@@ -1,6 +1,6 @@
 # 第 11 课：`game-api` 已绑定却仍 `FailedMount`——kubelet 为什么不把 Bind 当成一次性创建命令
 
-> 从一次 Spring Boot 滚动发布的 ConfigMap 缺失，读懂持久化交接、节点级快照、`syncLoop`、按 UID 串行的 `podWorkers`，以及可重入的 `SyncPod`。
+> 从一次 Spring Boot 滚动发布的 ConfigMap 缺失，读懂持久化交接（把责任写成可重读的记录）、节点级快照（本节点当前 Pod 的全量照片）、`syncLoop`、按 UID 串行的 `podWorkers`，以及可重入的 `SyncPod`（失败后可以再做一轮，不必推倒重来）。
 
 第 10 课结束在 scheduler 把 `game-api-new-x` 绑定到 `worker-05`。API 中已经能看到 `spec.nodeName=worker-05` 和 `PodScheduled=True`，但新 Pod 仍是 `0/2`，Event 反复出现：
 
@@ -9,56 +9,102 @@ Warning  FailedMount  MountVolume.SetUp failed for volume "game-config":
                       configmap "game-api-config" not found
 ```
 
+先把本章里两个都叫“事件”的东西分开。它们只是英文都叫 Event，作用完全不同：
+
+| 名字 | 大白话 | 本章例子 |
+|---|---|---|
+| **Watch 对象通知** | apiserver 告诉客户端“某个 API 对象变了”，用来刷新本地看到的对象状态 | `ADDED`、`MODIFIED`、`DELETED` |
+| **Kubernetes Event 对象** | 组件写下的一条诊断记录，方便运维人员看“刚才哪里失败了” | `Warning / FailedMount / configmap not found` |
+
+后文单写 `Event` 时，默认指第二种诊断记录；第一种会明确写成“Watch 对象通知”。Watch 通知不是创建容器的命令，`FailedMount` Event 也不是一份可供 kubelet消费的任务。
+
 很多平台同学此时会产生一个很自然、但会妨碍读源码的直觉：
 
 > “scheduler 都已经 Bind 了，为什么 kubelet 没把两个容器创建出来？Bind 难道不是一条发给 kubelet 的创建命令吗？”
 
-不是。一个普通 Pod 从 scheduler 交给 kubelet，不是一次易丢失的远程命令，而是一次**持久状态交接**：scheduler 把 Node 选择写进 apiserver；目标 kubelet 独立观察属于本节点的期望状态，再反复让节点实际状态向它收敛。
+不是。一个普通 Pod 从 scheduler 交给 kubelet，不是一次易丢失的远程命令，而是一次**持久状态交接**：scheduler 把 Node 选择写进 apiserver；目标 kubelet 独立观察属于本节点的期望状态，再反复让节点实际状态向它靠拢。源码里把这种“发现没对上就继续补”的过程叫**收敛**。
 
 本章只有一个中心命题：
 
-> **`spec.nodeName` 是可重放的责任转移，不是一次性 RPC；`syncLoop` 负责接收和分发节点事件，`podWorkers` 负责守住同一 UID 的串行状态机，`SyncPod` 负责把“API 里的期望”与“节点上的现实”反复对齐。正因为这条链不是一次性创建流程，ConfigMap 补齐后，原 UID、原 Node 才能继续推进，同时不会把同节点其他 Pod 全部堵住。**
+> **Bind 只把 `worker-05` 写进共享的 Pod 记录，不会直接命令 kubelet创建容器。目标 kubelet随后自己看到这张记录；`syncLoop` 负责分发，`podWorkers` 让同一个 UID 排队执行，`SyncPod` 做一轮“期望和现实的对账”。ConfigMap 补齐后，这个 UID 因而能在原 Node 继续，而不是从头再调度。**
+
+先看一张职责图。**从左往右读**；实线箭头表示“状态或责任交到下一层”，虚线表示“等待或观察结果”，不表示这些组件之间一定有一次同步 RPC（远程函数调用，也就是程序 A 直接调用程序 B）。
+
+```mermaid
+flowchart LR
+    A["scheduler<br/>只决定放到哪台 Node"] -->|"把 Node 名写进 Pod"| B["API Server<br/>保存共享交接单"]
+    B -->|"目标 kubelet反复读取"| C["kubelet API source<br/>只取本 Node 的 Pod"]
+    C --> D["syncLoop<br/>快速分发"]
+    D --> E["podWorkers<br/>同一 UID 排队"]
+    E --> F["SyncPod<br/>做一轮对账"]
+    F -.->|"等待卷状态"| G["volume manager<br/>后台挂卷并重试"]
+    G -.->|"卷已挂载"| F
+    F -->|"卷通过后"| H["container runtime<br/>创建 sandbox 和容器"]
+```
+
+图里几个名字先按下面理解，不要求现在背函数：
+
+| 源码名 | 先翻成大白话 | 它不负责什么 |
+|---|---|---|
+| UID | Pod 这一次生命的身份证；同名重建会换 UID | 不能只用 Pod 名区分新旧生命 |
+| API source | kubelet从 apiserver 接收本节点 Pod 的入口 | 不直接创建容器 |
+| `syncLoop` | 节点事件的交通警察，只做快速分发 | 不在主循环里等几分钟挂卷 |
+| `podWorkers` | 每个 UID 一张最新工单、一个串行工位 | 不保证每个普通中间版本都执行一次 |
+| `SyncPod` | 针对一个 Pod 做一轮检查和补差 | 不是“一调用就必须全部成功”的创建事务 |
+| volume manager | kubelet里的后台挂卷小组 | 不替 scheduler 重新选 Node |
+| container runtime | 真正管理容器的程序，例如 containerd；kubelet通过 CRI 标准接口调用它 | 不决定 Pod 应该去哪台 Node |
+| PodSandbox | Pod 里各容器共用的基础运行环境，可先理解成“容器开工前的地基” | 有 sandbox 也不等于业务容器已经 Ready |
 
 先不要执行命令。带着四个问题读本章：
 
 1. scheduler Bind 成功后，如果 scheduler 立刻重启，`worker-05` 为什么仍能接到这个 Pod？
 2. 缺失 ConfigMap 时，为什么不应该删除 Pod、重新调度或回滚已经完成的每一步？
-3. 同一 UID 连续收到 v2、v3、v4 更新时，为什么不能让三个 goroutine 同时改它，却也不必逐个版本做完？
+3. 同一 UID 连续收到 v2、v3、v4 更新时，为什么不能让三个 goroutine（Go 的轻量并发任务）同时改它，却也不必逐个版本做完？
 4. `uid-A` 在等卷时，为什么 `uid-B` 仍可以在同一节点推进？
 
 ## 0. 本课定位、深度和两遍阅读路线
 
-这是 kubelet 节点执行主线的 **S3 深读**。你已经维护 Kubernetes 多年，本课不会重新讲 Pod、ConfigMap、Event 或 `kubectl describe` 的基础用法；重点是它们背后的状态所有者、并发边界、错误补偿和设计取舍。
+这是 kubelet 节点执行主线的 **S3 深读**。S3 是本套材料的深度标记，意思是“能沿调用链反查源码，并能用现场证据判断走到哪一层”，不是 Kubernetes 官方等级。你不是 Kubernetes 使用新手，但可以把自己当成“kubelet 源码和 Go 的新手”。本课不会重新讲怎样创建 Pod、ConfigMap 或使用 `kubectl describe`；会把源码里第一次出现的专有词、状态所有者、并发边界、失败后谁重试讲清楚。
 
 本课读深：
 
 - Binding 怎样最终变成持久 Pod 的 `spec.nodeName`；
-- 目标 kubelet 为什么只观察 `spec.nodeName=<自己>` 的普通 Pod；
-- 当前版本为什么要区分 watch-list 与传统 List/Watch；
-- 为什么 Reflector 的增量事件先还原成完整 snapshot，再由 PodConfig 按 UID 做生命周期 diff；
-- 为什么第一次“空 snapshot”也是重要事件；
-- `syncLoop` 为什么只做节点级事件汇聚，不在主循环里同步创建容器；
-- `HandlePodAdditions` 为什么先登记 desired Pod，再做节点本地 admission；
+- 目标 kubelet 为什么用 field selector（服务端过滤条件）只观察 `spec.nodeName=<自己>` 的普通 Pod；
+- 当前版本为什么要区分 watch-list（同一条 Watch 先传初始全量、再接后续变化）与传统 List/Watch（先取全量、再持续接变化）；
+- 为什么 Reflector（把 API 状态同步到本地的组件）先把变化还原成完整 snapshot（当前集合的全量照片），再由 PodConfig（把前后照片翻译成 Pod 生命周期动作的一层）按 UID 做 diff（比较前后两张照片）；
+- 为什么第一次“空 snapshot”也是重要同步结果；
+- `syncLoop` 为什么只做节点级内部触发汇聚，不在主循环里同步创建容器；
+- `HandlePodAdditions` 为什么先登记 desired Pod（节点应该管理的 Pod），再做节点本地 admission（节点接单前的最后复核）；
 - `podWorkers` 怎样实现同 UID 串行、不同 UID 可并行、普通更新可合并、终止意图不可倒退；
 - `SyncPod` 为什么是可重入的收敛脚本，而不是数据库原子事务；
 - ConfigMap 缺失、卷等待超时、后台卷重试和 Pod worker 重试怎样分工。
 
 本课只建立边界、不展开：
 
-- CRI 怎样创建 PodSandbox、拉镜像和创建容器，留到第 12 课；
-- PLEG、probe、statusManager 怎样把运行结果写回 API，留到第 13 课；
-- static Pod、mirror Pod、file/http source 只解释会改变主结论的分支；
+- CRI（kubelet 与容器运行时之间的标准接口）怎样创建 PodSandbox、拉镜像和创建容器，留到第 12 课；
+- PLEG（观察容器变化）、probe（健康检查）、statusManager（汇总并回写 Pod 状态）留到第 13 课；
+- static Pod、mirror Pod（static Pod 在 API 中的镜像对象）、file/http source 只解释会改变主结论的分支；
 - Device Plugin、DeviceManager、GPU UUID 注入留到第 15～17 课。
 
-建议分两遍：
+建议分两遍。首遍不要从第 1 行硬啃到最后，只走下面 6 站：
 
-- **首遍抓主线：** 读 `2～6 -> 7.1、7.4～7.7 -> 8 -> 9.1～9.4 -> 10.1、10.3～10.5 -> 11～12 -> 14～18 -> 23`。目标是能用自己的话解释“Bind 不是命令、首次空快照为什么保护清理、同 UID 为什么串行、缺依赖为什么能原地恢复”。
-- **二遍补版本和缓存细节：** 再读 `7.2～7.3 -> 9.5 -> 10.2 -> 13 -> 19～22`。重点是 watch-list 版本分支、runtime status 新鲜度、反事实、Go 索引和测试覆盖空白。两遍清单不再重复；首遍遇到长源码块时先抓中文注释和“大白话总结”，二遍再逐句复述。
+| 站点 | 章节锚点 | 这一站只回答什么 |
+|---:|---|---|
+| 1 | [2.2～2.3](#22-02-的两个容器和缺失依赖) | 现场已经证明什么，还没证明什么 |
+| 2 | [5.1～5.4](#51-主接单链) | 整条责任链，以及第一段源码为什么返回 NotFound |
+| 3 | [6.3](#63-设计结论bind-成功也不等于-node-已经接受)、[7.1](#71-先在服务端只看属于本-node-的-pod)、[7.4～7.7](#74-podconfig-才把-snapshot-翻译成-kubelet生命周期更新) | Bind 后 kubelet怎样重新看到这个 UID |
+| 4 | [8.2～8.4](#82-一个-select-汇聚多种触发但不规定固定优先级)、[9.1～9.4](#91-先用工位和门铃理解) | 为什么主循环不被一个 Pod 堵住，同 UID 又不会并发乱跑 |
+| 5 | [10.3～10.5](#103-后半段error阶段推进和-worker-退出不能混为一谈)、[11.2～11.6](#112-一轮收敛的阶段和-early-return) | 失败后 Pod worker 与卷控制环分别怎样再试 |
+| 6 | [12.2～12.5](#122-路径-a当前-syncpod-还在-wait原地继续同一轮)、[14.1～14.3](#141-api-侧绑定责任是否已经转移)、[18.1](#181-首遍验收题) | 配置补齐后的两种恢复时序，以及现场怎样取证 |
+
+**首遍读源码的规则：** 第 5.3 节第一段源码逐行读；后面的长函数先读“输入是什么、改了哪本账、失败交给谁”和每段后的“大白话总结”。如果这三件事说不出来，再回到中文行注释逐句读。这样是在学源码主线，不是在逃避源码。
+
+**二遍再补：** `6.1～6.2 -> 7.2～7.3 -> 8.1 -> 9.5 -> 10.1～10.2 -> 11.1、11.7 -> 13 -> 16～17 -> 18.2 -> 19～22`。这遍再处理版本分支、缓存新鲜度、termination（Pod 终止过程）、GPU 映射、Go 语法和测试边界。
 
 ## 1. 当前源码基线与阅读约定
 
 ```text
-源码目录：<KUBERNETES_SRC>
+源码目录：D:\datou\devops\kubernetes-master\kubernetes
 commit：301946d15e67a4a2e8a5fb8292eb836acd366d78
 describe：v1.37.0-alpha.0-280-g301946d15e6
 源码 go.mod / go.work：go 1.26.0
@@ -80,10 +126,15 @@ kubernetes/pkg/kubelet/kubelet.go
 kubernetes/pkg/kubelet/pod_workers.go
 kubernetes/pkg/kubelet/container/cache.go
 kubernetes/pkg/kubelet/volumemanager/volume_manager.go
+kubernetes/pkg/volume/configmap/configmap.go
 kubernetes/pkg/volume/util/operationexecutor/operation_generator.go
 ```
 
 > **源码阅读约定：** 标有“教学注释版”的 Go 代码，控制流、变量名、判断顺序和返回关系来自本课固定提交；中文 `//` 是讲义新增，不是 Kubernetes 上游原注释。每条影响控制或业务语义的语句都会就地解释，多行调用只解释一次，单独括号不机械标注。每个代码块会说明是完整函数、连续摘录还是非连续检查点；不会用孤立的省略号冒充被删除的源码。小语法演示会明确标成“Go 示例”。
+
+> **两个反复出现的 Go 名字：** `ctx/context` 是一轮工作的取消、超时和链路信息，不保存 Pod 业务状态；`err/error` 是函数返回的错误值，在某个 error 返回位置上 `nil` 才表示“这里没有错误”。context 只能传递“请停止”的意图，不能强行杀死 goroutine。
+
+> **表格阅读约定：** 默认一行一行看，每一行从左往右读；不带“顺序/阶段/时间”列的表格，各行通常是并列关系，不表示从上往下依次调用。
 
 ## 2. 先不执行命令：把 Java 发布现场固定下来
 
@@ -109,7 +160,7 @@ spec:
 这是一个 Spring Boot 服务：
 
 - 旧版本 3 个 Pod 都是 `Ready=True`，继续承接游戏请求；
-- 新实例完成类加载、连接池建立、JIT 预热和 readiness 大约需要 45 秒；
+- 新实例完成类加载、连接池建立、JIT（即时编译）预热和 readiness（健康检查放行）大约需要 45 秒；
 - `maxUnavailable=0` 表示新实例真正 Ready 前，不主动牺牲旧的可服务副本；
 - `maxSurge=1` 允许临时多创建一个新 Pod；
 - 第 09～10 课已经算出新 Pod 的有效 request 是 `2000m CPU / 2Gi memory`，并最终绑定到 `worker-05`。
@@ -123,7 +174,7 @@ spec:
 | 容器 | 作用 | 与本案有关的事实 |
 |---|---|---|
 | `game-api` | Spring Boot 主应用 | 启动时读取 `/etc/game/application.yaml` |
-| `jmx-exporter` | 暴露 JVM/JMX 指标的 sidecar | 即使它自身不需要该 ConfigMap，也要等 Pod 的卷准备阶段整体通过后才进入本章下一阶段 |
+| `jmx-exporter` | 暴露 JVM/JMX 指标的 sidecar（和主应用放在同一个 Pod 里的辅助容器） | 即使它自身不需要该 ConfigMap，也要等 Pod 的卷准备阶段整体通过后才进入本章下一阶段 |
 
 相关 Pod spec 简化为：
 
@@ -148,7 +199,7 @@ spec:
       optional: false
 ```
 
-`optional: false` 是本案成立的输入。如果改成 `true`，ConfigMap 不存在时 volume plugin 的行为会变，不能继续套用本章这条失败链。
+`optional: false` 是本案成立的输入。如果改成 `true`，ConfigMap 不存在时 volume plugin（kubelet里负责某一种卷的代码模块）的行为会变，不能继续套用本章这条失败链。
 
 事故时刻：
 
@@ -178,23 +229,27 @@ ready:     0/2
 | `0/2 ContainerCreating` | 两个普通容器都未 Ready，展示原因仍在创建前后阶段 | 不能证明 JVM 已经启动过 |
 | 同 UID、同 Node 后来恢复 | 节点执行链具备原地继续收敛能力 | 不能单独区分是当前 `SyncPod` 继续，还是后续一轮重试 |
 
-特别注意：缺失 ConfigMap 的 `FailedMount` 通常由后台 volume operation executor 发出；`Kubelet.SyncPod` 还有另一个同 reason 的 Event 分支，例如 volume desired-state 的 Pod 级处理 error 可以走到那里。但普通等待超时属于 `wait.Interrupted`，不会必然再发一条包装 Event。第 11 节会按真实源码拆开。
+这里先记一个值班结论：**同一个 `FailedMount` 原因可能由两处代码写出。** 本例完整 message 以 `MountVolume.SetUp failed` 开头，说明是后台“卷操作执行器”在尝试挂卷时写的；`SyncPod` 等卷失败时还有另一处也能写 `FailedMount`。普通等待超时在源码里被归为“等待被打断”，所以不一定再写第二条。只看 reason，不看完整 message，会把两条路径混成一条。第 11 节再对照源码拆开。
 
 ### 2.4 先写下你的预测
 
 1. scheduler 是否需要保持在线，直到 kubelet真正创建完容器？
-2. kubelet看到一条原始 Watch `ADDED` 后，能否直接在 Watch 回调里启动容器？
+2. kubelet看到一条原始 Watch 对象通知 `ADDED` 后，能否直接在 Watch 回调里启动容器？
 3. `game-api-config` 缺失时，scheduler 应不应该把 Pod 换到另一个 Node？
 4. API 连续写入同 UID 的 v2、v3、v4 时，节点必须逐条执行吗？
-5. 补齐 ConfigMap 会不会直接向 `podWorkers` 的 channel 发送“继续”通知？
+5. 补齐 ConfigMap 会不会直接向 `podWorkers` 的 channel（Go 协程之间传通知的管道）发送“继续”通知？
 
 正确答案会从设计不变量和源码中推出来，而不是先背结论。
 
 ## 3. Kubernetes 在这里解决的不是“调用函数”，而是分布式交接
 
+“分布式交接”听起来很大，其实就是：scheduler、API Server、kubelet 是三个会各自重启、网络也可能中断的进程，所以不能把责任交接只放在一次网络通话里，必须留下可以重新读取的记录。
+
 ### 3.1 错误方案一：scheduler Bind 后直接 RPC kubelet
 
 假设设计成：
+
+**读图方法：从左往右读。** 这是被 Kubernetes 放弃的假想方案，用来说明一次网络调用为什么不足以完成可靠交接。
 
 ```text
 scheduler -> worker-05:10250 -> CreatePod(uid-A)
@@ -210,13 +265,13 @@ scheduler -> worker-05:10250 -> CreatePod(uid-A)
 
 Kubernetes 选择把交接事实写进 apiserver：持久对象可重读、可重列、可 Watch；scheduler 负责决定并写入，kubelet负责观察并收敛。代价是状态传播存在延迟，组件间只能做到基于观察的最终一致，而不是一个跨组件同步事务。
 
-### 3.2 错误方案二：原始 Watch 事件直接启动容器
+### 3.2 错误方案二：原始 Watch 对象通知直接启动容器
 
-Watch 是网络流，不是永不丢失的业务队列。连接会断、resourceVersion 会过期、kubelet会重启，初始状态也不等于“只等未来新增事件”。如果把每个 `ADDED/MODIFIED/DELETED` 当成必须执行一次的命令，会出现：
+Watch 是持续接收 API 对象变化的网络连接，不是永不丢失的业务队列。连接会断，resourceVersion（API 对象的并发版本号，不是应用版本号）会过期，kubelet也会重启。初始状态更不能靠“只等未来新增通知”恢复。如果把每个 `ADDED/MODIFIED/DELETED` 当成必须执行一次的命令，会出现：
 
 - 断线期间的对象不知道如何补齐；
 - 重连后的全量对象可能被误当成“新建一次”；
-- 重复 Event 可能重复产生副作用；
+- 重复 Watch 通知可能重复产生副作用；
 - 同名 Pod 删除重建时，名称相同但 UID 已变，容易串错生命周期；
 - source 尚未完成第一次同步时，错误清理本地已有 Pod。
 
@@ -224,23 +279,25 @@ Watch 是网络流，不是永不丢失的业务队列。连接会断、resource
 
 ### 3.3 错误方案三：`syncLoop` 收到 Pod 后同步做完整创建
 
-卷挂载可能等待数分钟，镜像拉取可能很慢，runtime 或 CNI 也可能阻塞。如果节点唯一的事件主循环亲自等完 `uid-A`：
+卷挂载可能等待数分钟，镜像拉取可能很慢，runtime 或 CNI（Pod 网络插件接口）也可能阻塞。如果节点唯一的事件主循环亲自等完 `uid-A`：
+
+**读图方法：从上往下读。** 这也是反例：前一个 Pod 的长等待把后面的全节点事件都堵住。
 
 ```text
 syncLoop 收到 uid-A
   -> 等 ConfigMap/卷 2 分钟以上
-  -> 这期间 uid-B、删除、探针、PLEG、housekeeping 都难以及时分发
+  -> 这期间 uid-B、删除、探针、PLEG（容器变化观察）、housekeeping（周期清理检查）都难以及时分发
 ```
 
 正确分层是：`syncLoop` 做短小的事件分发；耗时的单 Pod 收敛交给按 UID 切分的 worker。收益是不同 Pod 可以推进，代价是必须额外维护 per-UID 状态、锁、channel 和重试队列。
 
 ### 3.4 错误方案四：同一 UID 每来一个版本就开一个 goroutine
 
-如果 v2 正在挂卷，v3 改了 annotation，v4 又开始删除，三个 goroutine 同时操作同一 Pod，可能出现：
+goroutine 是 Go 的轻量并发任务，可以先把它理解成“成本较低的线程”。如果 v2 正在挂卷，v3 改了 annotation，v4 又开始删除，三个 goroutine 同时操作同一 Pod，可能出现：
 
 - 一个协程创建容器，另一个同时拆卷；
 - 旧版本晚完成，覆盖新版本状态；
-- grace period 被重新放大；
+- grace period（优雅终止的等待时长）被重新放大；
 - 同一 UID 的 cleanup 与 setup 交叉。
 
 Kubernetes 要守的是“同一生命周期串行”，而不是“每条事件都执行”。普通期望更新允许合并成最新值；终止一旦开始则只能向前，不能被普通更新覆盖回运行态。
@@ -254,26 +311,28 @@ Kubernetes 要守的是“同一生命周期串行”，而不是“每条事件
 - 控制器看到旧 UID 消失后又创建新 Pod，放大抖动；
 - 把节点依赖问题伪装成 scheduler 问题。
 
-`SyncPod` 因此被设计为可重入收敛脚本：一轮可以有部分副作用，失败不要求数据库式回滚；下一轮重新读取期望和实际状态，继续补齐差距。
+`SyncPod` 因此被设计成可重入（同一输入可以安全地再做一轮）的收敛脚本：一轮可以已经做成一部分；后面失败时，不要求把前面成功的步骤全部撤销。下一轮重新读取期望和实际状态，再继续补齐差距。
 
 ## 4. 先建立状态所有者、契约与九条不变量
+
+源码里反复出现“哪本账”和“谁拥有状态”。它不是说真的有数据库表，而是在问：**这个事实由谁保存，哪个组件有权修改，故障后从哪里恢复。**
 
 ### 4.1 谁拥有哪本账
 
 | 状态/账本 | 主要所有者 | key 或观察维度 | 在本案中回答什么 |
 |---|---|---|---|
-| Pod desired state | apiserver | `namespace/name` 定位；UID 划生命周期；RV 表示并发版本 | `uid-A` 应在 `worker-05`，并引用哪个 ConfigMap |
+| Pod desired state（期望状态） | apiserver | `namespace/name` 定位；UID 划生命周期；RV 是 resourceVersion 的简称 | `uid-A` 应在 `worker-05`，并引用哪个 ConfigMap |
 | scheduler binding decision | Pod spec/condition | `spec.nodeName`、`PodScheduled` | 调度责任是否已交出 |
-| API source snapshot | Reflector + UndeltaStore | Store 使用 `namespace/name` | 当前本节点可见的完整 Pod 集合是什么 |
-| PodConfig lifecycle view | `podStorage` | `source -> UID -> Pod` | 相邻 snapshot 之间是 ADD、UPDATE、DELETE、REMOVE 还是 RECONCILE |
-| 本机 desired Pod | `podManager` | UID / fullname | kubelet认为本机应该管理哪些 Pod |
+| API source snapshot（全量照片） | Reflector + UndeltaStore（把零散对象变化整理成当前全量的内存账本） | Store 使用 `namespace/name` | 当前本节点可见的完整 Pod 集合是什么 |
+| PodConfig lifecycle view（生命周期变化账） | `podStorage` | `source -> UID -> Pod`；source 是 Pod 配置来源，本例就是 apiserver | 相邻 snapshot 之间是 ADD、UPDATE、DELETE、REMOVE 还是 RECONCILE（对象没换，只需再对账） |
+| 本机 desired Pod（本机期望） | `podManager` | UID / fullname | kubelet认为本机应该管理哪些 Pod |
 | 本地已准入资源 | `allocationManager` | UID 与资源分配 | 本节点是否接受该已绑定 Pod |
 | per-UID execution state | `podWorkers` | UID | 当前是 syncing、terminating 还是 terminated；有无最新 pending update |
-| runtime actual state | PLEG / `podCache` | UID | sandbox 和容器实际上处于什么状态 |
+| runtime actual state（容器实际状态） | PLEG / `podCache` | UID | sandbox 和容器实际上处于什么状态；PLEG 是 kubelet观察容器运行变化的组件 |
 | volume desired/actual | volume manager | unique Pod name、volume key | 期望挂哪些卷、哪些已经 mounted |
 | API status | statusManager | UID | 节点观察结果怎样异步回写 API |
 
-不要把这些 cache 都笼统叫“kubelet缓存”。它们的 key、真相来源和并发边界不同，排障时问错账本就会推出错误结论。
+不要把这些 cache（内存里的状态副本）都笼统叫“kubelet缓存”。它们的 key、真相来源和并发边界不同，排障时问错账本就会推出错误结论。
 
 ### 4.2 九条设计不变量
 
@@ -292,10 +351,10 @@ Kubernetes 要守的是“同一生命周期串行”，而不是“每条事件
 | 设计选择 | 收益 | 代价 |
 |---|---|---|
 | apiserver 持久交接 | 组件解耦、故障后可重放 | 观察存在延迟，不能假设瞬时一致 |
-| snapshot + UID diff | 能处理重连、重复和同名重建 | 多一层内存状态与 DeepCopy 成本 |
+| snapshot + UID diff | 能处理重连、重复和同名重建 | 多一层内存状态与 DeepCopy（复制出互不影响的新对象）成本 |
 | 首次空 snapshot ready 门 | 防止启动期误删 | 清理要等待所有已配置 source 报到 |
 | `syncLoop` 与 worker 分层 | 一个慢 Pod 不阻塞全节点事件分发 | 并发状态机更复杂 |
-| latest-value pending update | 降低更新风暴和重复工作 | 中间普通版本不保证逐条执行 |
+| 只保留最新普通待办 | 降低更新风暴和重复工作 | 中间普通版本不保证逐条执行 |
 | 可重入 `SyncPod` | 暂时失败可原地恢复 | 每一步都必须容忍重复调用和部分副作用 |
 | volume 与 Pod worker 双控制环 | 挂载可独立重试，Pod 只等结果 | Event、退避和时间线不再只有一个来源 |
 
@@ -303,18 +362,20 @@ Kubernetes 要守的是“同一生命周期串行”，而不是“每条事件
 
 ### 5.1 主接单链
 
+**读图方法：从上往下读。** 箭头表示“上一层留下的状态，被下一层看见并继续处理”；只有缩进到同一个函数下面时，才可以先理解成函数调用。整张图不是一条跨进程同步调用栈。
+
 ```text
 kube-scheduler
   DefaultBinder.Bind(uid-A, worker-05)
     -> Pod Binding 子资源
-    -> apiserver GuaranteedUpdate
+    -> apiserver GuaranteedUpdate（带并发检查地更新 Pod）
        spec.nodeName = worker-05
        PodScheduled = True
 
 worker-05 kubelet
   NewSourceApiserver(fieldSelector: spec.nodeName=worker-05)
     -> Reflector 恢复当前完整集合
-    -> UndeltaStore 每次变化 push 完整 snapshot
+    -> UndeltaStore 把对象变化重新整理成完整 snapshot
     -> PodConfig 按 source + UID 比较前后 snapshot
     -> PodUpdate{Op: ADD, Pods: [uid-A], Source: "api"}
     -> syncLoopIteration
@@ -323,7 +384,7 @@ worker-05 kubelet
        allocationManager.AddPod
        podWorkers.UpdatePod(SyncPodCreate)
     -> uid-A 的 podWorkerLoop
-       -> 等一份上一轮之后重新观察过的 runtime status
+       -> 等一份上一轮之后重新观察过的 runtime status（容器实际状态快照）
        -> Kubelet.SyncPod
           -> WaitForAttachAndMount
           -> containerRuntime.SyncPod（第 12 课）
@@ -331,24 +392,67 @@ worker-05 kubelet
 
 ### 5.2 ConfigMap 缺失时的两条并行时间线
 
+**读图方法：两条线都从上往下走，左右没有固定先后。** Pod worker 负责“等结果”，volume manager 负责“在后台真正尝试挂卷并重试”；二者通过卷的期望/实际状态协作，不是前者每隔几秒直接调用后者一次。
+
 ```text
 Pod worker 时间线
   SyncPod(uid-A)
     -> WaitForAttachAndMount
-       等全部卷 mounted，或及时返回 DSW Pod 级处理 error
+       等全部卷 mounted，或及时返回 DSW（卷期望状态账）里的 Pod 级处理 error
 
 Volume manager 时间线
-  desired-state populator 看见 uid-A 引用 game-api-config
-    -> reconciler 发起 MountVolume.SetUp
+  desired-state populator（把 Pod 所需卷登记进期望账的小组）看见 uid-A 引用 game-api-config
+    -> reconciler（反复比较卷期望账和实际账的小组）发起 MountVolume.SetUp
        -> ConfigMap plugin 查询对象
        -> NotFound
        -> FailedMount Event
        -> volume operation 自身退避再试
 ```
 
-补齐 ConfigMap 不是直接给 `podWorkers` 按门铃。它先改变 ConfigMap manager 和 volume operation 的可成功条件；Pod worker 此时可能仍在当前 wait，也可能已经超时并由自己的 workQueue 等下一轮。第 12 节会把两种合法时序分别走一遍。
+补齐 ConfigMap 不是直接给 `podWorkers` 按门铃。它先改变 ConfigMap manager 和 volume operation 的可成功条件；Pod worker 此时可能仍在当前 wait，也可能已经超时并由自己的 workQueue（记录每个 UID 何时该再工作的日程表）等下一轮。第 12 节会把两种合法时序分别走一遍。
 
-### 5.3 章节停止线
+这里的**退避**不是放弃，而是“失败后先等一会再试”，避免依赖还没恢复时疯狂重试把节点和 API 打满。Pod worker 和卷操作各自记自己的下次重试时间。
+
+### 5.3 第一段核心源码：为什么 `optional: false` 会把 NotFound 变成失败
+
+先不追完整调用链，只用第一段 Go 源码回答事故最直接的问题：**ConfigMap 不存在时，哪一行决定继续还是报错？**
+
+源码：`kubernetes/pkg/volume/configmap/configmap.go:189-202`
+
+摘录类型：**`SetUpAt` 内部一段连续摘录，教学注释版**。函数前面已经准备好“把 ConfigMap 内容写成容器内文件”所需的临时目录层（源码叫 wrapper）；这段只展示读取 ConfigMap 和处理 NotFound（对象没找到）的完整判断，后面的文件写入不属于本次失败路径。
+
+```go
+// Optional 在 API 类型里是 *bool；只有“字段存在并且值为 true”才允许缺对象。
+optional := b.source.Optional != nil && *b.source.Optional
+// 用 Pod 的 namespace 和 volume source 里的 name 读取 ConfigMap。
+configMap, err := b.getConfigMap(b.pod.Namespace, b.source.Name)
+// err != nil 表示这次读取没有拿到正常对象。
+if err != nil {
+	// 只有“错误是 NotFound”并且“optional=true”才不返回错误。
+	if !(errors.IsNotFound(err) && optional) {
+		// 写节点日志，保留具体 namespace/name 和底层错误。
+		klog.Errorf("Couldn't get configMap %v/%v: %v", b.pod.Namespace, b.source.Name, err)
+		// 本例 optional=false，因此 NotFound 从这里返回给上层卷操作。
+		return err
+	}
+	// 只有 optional=true 且对象不存在时，才构造一个空 ConfigMap 继续。
+	configMap = &v1.ConfigMap{
+		// 空对象仍保留原 namespace/name，供后续统一生成投影内容。
+		ObjectMeta: metav1.ObjectMeta{
+			// namespace 来自当前 Pod。
+			Namespace: b.pod.Namespace,
+			// name 来自 volume source。
+			Name: b.source.Name,
+		},
+	}
+}
+```
+
+**大白话总结：** 本例 `optional=false`，所以 `NotFound && optional` 的结果是 `false`，外层再取反后进入 `return err`。这段只证明“ConfigMap volume setup 失败了”；它还没有证明 Event 在哪写、Pod worker 当时是否正在等待，也没有证明 scheduler 应重新选 Node。后文会把这些责任逐层接上。
+
+**顺手学 Go：** `*bool` 是“指向布尔值的指针”，既能表达 true/false，也能表达字段没有填写的 nil。`&&` 是“并且”，`!` 是“取反”，`*b.source.Optional` 是取出指针里的布尔值。读复合条件时可以代入本例：`IsNotFound=true`、`optional=false`。
+
+### 5.4 章节停止线
 
 本章在下面一行停住：
 
@@ -356,7 +460,7 @@ Volume manager 时间线
 kl.containerRuntime.SyncPod(...)
 ```
 
-到这里我们只证明 kubelet完成了接单、per-UID 串行和进入 runtime 前的准备。PodSandbox、CNI、镜像、容器、Java 进程是否真正启动，必须进入第 12 课，不能在本章提前下结论。
+到这里我们只证明 kubelet完成了接单、per-UID 串行和进入 runtime 前的准备。PodSandbox、CNI（Pod 网络接口/插件）、镜像、容器、Java 进程是否真正启动，必须进入第 12 课，不能在本章提前下结论。
 
 ## 6. 为什么 Bind 要写持久对象，而不是调用目标 kubelet
 
@@ -364,7 +468,7 @@ kl.containerRuntime.SyncPod(...)
 
 源码：`kubernetes/pkg/scheduler/framework/plugins/defaultbinder/default_binder.go:51-75`
 
-摘录类型：**完整函数，教学注释版**。当前 `SchedulerAsyncAPICalls` 为 Beta 且默认 `false`；`APICacher()` 非空时才走上半分支。异步分支的 `WaitOnFinish` 还可能把 skipped/overwritten 视作可接受生命周期，因此不能把每个 `nil` 都机械翻译成“本次调用刚刚落盘”；真正的持久状态仍要以 apiserver 中的 Pod 为准。
+摘录类型：**完整函数，教学注释版**。`APICacher` 是 scheduler 内部管理 API 调用生命周期的一层，不是 kubelet的 Pod 缓存。当前 `SchedulerAsyncAPICalls` 为 Beta 且默认 `false`；`APICacher()` 非空时才走上半分支。异步分支的 `WaitOnFinish` 还可能把 skipped/overwritten 视作可接受生命周期，因此不能把每个 `nil` 都机械翻译成“本次调用刚刚落盘”；真正的持久状态仍要以 apiserver 中的 Pod 为准。
 
 ```go
 // DefaultBinder 是 receiver，可暂时类比 Java 方法里的 this；state 在当前实现中没有使用。
@@ -500,6 +604,8 @@ func (r *BindingREST) setPodNodeAndMetadata(ctx context.Context, podUID types.UI
 
 到这里，以下结论必须分开：
 
+**读图方法：从上往下读。** 第一行只证明 API 中的绑定事实；每个“不等于”都是下一层还要单独取得的证据。
+
 ```text
 Binding 持久成功
   = API 已把 worker-05 记录为 uid-A 的目标 Node
@@ -518,13 +624,13 @@ Binding 持久成功
 
 这也是为什么 `PodScheduled=True` 后仍然可能 `Pending`。状态没有矛盾，只是不同责任域的进度不同。
 
-## 7. 为什么 kubelet不把原始 Watch Event 当成创建命令
+## 7. 为什么 kubelet不把原始 Watch 对象通知当成创建命令
 
 ### 7.1 先在服务端只看属于本 Node 的 Pod
 
 源码：`kubernetes/pkg/kubelet/config/apiserver.go:35-67`
 
-摘录类型：**两个相邻的完整函数，教学注释版**。第一个函数建立本 Node 的 ListWatch 并等待 Node informer 完成初始 sync；第二个函数把 Reflector、UndeltaStore 和下游 snapshot channel 接起来。
+摘录类型：**两个相邻的完整函数，教学注释版**。ListWatch 是把“取当前全量”和“持续接后续变化”组合起来的客户端入口。第一个函数建立本 Node 的 ListWatch，并等待 Node informer（长期同步 API 对象到本地缓存的组件）完成第一次同步；第二个函数把 Reflector、UndeltaStore 和下游 snapshot channel 接起来。
 
 ```go
 // NewSourceApiserver 为当前 nodeName 创建普通 API Pod source。
@@ -551,7 +657,7 @@ func NewSourceApiserver(logger klog.Logger, c clientset.Interface, nodeName type
 	}()
 }
 
-// newSourceApiserverFromLW 把完整对象集合发送给 PodConfig，而不是暴露原始 Watch 事件。
+// newSourceApiserverFromLW 把完整对象集合发送给 PodConfig，而不是暴露原始 Watch 对象通知。
 func newSourceApiserverFromLW(lw cache.ListerWatcher, updates chan<- sourceUpdate) {
 	// send 是 closure：输入 Store 的完整对象 slice，输出类型化 Pod snapshot。
 	send := func(objs []interface{}) {
@@ -577,17 +683,21 @@ func newSourceApiserverFromLW(lw cache.ListerWatcher, updates chan<- sourceUpdat
 
 ### 7.2 【二遍版本边界】当前版本不应写死“永远先 List 再 Watch”
 
-很多旧教程把 Reflector 画成固定的：
+先把三个词翻成人话：`List` 是“拿一张当前全量照片”，`Watch` 是“持续接收后续变化”，`watch-list` 是“用同一条 Watch 连接先传初始全量、再接后续变化”。很多旧教程把 Reflector 画成固定的：
+
+**读图方法：从左往右读。** 这是设计抽象，不是在保证网络请求永远只有这一种顺序。
 
 ```text
 LIST 得到初始全量 -> 从 resourceVersion 开始 WATCH 增量
 ```
 
-这仍是正确的**抽象模型**：先建立一致的当前集合，再持续接收变化。但在本课固定提交里，client-go 的 `WatchListClient` 从 v1.35 起默认开启，生产 client 支持时会优先用 watch-list：
+这仍是正确的**抽象模型**：先建立一致的当前集合，再持续接收变化。但在本课固定提交里，client-go 的 `WatchListClient` 从 v1.35 起默认开启，生产 client 支持时会优先用 watch-list。
+
+**下面从上往下读。** `synthetic Added` 是“为了拼出初始全量而发送的模拟 Added”，不表示这些 Pod 刚刚新建；Bookmark 是“初始全量到这里结束”的书签标记，不是 Kubernetes Event；fallback 是“首选方案失败后退回兼容方案”。
 
 ```text
 WATCH(sendInitialEvents=true)
-  -> 一串 synthetic Added 构造 temporaryStore
+  -> 一串 synthetic Added 构造 temporaryStore（临时集合）
   -> initial-events-end Bookmark 确认初始集合结束
   -> Replace 到目标 Store
   -> 复用同一 watch 流接后续事件
@@ -598,7 +708,7 @@ WATCH(sendInitialEvents=true)
 
 源码：`kubernetes/staging/src/k8s.io/client-go/tools/cache/reflector.go:470-509`
 
-摘录类型：**完整函数，教学注释版**。它展示选择分支和 fallback；`watchList` 如何收集 synthetic Added、等待 Bookmark、再 `Replace`，放到二遍源码断点，不在首遍展开网络细节。
+摘录类型：**完整函数，教学注释版**。它展示选择分支和 fallback；`watchList` 如何收集 synthetic Added、等待 Bookmark、再 `Replace`（用完整集合整体替换 Store），放到二遍源码断点，不在首遍展开网络细节。
 
 ```go
 // ListAndWatchWithContext 建立初始一致状态，然后进入持续 watch。
@@ -647,7 +757,7 @@ func (r *Reflector) ListAndWatchWithContext(ctx context.Context) error {
 		}
 	}
 
-	// 到这里 Store 已有初始一致状态；进入通用 watchWithResync。本 source 构造时 resyncPeriod=0，不做周期 Store.Resync。
+	// 到这里 Store 已有初始一致状态；进入通用 watchWithResync。本 source 的 resyncPeriod=0，不做“对象没变也定期重发”的 Resync。
 	logger.V(2).Info("Caches populated", "type", r.typeDescription, "reflector", r.name)
 	return r.watchWithResync(ctx, w)
 }
@@ -658,6 +768,8 @@ func (r *Reflector) ListAndWatchWithContext(ctx context.Context) error {
 **顺手学 Go：** `defer` 会把匿名函数安排在当前函数返回前执行，常用于释放资源。`fallbackToList := !r.useWatchList` 中 `:=` 在当前作用域声明并赋值；`!` 是布尔取反。`return r.watchWithResync(ctx, w)` 会直接把被调函数的一个 `error` 作为当前函数返回值。
 
 ### 7.3 【二遍实现】为什么把增量重新变成完整 snapshot
+
+`UndeltaStore` 这个名字容易把人绕进去。Store 就是 client-go 在内存里保存的对象集合。首遍只记：**上游给它单个对象的增加、修改或删除；它每次都把 Store 当前完整列表推给下游。**
 
 源码：`kubernetes/staging/src/k8s.io/client-go/tools/cache/undelta_store.go:45-89`
 
@@ -728,11 +840,11 @@ func NewUndeltaStore(pushFunc func([]interface{}), keyFunc KeyFunc) *UndeltaStor
 }
 ```
 
-**大白话总结：** Reflector 可以收到增量，但 kubelet Pod source 的下游每次看到的是“目前完整有哪些 Pod”。这让断线重连、Replace 和重复事件都能回到同一个 snapshot 模型。源码明确允许并发时两次 `PushFunc` 得到相同集合；下一层必须把重复 snapshot 当正常 no-op，而不是重复创建。
+**大白话总结：** Reflector 可以收到增量，但 kubelet Pod source 的下游每次看到的是“目前完整有哪些 Pod”。这让断线重连、Replace 和重复通知都能回到同一个 snapshot 模型。源码明确允许并发时两次 `PushFunc` 得到相同集合；下一层必须把重复 snapshot 当正常 no-op（什么也不用做），而不是重复创建。
 
 **顺手学 Go：** `if err := call(); err != nil` 把 `err` 的作用域限制在这条 `if/else` 结构里。`func([]interface{})` 是函数类型，说明 `PushFunc` 可像值一样保存在结构体中。`&UndeltaStore{...}` 返回结构体指针；字段名初始化不依赖书写顺序。
 
-### 7.4 PodConfig 才把 snapshot 翻译成 kubelet生命周期事件
+### 7.4 PodConfig 才把 snapshot 翻译成 kubelet生命周期更新
 
 `UndeltaStore` 的完整集合进入 `PodConfig` 后，才出现 kubelet语义上的 `ADD/UPDATE/DELETE/REMOVE/RECONCILE`。这里有三层容易混淆的 key：
 
@@ -742,9 +854,9 @@ func NewUndeltaStore(pushFunc func([]interface{}), keyFunc KeyFunc) *UndeltaStor
 | UndeltaStore | `namespace/name` | 镜像当前对象集合 |
 | `podStorage` | `source -> UID -> Pod` | 比较同一 source 的前后生命周期 |
 
-`PodConfig.updates` 是容量 50 的有界 channel。它不是无限消息仓库，也没有“满了静默丢弃”的 default 分支；下游长期不消费时，发送会阻塞，反压会逐层传回 `Merge`、mux、source 和 Reflector。
+`PodConfig.updates` 是容量 50 的有界 channel（Go 组件之间传值的通道）。它不是无限消息仓库，也没有“满了就悄悄丢掉”的分支。下游长期不消费时，发送方会等；这种“后面堵住，压力向前传”的现象叫**反压**，会逐层传回 `Merge`、mux（把多个 source 汇成一路的组件）、source 和 Reflector。
 
-### 7.5 `Merge` 为什么先算完，再按固定顺序发事件
+### 7.5 `Merge` 为什么先算完，再按固定顺序发 PodUpdate
 
 源码：`kubernetes/pkg/kubelet/config/config.go:139-175`
 
@@ -839,7 +951,7 @@ func (s *podStorage) merge(ctx context.Context, source string, update sourceUpda
 				ref.Annotations = make(map[string]string)
 			}
 			ref.Annotations[kubetypes.ConfigSourceAnnotationKey] = source
-			// 普通 API Pod 记录“从 Watch 首次观察到”的启动 SLI；static Pod 不走这条统计。
+			// 普通 API Pod 记录“从 Watch 首次观察到”的启动时延指标；static Pod 不走这条统计。
 			if !kubetypes.IsStaticPod(ref) {
 				s.startupSLIObserver.ObservedPodOnWatch(ref, time.Now())
 			}
@@ -921,6 +1033,8 @@ PodUpdate{Op: ADD, Pods: [], Source: "api"}
 
 它不是无意义空消息，真实链路是：
 
+**读图方法：从上往下读。** 每一层只把“这个 source 已完成第一次完整同步”交给下一层，直到删除安全门真正打开。
+
 ```text
 API source 得到完整空 snapshot
   -> podStorage.markSourceSet("api")
@@ -933,6 +1047,8 @@ API source 得到完整空 snapshot
 ```
 
 如果只用“当前 map 为空”判断，kubelet启动早期无法区分：
+
+**读图方法：上下两行是两个容易混淆的状态，不是先后步骤。**
 
 ```text
 真的完整同步后为空
@@ -1001,9 +1117,9 @@ func (kl *Kubelet) syncLoop(ctx context.Context, updates <-chan kubetypes.PodUpd
 }
 ```
 
-**大白话总结：** 正常情况下，`syncLoop` 是事件交通警察；runtime 整体不健康则是少数会让它暂停所有通道消费的全局门。暂停期间 PodConfig 容量 50 的输出 channel 可能逐渐塞满，然后形成反压，而不是悄悄丢事件。
+**大白话总结：** 正常情况下，`syncLoop` 是事件交通警察；runtime 整体不健康则是少数会让它暂停所有通道消费的全局门。暂停期间 PodConfig 容量 50 的输出 channel 可能逐渐塞满，然后形成反压，而不是悄悄丢更新。
 
-**顺手学 Go：** `<-chan kubetypes.PodUpdate` 表示只读 channel。`time.NewTicker` 返回需要 `Stop()` 的对象，所以用 `defer` 收尾。`const (...)` 把一组常量放在同一声明块。`continue` 直接开始下一轮 `for`，`break` 则结束循环。
+**顺手学 Go：** `<-chan kubetypes.PodUpdate` 表示只读 channel。`time.NewTicker` 创建按固定间隔“响一次”的定时器；它需要 `Stop()`，所以用 `defer` 收尾。`const (...)` 把一组常量放在同一声明块。`continue` 直接开始下一轮 `for`，`break` 则结束循环。
 
 ### 8.2 一个 `select` 汇聚多种触发，但不规定固定优先级
 
@@ -1171,11 +1287,11 @@ func (kl *Kubelet) HandlePodAdditions(ctx context.Context, pods []*v1.Pod) {
 
 ### 8.4 为什么 scheduler 通过了，本地 admission 仍可能拒绝
 
-scheduler 使用自己的 cache 做集群决策；从调度快照到 kubelet接单之间，节点实际资源、端口、设备或系统状态可能变化。kubelet必须在执行前保护本节点，不能把 Bind 当作不可质疑的远程命令。
+scheduler 使用自己的 cache 做集群范围的选择；从调度快照到 kubelet真正接单之间，节点实际资源、端口、设备或系统状态可能变化。**本地 admission** 就是 kubelet按节点此刻的真实情况再过一道门：能接就继续，不能接就记录原因并拒绝，不负责重新挑 Node。
 
 源码：`kubernetes/pkg/kubelet/allocation/allocation_manager.go:611-625`
 
-摘录类型：**完整函数，教学注释版**。`AddPod` 在外层持有 `allocationMutex`，必要时读取已准入/已 checkpoint 的资源，再调用本函数。
+摘录类型：**完整函数，教学注释版**。`AddPod` 在外层持有 `allocationMutex`，必要时读取已经准入或已经写入 checkpoint（节点磁盘上的恢复记录）的资源，再调用本函数。
 
 ```go
 // canAdmitPod 让所有本地 admit handler 依次判断这个 Pod 是否能在当前节点运行。
@@ -1198,13 +1314,15 @@ func (m *manager) canAdmitPod(logger klog.Logger, allocatedPods []*v1.Pod, pod *
 }
 ```
 
-**大白话总结：** 本地 admission 是 Node 的最后保护门，不是第二个 scheduler。否决结果是 `false + reason + message`，`HandlePodAdditions` 会写 Event、把 Pod 标为 Failed 并停止普通创建；它不会擅自清空 `spec.nodeName` 或重新选 Node，上层控制器后续如何补副本是另一条控制链。这里没有独立 `error` 返回槽：资源/策略不满足和 `InvalidNodeInfo`、`UnexpectedAdmissionError` 等内部异常都可能被编码成 `Admit=false + reason/message`，值班时要继续按 reason/message 分层。
+**大白话总结：** 本地 admission 是 Node 的最后保护门，不是第二个 scheduler。否决结果是 `false + reason + message`，`HandlePodAdditions` 会写 Event、把 Pod 标为 Failed 并停止普通创建；它不会擅自清空 `spec.nodeName` 或重新选 Node，上层控制器后续如何补副本是另一条控制链。这里没有独立 `error` 返回槽：资源/策略不满足和 `InvalidNodeInfo`（节点信息无效）、`UnexpectedAdmissionError`（准入内部异常）都可能被编码成 `Admit=false + reason/message`，值班时要继续按 reason/message 分层。
 
 **顺手学 Go：** `func(p *v1.Pod) bool { return p.UID == pod.UID }` 是传给 `DeleteFunc` 的匿名判断函数。内层参数也叫 `p`，外层目标 Pod 叫 `pod`，作用域不同。Go 多返回值让 `bool/reason/message` 形成显式否决契约，但这里恰好没有单独 `error`，所以不能仅凭返回形状区分资源/策略不满足和内部异常。
 
-还有一个非对称失败边界：启用 InPlacePodVerticalScaling 时，`AddPod` 在 admission 通过后写 allocation checkpoint；当前代码若写失败只记录日志，仍返回 admission 成功。也就是说，“checkpoint 写失败”不是本函数这次否决 Pod 的分支，后续恢复风险要结合 allocation 日志和 checkpoint 证据判断。
+还有一个二遍再看的特殊边界：启用 InPlacePodVerticalScaling（Pod 不重建就调整资源）时，`AddPod` 在 admission 通过后写 allocation checkpoint，也就是把已经准入的资源记录到节点磁盘，供重启后恢复。当前代码若写失败只记录日志，仍返回 admission 成功。因此“checkpoint 写失败”不是本函数这次拒绝 Pod 的分支。
 
 到这里，`uid-A` 已完成：
+
+**读图方法：从上往下读。** 每一行都是下一道门；上一行成功不自动代表下一行也成功。
 
 ```text
 API 持久绑定
@@ -1217,25 +1335,25 @@ API 持久绑定
 
 接下来才进入本章最重要的并发边界：为什么不是 `HandlePodAdditions` 直接调用 `SyncPod`，而要先进入 `podWorkers`。
 
-## 9. 为什么 `podWorkers` 更像“按 UID 分片的最新值执行器”
+## 9. 为什么 `podWorkers` 要给每个 UID 一个串行工位
 
-### 9.1 先修正两个容易过度类比的说法
+### 9.1 先用“工位”和“门铃”理解
 
-可以把它暂时类比成 actor，但要加两个限定：
+先别背 `actor`、`latest-value worker`、`FIFO mailbox` 这些词。把一个 UID 想成一个维修工位：
 
-> `podWorkers` 更像**按 UID 分片的 latest-value worker**，不是保存每条消息并严格 FIFO 回放的完整 actor mailbox。
-
-原因是：
-
-- `podUpdates[uid]` 是容量 1 的 `chan struct{}`，只传“有活了”的通知，不承载 Pod payload；
-- 真正 payload 放在 `podSyncStatuses[uid].pendingUpdate`；
-- 普通新更新可以覆盖尚未执行的旧 pending update；
-- 同一 UID 只有一个 worker goroutine，上一轮结束后才执行下一轮；
-- 不同 UID 有独立 goroutine，允许并行调用线程安全的 `podSyncer`；
-- `podLock` 仍是所有 UID 共享的短临界区锁，但真正耗时的 `SyncPod` 不持有它；
+- `pendingUpdate` 是桌上那张**最新工单**，保存真正的 Pod 内容；
+- `podUpdates[uid]` 是容量 1 的**门铃**，只表达“桌上有活了”，不装 Pod 内容；
+- 工人忙时又来普通新工单，可以用 v4 覆盖还没做的 v3；
+- 同一 UID 只有一个 worker goroutine，所以上一轮结束后才开始下一轮；
+- 不同 UID 有不同 worker，因此 `uid-A` 等卷时，`uid-B` 可以运行自己的 `SyncPod`；
+- `podLock` 是所有 UID 共用的一把短锁，“临界区”就是拿着这把锁读写共享状态的那小段时间；耗时的 `SyncPod` 不拿着它；
 - volume、runtime、device 等下游还可能按自己的资源 key 串行，所以“不同 UID 可并行”不等于“所有底层操作保证同时完成”。
 
+如果以后在并发资料里看到 **latest-value worker**，说的就是“普通待办只保留最新值”；看到 **FIFO**，说的是“先进先出、每条都按顺序保留”。`podWorkers` 不是完整 FIFO 消息队列。
+
 对本例可以画成：
+
+**读图方法：两行都从左往右读，代表两个独立 UID；最下面三行说明共享锁只在取放工单时短暂使用。**
 
 ```text
 uid-A:
@@ -1249,11 +1367,11 @@ worker-A 等卷时不持有 podLock
 所以 worker-B 可以进入自己的 SyncPod
 ```
 
-### 9.2 `UpdatePod` 为什么把 payload 和通知分开
+### 9.2 `UpdatePod` 为什么把“工单内容”和“门铃通知”分开
 
 源码：`kubernetes/pkg/kubelet/pod_workers.go:941-995`
 
-摘录类型：**连续摘录，教学注释版**。该区间是 `UpdatePod` 的后半段：前半段已经按 UID 建立/读取 `podSyncStatus`，拒绝 finished 状态，并把 deletion、terminal phase、kill 和 grace period 缩短锁存进状态机；本段负责创建 worker、覆盖最新 pending payload 和发通知。
+摘录类型：**连续摘录，教学注释版**。源码里的 payload 就是“真正的工单内容”。该区间是 `UpdatePod` 的后半段：前半段已经按 UID 建立/读取 `podSyncStatus`，拒绝已经彻底结束的 worker，并把删除、终态、kill 和优雅退出时间缩短等不可逆事实锁存进状态机；本段负责创建 worker、覆盖最新待办内容和发门铃通知。
 
 ```go
 // 先按 UID 查是否已有通知 channel；每个 UID 最多一个常驻 worker channel。
@@ -1263,7 +1381,7 @@ if !exists {
 	podUpdates = make(chan struct{}, 1)
 	p.podUpdates[uid] = podUpdates
 
-	// static Pod 还要按 fullname 排队；普通 API Pod uid-A 不进入这个分支。
+				// static Pod 还要按 fullname 排队；普通 API Pod uid-A 不进入这个分支。
 	if kubetypes.IsStaticPod(pod) {
 		p.waitingToStartStaticPodsByFullname[status.fullname] =
 			append(p.waitingToStartStaticPodsByFullname[status.fullname], uid)
@@ -1315,13 +1433,13 @@ if (becameTerminating || wasGracePeriodShortened) && status.cancelFn != nil {
 }
 ```
 
-**大白话总结：** `UpdatePod` 返回只代表“最新期望已经放进槽位并尽力按了门铃”，绝不代表 `SyncPod` 已执行完成。v2、v3、v4 在 worker 忙时可能压缩成 v4；到底执行几个版本取决于并发时序，但最终最新普通期望会被看到。创建 goroutine 的代码也证明了正确调用顺序是 `UpdatePod -> podWorkerLoop -> startPodSync`。
+**大白话总结：** `UpdatePod` 返回只代表“最新工单已经放上桌，并尽力按了门铃”，绝不代表 `SyncPod` 已执行完成。v2、v3、v4 在 worker 忙时可能压缩成 v4；到底执行几个版本取决于并发时序，但最终最新普通期望会被看到。创建 goroutine 的代码也证明了正确调用顺序是 `UpdatePod -> podWorkerLoop -> startPodSync`。
 
 **顺手学 Go：** `make(chan struct{}, 1)` 创建容量 1 的 channel；空结构体 `struct{}` 不携带 payload，通常只做信号。`go func() { ... }()` 启动匿名 goroutine。带 `default` 的 `select` 是非阻塞发送：channel 已满时不会等待。`status.pendingUpdate.Pod, _ = ...` 丢弃第二个返回值，表示当前代码只关心修正后的 Pod。
 
 ### 9.3 为什么普通更新可覆盖，删除却不会被忘掉
 
-在写 `pendingUpdate` 之前，`UpdatePod` 已经把不可逆事实写进 `podSyncStatus`：
+在写 `pendingUpdate` 之前，`UpdatePod` 已经把不可逆事实“锁存”进 `podSyncStatus`。锁存就是一旦记下就不允许普通更新把它改回去：
 
 | 事实 | 锁存字段/规则 | 后续普通 update 能否倒退 |
 |---|---|---|
@@ -1333,6 +1451,8 @@ if (becameTerminating || wasGracePeriodShortened) && status.cancelFn != nil {
 
 `WorkType()` 的优先级也很直接：
 
+**读图方法：从上往下检查，命中第一条就停止。**
+
 ```text
 terminatedAt 已设置    -> TerminatedPod
 否则 terminatingAt 已设置 -> TerminatingPod
@@ -1342,6 +1462,10 @@ terminatedAt 已设置    -> TerminatedPod
 所以即使一次删除更新的 `options` 后来被另一个普通 options 覆盖，生命周期方向已经锁进 status；worker 计算出的 WorkType 仍是终止。这就是“payload 可合并，生命周期不能倒退”。对应测试是 `TestUpdatePodDoesNotForgetSyncPodKill`。
 
 ### 9.4 `startPodSync` 怎样原子取走最新工作
+
+这里的“原子”不是数据库事务，而是“在同一把锁里完成读取、取走和清空，其他 goroutine 不能只看见做到一半的状态”。
+
+后面代码会出现 `runtime-only orphan`：它指 API Pod 已经不在了，但 container runtime 里还残留 sandbox 或容器的“孤儿运行对象”，只能清理，不能再按普通 Pod 启动。
 
 源码：`kubernetes/pkg/kubelet/pod_workers.go:1122-1209`
 
@@ -1569,7 +1693,7 @@ func (c *cache) GetNewerThan(id types.UID, minTime time.Time) (*PodStatus, error
 }
 ```
 
-**大白话总结：** 它保证的是“cache 至少在上一轮 `lastSyncTime` 之后重新观察过”，不是“调用瞬间绝对最新”的线性一致状态。Pod 不存在时，只要全局 runtime relist 已经更新，也可以返回默认空 PodStatus。这足以支持重复收敛，但不能被描述成 etcd 式强一致读。
+**大白话总结：** 它保证的是“cache 至少在上一轮 `lastSyncTime` 之后重新观察过”，不是“调用瞬间绝对最新”的强一致状态。Pod 不存在时，只要 runtime 全局缓存已经重新刷新，也可以返回默认空 PodStatus。这足以支持重复收敛，但不能被描述成每次都直接读到调用瞬间的真实世界。
 
 **顺手学 Go：** `d := <-ch` 是阻塞接收。因为函数没有 `context.Context` 参数，这个等待本身不能直接 select 调用方取消；正常依赖 PLEG/cache 更新解除订阅。返回 `(*PodStatus, error)` 时两个值来自同一份 `data`，调用方必须分别判断。
 
@@ -1657,6 +1781,8 @@ func (c *cache) GetNewerThan(id types.UID, minTime time.Time) (*PodStatus, error
 
 ### 10.4 `completeWork` 为什么既有定时重试，又能立即响应新更新
 
+先把三个词翻成人话：`workQueue` 是“记着每个 UID 什么时候该再干活的日程表”；`backoff` 是失败后等待多久再试；`jitter` 是在等待时间上加一点随机浮动，避免大量 Pod 同一毫秒一起重试。
+
 源码：`kubernetes/pkg/kubelet/pod_workers.go:1510-1552`
 
 摘录类型：**完整函数，教学注释版**。
@@ -1710,7 +1836,7 @@ func (p *podWorkers) completeWork(logger klog.Logger, podUID types.UID, phaseTra
 }
 ```
 
-**大白话总结：** 一轮失败时会把 UID 放进 workQueue；默认其他同步错误在当前构造参数下通常是约 10 秒并带 jitter，但不要把它写成跨版本常量。workQueue 到期后通常由 1 秒 `syncTicker -> getPodsToSync -> HandlePodSyncs -> UpdatePod(SyncPodSync)` 再按门铃。若执行期间已来了 v4 或 termination，则立即通知，不必等待失败退避。
+**大白话总结：** 一轮失败时会把 UID 的下次执行时间记进 workQueue；默认其他同步错误在当前构造参数下通常是约 10 秒并带随机浮动，但不要把它写成跨版本常量。时间到后，通常由每秒检查一次的 `syncTicker -> getPodsToSync -> HandlePodSyncs -> UpdatePod(SyncPodSync)` 再按门铃。若执行期间已来了 v4 或 termination，则立即通知，不必等失败退避。
 
 **顺手学 Go：** `switch` 从上到下命中第一个 case。`strings.Contains` 在这里是特定错误文本分类，不能泛化为所有 error 设计。`if backoffAt, isBackoffErr := ...; isBackoffErr` 是带初始化语句的 if。嵌套 `select` 仍是非阻塞发送。
 
@@ -1720,30 +1846,30 @@ func (p *podWorkers) completeWork(logger klog.Logger, podUID types.UID, phaseTra
 
 | 控制环 | 失败对象 | 起点/上限的当前实现 | 谁再次执行 |
 |---|---|---|---|
-| Pod worker | 一整轮 `SyncPod` 返回 error | 默认 worker backoff 当前约 10s，受 resync interval 和 jitter 约束 | syncTicker 让到期 UID 再次 `UpdatePod` |
+| Pod worker | 一整轮 `SyncPod` 返回 error | 默认 worker 退避当前约 10s，受定期对账间隔和随机浮动约束 | syncTicker 让到期 UID 再次 `UpdatePod` |
 | volume operation | 某次具体 Mount/SetUp 操作失败 | 独立指数退避，当前从约 500ms 起、最大约 2m2s | operation executor / reconciler |
 
-因此不能拿两条相邻 Event 的间隔，直接反推出 Pod worker 的 backoff；也不能看到 `Error syncing pod` 就认为卷后台停止了。两个控制环共享“最终挂载成功”这个目标，但各自有状态和时间线。
+因此不能拿两条相邻 Event 的间隔，直接反推出 Pod worker 的退避时间；也不能看到 `Error syncing pod` 就认为卷后台停止了。两个控制环共享“最终挂载成功”这个目标，但各自有状态和时间线。
 
 ## 11. 为什么 `SyncPod` 必须可重入，而卷又必须独立运行
 
-### 11.1 `SyncPod` 是 transaction script，但不是数据库事务
+### 11.1 `SyncPod` 是“一轮对账清单”，不是全成全退的数据库事务
 
 上游函数注释明确给出合同：
 
 ```text
-输入：当前 desired Pod、最近重新观察过的 runtime PodStatus、本轮 updateType
-目标：让单个 Pod 的 actual state 向 spec 收敛
-性质：reentrant，可重复进入
-失败：返回 transient error，下一轮应继续取得进展
+输入：当前期望 Pod、最近重新观察过的容器实际状态、本轮更新类型
+目标：让单个 Pod 的节点现实逐步靠近 spec 中的期望
+性质：reentrant（可重入），失败后可以安全地再做一轮
+失败：返回 transient error（暂时性错误），下一轮应继续取得进展
 拆除：不由本函数反向执行，而由 SyncTerminatingPod / SyncTerminatedPod 负责
 ```
 
-这里的 `transaction script` 是“把一轮业务步骤编排在一个函数里”，不是 ACID 原子事务。一轮可能已经创建目录、注册 ConfigMap、挂上部分卷或让 runtime 完成部分动作；后面失败时不会把所有副作用自动 rollback，而是要求各步骤可重复、可检查、可继续。
+有些设计资料把这种写法叫 `transaction script`，但首遍不用背这个英文。这里就是把一轮要检查、要补的步骤按顺序编排在一个函数里。它不是数据库那种“要么全部成功，要么把前面动作全部撤销”的事务：一轮可能已经创建目录、注册 ConfigMap、挂上部分卷，后面才失败。下一轮会检查已经做成什么，再继续补，而不是盲目从零重来。
 
 源码：`kubernetes/pkg/kubelet/kubelet.go:2019-2036`
 
-摘录类型：**`SyncPod` 入口的连续摘录，教学注释版**。函数后续所有业务阶段在 11.2 列出；本段只建立输入、命名返回值、trace 和 enter/exit 证据。
+摘录类型：**`SyncPod` 入口的连续摘录，教学注释版**。函数后续所有业务阶段在 11.2 列出；本段只建立输入、命名返回值、trace 和 enter/exit 证据。trace span 是“一次调用从进入到退出的计时记录”，用来串日志、耗时和错误，不是 Pod 的业务状态。
 
 ```go
 // SyncPod 接收本轮 context、更新类型、desired Pod、可选 mirror Pod 和 runtime status。
@@ -1781,7 +1907,7 @@ func (kl *Kubelet) SyncPod(ctx context.Context, updateType kubetypes.SyncPodType
 	}()
 ```
 
-**大白话总结：** `SyncPod enter` 只证明本轮进入；V(4) 的 `SyncPod exit` 日志本身只带 `isTerminal`，**不带 err 字段**。若要证明本轮 error，必须组合 trace span 中记录的 error，或 worker 的 `Error syncing pod, skipping` 等证据。无论如何，它们都不意味着 Pod 被删除或重新调度。因为 `err` 是命名返回值，`defer` 能在任意退出点看到最终 error 并写入 span。
+**大白话总结：** `SyncPod enter` 只证明本轮进入；V(4) 表示较详细的日志等级，这条 `SyncPod exit` 日志本身只带 `isTerminal`，**不带 err 字段**。若要证明本轮 error，必须组合 trace span 中记录的 error，或 worker 的 `Error syncing pod, skipping` 等证据。无论如何，它们都不意味着 Pod 被删除或重新调度。因为 `err` 是命名返回值，`defer` 能在任意退出点看到最终 error 并写入 span。
 
 **顺手学 Go：** `pod, mirrorPod *v1.Pod` 表示两个相邻参数共享同一指针类型。`(isTerminal bool, postSync func(), err error)` 是三个命名返回值。`defer func(){...}()` 中 closure 捕获的是这些返回变量，所以各处 `return` 赋值后，defer 读取到的是最终结果。
 
@@ -1795,16 +1921,18 @@ func (kl *Kubelet) SyncPod(ctx context.Context, updateType kubetypes.SyncPodType
 | 2 | 写入 statusManager | 本地状态更新，不等于同步写 apiserver 成功 | 仍 Pending |
 | 3 | 检查 network ready | 非 hostNetwork 且 CNI 未就绪 -> `NetworkNotReady` | 假设通过 |
 | 4 | 注册 Secret/ConfigMap 跟踪 | termination 已请求时不再注册新依赖 | 注册 `game-api-config` |
-| 5 | cgroup、资源和 soft admission | 可能在到达卷之前 return | 假设通过 |
+| 5 | cgroup（Linux 资源限制组）、资源检查和节点软准入复核 | 可能在到达卷之前 return | 假设通过 |
 | 6 | static mirror 对账、创建 Pod data dirs | 目录失败 -> Event + error | 通过 |
 | 7 | 等所有预期 volume attached/mounted | timeout、取消、attach limit 或其他错误 | 本案卡点 |
 | 8 | 获取 image pull secrets、登记 probe | 只有卷通过才到达 | 尚未到达 |
 | 9 | `containerRuntime.SyncPod` | runtime 返回逐动作结果/聚合 error | 第 12 课 |
-| 10 | reasonCache、relist 和返回 | partial success 不自动 rollback | 第 12 课 |
+| 10 | reasonCache（保存容器等待/失败原因的本地缓存）、重新读取 runtime 状态和返回 | 前面部分成功的动作不会自动撤销 | 第 12 课 |
 
 所以只看到 `FailedMount` 时，不应声称第 8～10 步已经执行；也不能因为本章重点从卷开始，就假装 5 段 cgroup 分支不存在。
 
 ### 11.3 volume manager 为什么自己有两个长期控制环
+
+先认两个角色：desired-state populator 是“把 Pod 需要哪些卷填进期望账的人”；reconciler 是“不断比较期望账和实际账，发现差距就发起挂载或卸载的人”。**控制环**就是这种“反复看差距、做一点、再看”的长期循环。
 
 源码：`kubernetes/pkg/kubelet/volumemanager/volume_manager.go:298-317`
 
@@ -1849,7 +1977,11 @@ func (vm *volumeManager) Run(ctx context.Context, sourcesReady config.SourcesRea
 
 摘录类型：**完整函数，教学注释版**。当前常量是每 `300ms` 检查一次、最长 `2m3s`；这是固定提交实现，不应写成所有版本的 API 保证。
 
-这里还有一个不能被“只查 ASW”四个字盖住的分支。`verifyVolumesMountedFunc` 每次先消费 `desiredStateOfWorld.PopPodErrors(podName)`：
+卷代码里常写两个缩写：DSW 是 Desired State of World，指“应该挂哪些卷”的期望账；ASW 是 Actual State of World，指“实际上哪些卷已经挂好”的实际账。这里的 World 只指 volume manager 管的这部分世界，不是整个集群。
+
+`verifyVolumesMountedFunc` 不是只查 ASW。它每次先消费 `desiredStateOfWorld.PopPodErrors(podName)`：
+
+**读图方法：从上往下读，两个分支二选一。** `condition` 是轮询函数每次执行的检查逻辑。
 
 ```text
 DSW 有 Pod 级处理错误
@@ -1860,7 +1992,7 @@ DSW 没有错误
   -> 才检查 expectedVolumes 是否都已 mounted
 ```
 
-这种 DSW 处理 error 通常不是 `wait.Interrupted`，因此正是第 11.5 节 `SyncPod` 发出第二类 `Unable to attach or mount volumes` / `FailedMount` 的一条具体来源。
+这种 DSW 处理 error 通常不属于“等待超时或被取消”，因此正是第 11.5 节 `SyncPod` 发出第二类 `Unable to attach or mount volumes` / `FailedMount` 的一条具体来源。
 
 ```go
 // WaitForAttachAndMount 等待全部预期卷 mounted，同时把 DSW Pod 级处理错误及时返回。
@@ -2043,51 +2175,60 @@ kl.reasonCache.Update(pod.UID, result)
 
 ### 11.6 为什么缺失 ConfigMap 的 Event 通常来自后台 operation
 
-ConfigMap plugin 的关键判断在 `kubernetes/pkg/volume/configmap/configmap.go:176-202`：
+第 5.3 节已经证明 ConfigMap plugin 会把 NotFound 返回。这里不重复那段源码，只接着看：后台卷操作怎样把这个 error 变成你在 `kubectl describe` 里看到的诊断 Event。
 
-摘录类型：**`SetUp` 完整函数加 `SetUpAt` 前半段连续摘录，教学注释版**。`202` 之后是 payload、目录和原子写入；本案在 `194 return err` 已提前退出。
+源码：`kubernetes/pkg/volume/util/operationexecutor/operation_generator.go:603-608`
+
+摘录类型：**mount 函数中的一段连续错误分支，教学注释版**。
 
 ```go
-// SetUp 使用该 volume 的默认路径调用真正实现。
-func (b *configMapVolumeMounter) SetUp(mounterArgs volume.MounterArgs) error {
-	return b.SetUpAt(b.GetPath(), mounterArgs)
+// mountErr 非 nil，表示具体 volume plugin 的 SetUp 没成功。
+if mountErr != nil {
+	// 先检查是否属于少数需要额外诊断的挂载错误。
+	og.checkForFailedMount(volumeToMount, mountErr)
+	// 把本次失败写入卷的实际状态账，供后续判断和重试。
+	og.markVolumeErrorState(volumeToMount, markOpts, mountErr, actualStateOfWorld)
+	// 给面向用户的错误加上 “MountVolume.SetUp failed” 前缀。
+	eventErr, detailedErr := volumeToMount.GenerateError("MountVolume.SetUp failed", mountErr)
+	// 把面向 Event 的错误和详细日志错误一起交给 operation 框架。
+	return volumetypes.NewOperationContext(eventErr, detailedErr, migrated)
 }
-
-// SetUpAt 准备目标目录并读取 ConfigMap；本段到缺对象的 optional 分支结束。
-func (b *configMapVolumeMounter) SetUpAt(dir string, mounterArgs volume.MounterArgs) error {
-	klog.V(3).Infof("Setting up volume %v for pod %v at %v", b.volName, b.pod.UID, dir)
-
-	// ConfigMap volume 用一个受管理的 EmptyDir wrapper 承载投影文件。
-	wrapped, err := b.plugin.host.NewWrapperMounter(b.volName, wrappedVolumeSpec(), &b.pod)
-	if err != nil {
-		return err
-	}
-
-	// 只有 source.Optional 非 nil 且值为 true，才允许对象不存在。
-	optional := b.source.Optional != nil && *b.source.Optional
-	// 通过 kubelet的 ConfigMap getter 读取同 namespace 的对象。
-	configMap, err := b.getConfigMap(b.pod.Namespace, b.source.Name)
-	if err != nil {
-		// NotFound 且 optional=true 才可继续；本例 optional=false，因此直接返回 NotFound。
-		if !(errors.IsNotFound(err) && optional) {
-			klog.Errorf("Couldn't get configMap %v/%v: %v", b.pod.Namespace, b.source.Name, err)
-			return err
-		}
-		// optional=true 时构造空 ConfigMap，让后续 payload 逻辑按空对象处理。
-		configMap = &v1.ConfigMap{
-			ObjectMeta: metav1.ObjectMeta{
-				Namespace: b.pod.Namespace,
-				Name:      b.source.Name,
-			},
-		}
-	}
 ```
 
-**大白话总结：** 本例的 `optional=false` 让 NotFound 成为真实 setup error。operation generator 会把它包装成 `MountVolume.SetUp failed ...`，其 `EventRecorderFunc` 在 `operation_generator.go:649-660` 以 `FailedMount` 记录；之后 volume operation 自己退避重试。这个 Event 能证明卷执行链尝试过 setup，但不能单凭 reason 确定 `SyncPod` 当前是否仍在 wait。
+源码：`kubernetes/pkg/volume/util/operationexecutor/operation_generator.go:649-660`
 
-**顺手学 Go：** `b.source.Optional` 是 `*bool`，所以先判 `!= nil`，再用 `*` 取值。`!(A && B)` 是对整体条件取反；本例 `IsNotFound=true`、`optional=false`，括号内为 false，取反后进入 return。`&b.pod` 表示取得字段的地址，以符合 wrapper API 需要的指针参数。
+摘录类型：**同一生成函数末尾的连续摘录，教学注释版**。
+
+```go
+// operation 结束时，框架会调用这个函数处理面向用户的 Event 错误。
+eventRecorderFunc := func(err *error) {
+	// 只有本次 operation 真有 Event 错误才记录。
+	if *err != nil {
+		// 这里创建 Warning/FailedMount Kubernetes Event 对象，message 使用上面包装后的文本。
+		og.recorder.Eventf(volumeToMount.Pod, v1.EventTypeWarning, kevents.FailedMountVolume, "%s", (*err).Error())
+	}
+}
+
+// 返回一组可执行操作，把真正挂载函数、Event 回调和完成回调交给 operation executor。
+return volumetypes.GeneratedOperations{
+	// 这个名字用于标识和串行化 volume_mount 操作。
+	OperationName:     "volume_mount",
+	// 后台要执行的真正挂载函数。
+	OperationFunc:     mountVolumeFunc,
+	// 失败后写 Kubernetes Event 的回调。
+	EventRecorderFunc: eventRecorderFunc,
+	// 操作完成后记录时延等收尾信息的回调。
+	CompleteFunc:      util.OperationCompleteHook(util.GetFullQualifiedPluginNameForVolume(volumePluginName, volumeToMount.VolumeSpec), "volume_mount"),
+}
+```
+
+**大白话总结：** 路径是“两次交接”：ConfigMap plugin 返回 NotFound；卷操作先把它包装成 `MountVolume.SetUp failed ...`，再由回调写成 `Warning/FailedMount` Kubernetes Event。之后后台卷控制环按自己的退避再次尝试。这个 Event 能证明挂卷链执行过，但不能单凭 reason 判断 Pod worker 此刻是否仍在 wait。
+
+**顺手学 Go：** `func(err *error)` 的参数是 error 变量的指针，所以要用 `*err` 取出真正的 error。`GeneratedOperations{...}` 是结构体字面量：每个 `字段名: 值` 把一个函数或名字装进返回对象，框架稍后再调用。
 
 ### 11.7 context 取消意图不等于所有下游立即停止
+
+Go 的 context 可以携带取消和超时信号，但下游代码必须真的检查它，动作才会停。因此“上游调用了 cancel”与“所有底层操作已经停止”是两件事。
 
 本章已经看到三种边界：
 
@@ -2108,6 +2249,8 @@ func (b *configMapVolumeMounter) SetUpAt(dir string, mounterArgs volume.MounterA
 
 ### 12.1 共同前半段
 
+**读图方法：从上往下看时间。** 到 `t2` 后分成 Pod worker 与 volume manager 两条线；两条线可以交错，缩进只表示各自内部先后，不表示两条线之间有固定全序。
+
 ```text
 t0  scheduler Binding 持久化
     uid-A.spec.nodeName = worker-05
@@ -2123,23 +2266,32 @@ t2  从 podManager 登记以后，下面两条线允许并发，源码不承诺�
       local admission 通过
         -> podWorkers.UpdatePod 写 pendingUpdate 并启动 worker-A
         -> startPodSync -> GetNewerThan -> SyncPod enter
-        -> SyncPod.RegisterPod(game-api-config)
+        -> SyncPod.RegisterPod(game-api-config) 让 ConfigMap manager 开始跟踪
         -> WaitForAttachAndMount
 
     Volume manager 线
       desired-state populator 可从 podManager 看见 uid-A
         -> 建立 volume desired state
-        -> reconciler / operation 尝试 ConfigMap SetUpAt
+        -> reconciler 发起后台挂卷 operation，尝试 ConfigMap SetUpAt
         -> 失败后记录 Event，并按 volume operation 自己的退避重试
 ```
 
-这个并发边界很重要：volume populator 可能早于 local admission、worker 甚至 ConfigMap manager 注册开始处理。若使用 watch-based manager，早期读取还可能先得到 `object "prod"/"game-api-config" not registered`；注册完成后对象仍不存在，才会稳定表现为本章教学现场的 `configmap "game-api-config" not found`。因此“`SyncPod` 先 Register，再由 volume operation 首次 SetUp”不是固定全序。
+首遍只记：从 `podManager.AddPod` 以后，两条线就可能交错，源码不保证一定是 `SyncPod` 先 Register、volume operation 再首次 SetUp。看到 NotFound Event，只能证明某次 SetUp 已经尝试过，不能倒推出前面每一步的精确先后。
 
-本例已经观察到 NotFound Event，所以后续两条路径从“一次 ConfigMap SetUp 已因 NotFound 失败；`SyncPod` 可能尚未进入、正在执行或已经结束 volume wait”这个共同状态继续。下面路径 A 明确假设它仍在 wait，路径 B 明确假设 wait 已超时。此时 JVM 还没启动，`jmx-exporter` 也没进入 runtime 创建阶段，所以 `0/2` 与源码吻合。
+<details>
+<summary>二遍再看：为什么第一次错误偶尔不是 NotFound</summary>
+
+volume populator 可能比 local admission、Pod worker 或 ConfigMap manager 的注册更早运行。若 ConfigMap manager 使用“只跟踪已经注册对象”的 watch 模式，早期读取可能先得到 `object "prod"/"game-api-config" not registered`；注册完成后对象仍不存在，才会稳定变成 `configmap "game-api-config" not found`。这不改变两条线并发、最终反复对账的主结论。
+
+</details>
+
+本例已经看到 NotFound Event。后面只分两个主要情况：路径 A 假设当前 `SyncPod` 还在等卷；路径 B 假设它已经等超时并返回。此时 JVM 还没启动，`jmx-exporter` 也没进入 runtime 创建阶段，所以 `0/2` 与源码吻合。
 
 还有一个更快的时序变体：若 NotFound 发生在 `SyncPod` 到达 wait 之前，ConfigMap 和 mount 又先恢复，那么 `WaitForAttachAndMount` 进入后第一次检查就可通过。它仍属于“同一轮无需等 worker 重试”的原地收敛，不单独扩成第三条主路径。
 
 ### 12.2 路径 A：当前 `SyncPod` 还在 wait，原地继续同一轮
+
+**读图方法：从 `t4` 往下读。** 这条路径的关键前提是旧的 `WaitForAttachAndMount` 还没有返回。
 
 ```text
 t4  平台补齐 prod/game-api-config
@@ -2154,6 +2306,8 @@ t10 进入 containerRuntime.SyncPod
 这条路径不需要 PodConfig 产生一个新的 Pod UPDATE，也不是“创建 ConfigMap 直接给 worker channel 发通知”。它依赖后台 volume loop 改变 actual state，当前 wait 观察到条件成立。
 
 ### 12.3 路径 B：当前 wait 已超时，后续一轮继续
+
+**读图方法：从 `t4` 往下读。** 这条路径的关键前提是上一轮 `SyncPod` 已经返回 error；卷后台与 Pod worker 随后各走各的重试时间线。
 
 ```text
 t4  WaitForAttachAndMount 到 2m3s timeout
@@ -2178,6 +2332,8 @@ t9  进入 containerRuntime.SyncPod
 
 在 `uid-A` 处于 `WaitForAttachAndMount` 的同一时间窗，教学现场还要求观察：
 
+**读图方法：两行按同一时间窗上下对照，不是先做完 A 再做 B。**
+
 ```text
 uid-A: game-api-new-x，node=worker-05，持续等待 game-config
 uid-B: metrics-agent-x，node=worker-05
@@ -2201,6 +2357,8 @@ uid-B: metrics-agent-x，node=worker-05
 ### 12.6 卷通过后为什么仍不能说业务恢复
 
 进入 runtime 以后还要经历：
+
+**读图方法：从左往右读。** 每个箭头表示下一项前置条件；越过 volume 只代表能继续，并不代表后面全部成功。
 
 ```text
 PodSandbox/CNI
@@ -2232,6 +2390,8 @@ v2 可能正在执行；v3、v4 都写 `pendingUpdate` 时，v4 可以覆盖尚�
 
 名称仍是 `game-api-new-x`，但新 UID 是 `uid-C`：
 
+**读图方法：从上往下读；上层按名字看到“替换”，下层按 UID 拆成旧生命移除、新生命加入。**
+
 ```text
 UndeltaStore key：prod/game-api-new-x（同一个名称 key 被替换）
 PodConfig UID diff：REMOVE(uid-A) + ADD(uid-C)
@@ -2247,6 +2407,8 @@ podWorkers：worker-A 走 termination/cleanup；worker-C 是新生命周期
 ### 13.6 API snapshot 中旧 UID 消失，但 source 尚未 ready
 
 `HandlePodRemoves` 正常补偿顺序是：
+
+**读图方法：从上往下读。** 前三步更新本机账本，最后一步才尝试终止节点上的运行对象。
 
 ```text
 证书跟踪 Forget
@@ -2387,6 +2549,8 @@ sudo crictl ps -a --name jmx-exporter
 
 建议按一个 UID 对齐时间轴：
 
+**读图方法：从上往下按时间排序。** 每一项来自不同证据源，时间相邻不等于存在直接调用关系。
+
 ```text
 ConfigMap 创建/更新的 API 时间
 MountVolume.SetUp failed/succeeded 时间
@@ -2454,13 +2618,15 @@ uid-B：同一时间窗出现自己的 SyncPod enter、runtime 进展，随后 R
 
 GPU 在本章只占一张表。平台 Java Pod先把 kubelet通用骨架读懂，后面 GPU 专章只增加设备账，不重学一遍 `syncLoop/podWorkers/SyncPod`。
 
+表里新词先翻一次：extended resource 是 `nvidia.com/gpu` 这类由设备插件上报的资源数量；Device Plugin 是厂商侧“向 kubelet报告设备和健康状态”的插件；DeviceManager 是 kubelet里挑选并记录具体设备的模块；checkpoint 是重启后恢复分配关系的本地文件；CDI 是描述“把哪些设备文件和环境注入容器”的一种标准格式。
+
 | Java 平台本章 | GPU Pod 对应 | 保持不变 | 新增边界 |
 |---|---|---|---|
 | scheduler 写 `spec.nodeName` | 请求 `nvidia.com/gpu` 的 Pod也先持久绑定 | API 持久交接、目标 kubelet按 Node 接单 | scheduler 更早要看 extended resource Capacity/Allocatable |
 | PodConfig 按 UID diff | GPU Pod 同样变成 ADD/UPDATE/REMOVE | snapshot、首次空 source、UID 生命周期 | 无新增 |
 | per-UID worker | 每个 GPU Pod仍有自己的 worker | 同 UID 串行、跨 UID允许并行、termination 单调 | 下游 DeviceManager 还要按设备 ID/checkpoint 保护分配 |
 | local admission | GPU Node 也要本地复核资源/设备状态 | Bind 不等于节点无条件接受 | Device Plugin 健康和已分配设备账可能变化 |
-| `SyncPod` 到 runtime 边界 | runtime 前要准备设备注入 | 可重入收敛、不做数据库式 rollback | DeviceManager Allocate、CDI/env/device mounts 进入第 15～17 课 |
+| `SyncPod` 到 runtime 边界 | runtime 前要准备设备注入 | 可重入收敛、失败时不把已完成动作全部撤销 | DeviceManager Allocate、CDI/env/device mounts 进入第 15～17 课 |
 | ConfigMap FailedMount | GPU 也可能同时依赖模型配置/PVC | volume 双控制环仍相同 | driver/CUDA/Container Toolkit 故障属于不同责任层，不能都叫“GPU 不可用” |
 
 本章迁移结论只有一句：
@@ -2479,9 +2645,9 @@ GPU 在本章只占一张表。平台 Java Pod先把 kubelet通用骨架读懂�
 - `syncLoop` 与 per-UID worker 为什么分层；
 - 同 UID 串行、普通更新合并、termination 单调；
 - `podWorkerLoop -> GetNewerThan -> SyncPod -> completeWork`；
-- `SyncPod` 可重入和 partial side effect；
+- `SyncPod` 可重入，以及“一轮只做成一部分”时怎样继续；
 - volume manager 与 Pod worker 双控制环；
-- Event 能证明什么、不能证明什么。
+- Watch 对象通知与 Kubernetes Event 的区别，以及诊断 Event 能证明什么、不能证明什么。
 
 这些能力以后会直接迁移到 DeviceManager、GPU health、checkpoint 和 runtime 注入排障。
 
@@ -2509,38 +2675,52 @@ GPU 在本章只占一张表。平台 Java Pod先把 kubelet通用骨架读懂�
 
 ## 18. 验收题：不要背函数名，要改变输入预测分支
 
-### 18.1 题目
+### 18.1 首遍验收题
 
-1. scheduler Bind 成功后进程立刻重启，为什么 `worker-05` 仍能接到 `uid-A`？答案必须包含持久对象和 snapshot 恢复。
-2. API source 第一次同步结果是 0 个 Pod，为什么还要发空 ADD？如果不发，哪类破坏性动作可能被错误允许或永久等待？
-3. `uid-A` 的 v2 正在 `SyncPod`，v3、v4 连续到达。哪些事实保证同 UID 不并发？哪些事实允许 v3 不被单独执行？
-4. `game-api-config` 在当前 wait 的第 30 秒补齐。为什么可能不需要下一轮 `SyncPod` 就进入 runtime？
-5. 同一个 ConfigMap 在 wait 已经 timeout 后才补齐。哪两个独立控制环还会继续工作？
-6. Event 只有 `reason=FailedMount`，为什么不能断言 `SyncPod` 发出了“Unable to attach or mount”那条 Event？
-7. Pod 在卷等待时收到 deletionTimestamp。termination 为什么不会被后来的普通 UPDATE 覆盖？当前 runtime 调用又为什么不保证响应同一个取消？
-8. 把本例换成 GPU Pod，哪些 kubelet骨架完全不变？新增哪本设备账？
-9. `PodScheduled=True` 后 local admission 否决，为什么 kubelet不清空 `spec.nodeName` 再让 scheduler 重选？
-10. 同名 Pod从 `uid-A` 重建成 `uid-C`，UndeltaStore 和 PodConfig 分别怎样看它？
+1. scheduler Bind 成功后立刻重启，为什么 `worker-05` 仍能接到 `uid-A`？
+2. Watch 对象通知和 Kubernetes Event 对象有什么区别？哪一个用来刷新对象状态，哪一个主要给人排障？
+3. API source 第一次同步结果是 0 个 Pod，为什么还要明确发空 ADD？
+4. `uid-A` 的 v2 正在 `SyncPod`，v3、v4 连续到达。为什么同 UID 不会同时跑三轮，v3 又可能不单独执行？
+5. `game-api-config` 在当前 wait 的第 30 秒补齐，为什么可能不需要下一轮 `SyncPod` 就进入 runtime？
+6. ConfigMap 在 wait 已超时后才补齐，哪两个独立控制环还会继续工作？
+7. 只看到 `reason=FailedMount`，为什么不能断言一定是 `SyncPod` 写的那条 Event？
+8. `uid-A` 等卷时，同节点 `uid-B` 为什么还能推进？这个结论又不能扩大成什么？
 
-### 18.2 折叠答案
+**首遍通过标准：** 不看正文，能从左到右画出 `API 持久 Pod -> kubelet snapshot -> PodConfig UID diff -> syncLoop -> podWorkers -> SyncPod -> volume/runtime`，并用大白话答对至少 6/8；其中第 1、2、4 题必须说清楚。
+
+### 18.2 二遍验收题
+
+1. Pod 在卷等待时收到 `deletionTimestamp`。termination 为什么不会被后来的普通 UPDATE 覆盖？当前 runtime 调用又为什么不保证响应同一个取消？
+2. 把本例换成 GPU Pod，哪些 kubelet骨架完全不变？新增哪本设备账？
+3. `PodScheduled=True` 后 local admission 否决，为什么 kubelet不清空 `spec.nodeName` 再让 scheduler 重选？
+4. 同名 Pod 从 `uid-A` 重建成 `uid-C`，UndeltaStore 和 PodConfig 分别怎样看它？
+
+**二遍通过标准：** 至少答对 3/4，并且答案要说出状态由谁保存、失败后谁补偿，不能只报函数名。
+
+### 18.3 折叠答案
 
 <details>
 <summary>展开参考答案</summary>
 
-1. Binding 最终把 `spec.nodeName=worker-05` 持久化到 apiserver；目标 kubelet恢复后通过 Node field selector 重建完整 Pod snapshot，所以不依赖 scheduler 保持 RPC 会话。
-2. 空 ADD 表示“完整 snapshot 确实为空”，让 `sourcesReady` 区分尚未同步与真实为空；否则 delete/housekeeping 可能误删，或者 source 永远不能标 ready。
-3. 一个 UID 只有一个 `podWorkerLoop`，sync 方法在 loop 中同步执行；channel 只通知，最新 payload 在 `pendingUpdate`，新普通 update 可覆盖旧 pending，因此 v3 不保证单独执行。
-4. volume manager 在独立 goroutine 重试；ConfigMap 可见后 mount 成功并更新 actual state，当前 wait 下一次 300ms 检查即可通过。
-5. Pod worker 经 `completeWork/workQueue` 等下一轮；volume operation/reconciler 仍按自己的退避重试。
-6. operation executor 本身也用 `FailedMount`；普通 wait timeout 是 `wait.Interrupted`，`SyncPod` 的包装 Event 分支只在非 Interrupted error 执行。
-7. deletion 先锁存 `terminatingAt/deleted/grace`，WorkType 单调转为 Terminating；但 `containerRuntime.SyncPod` 当前用 `context.WithoutCancel`，具体 runtime 动作不继承 worker cancel。
-8. API 持久交接、snapshot/UID diff、syncLoop、per-UID worker、可重入 SyncPod 都不变；新增 Device Plugin/DeviceManager 的健康、device ID、allocation/checkpoint 和 runtime 注入账。
-9. 本地 admission 是 Node 的保护门，负责拒绝和报告，不拥有调度决策回滚；控制器根据 Failed Pod维护副本，scheduler 只处理新的未绑定 Pod。
-10. UndeltaStore 按 `namespace/name` 看到该 key 的对象被替换；PodConfig 按 UID 产生旧 `uid-A` REMOVE 与新 `uid-C` ADD。
+**首遍题：**
+
+1. Binding 最终把 `spec.nodeName=worker-05` 写进 apiserver 里的持久 Pod；目标 kubelet恢复后可按 Node 重新取得完整 Pod 集合，不依赖 scheduler 一直在线。
+2. Watch 对象通知携带 API 对象变化，用来刷新客户端状态；Kubernetes Event 是组件写下的诊断对象，主要给人排障。两者都不能直接等同于“创建一次容器”的命令。
+3. 空 ADD 证明“第一次完整照片确实是空的”，让 `sourcesReady` 区分“已经同步但没有 Pod”和“还没同步到任何结果”；否则安全清理可能永久不开门，错误设计甚至会误删。
+4. 一个 UID 只有一个 `podWorkerLoop`，所以同 UID 的 `SyncPod` 串行；channel 只是门铃，真正待办在 `pendingUpdate`，v4 可以覆盖还没执行的普通 v3。
+5. volume manager 在后台独立重试；ConfigMap 可读后挂卷成功并更新实际卷状态，当前 wait 下一次检查就能通过。
+6. Pod worker 通过 `completeWork/workQueue` 等下一轮；volume reconciler 仍按自己的退避继续挂卷，二者不是同一本重试账。
+7. 后台卷操作本身也会写 `FailedMount`；本例 `MountVolume.SetUp failed` 就来自这条线。reason 相同不等于写 Event 的源码位置相同，必须看完整 message。
+8. `syncLoop` 只快速分发，每个 UID 有独立 worker，worker-A 等卷时也不长期占着共享 `podLock`，所以 worker-B 能推进；但磁盘、CRI、网络或插件仍可能有共享瓶颈，不能说所有底层动作一定并行。
+
+**二遍题：**
+
+1. deletion 先锁存 `terminatingAt/deleted/grace`，生命周期只能向终止前进；但 `containerRuntime.SyncPod` 当前使用 `context.WithoutCancel`，具体 runtime 动作不继承 worker 的取消信号。
+2. API 持久交接、snapshot/UID diff、syncLoop、per-UID worker、可重入 SyncPod 都不变；新增 Device Plugin/DeviceManager 的设备健康、具体 device ID、分配 checkpoint 和容器注入账。
+3. 本地 admission 是 Node 的保护门，负责拒绝和报告，不拥有调度决策的回滚权；上层控制器根据 Failed Pod维护副本，scheduler 只处理新的未绑定 Pod。
+4. UndeltaStore 按 `namespace/name` 看到同一个 key 的对象被替换；PodConfig 按 UID 产生旧 `uid-A` 的 REMOVE 和新 `uid-C` 的 ADD。
 
 </details>
-
-通过标准：不看正文，能在白板画出“apiserver desired -> snapshot -> UID diff -> syncLoop -> podWorkers -> SyncPod -> volume/runtime actual”，并能把上述 10 题至少 8 题解释到状态所有者和补偿动作，而不是只报函数名。
 
 ## 19. 本章 Go 语法快速索引
 
@@ -2569,6 +2749,9 @@ GPU 在本章只占一张表。平台 Java Pod先把 kubelet通用骨架读懂�
 ### 20.1 首遍断点
 
 ```text
+pkg/volume/configmap/configmap.go
+  configMapVolumeMounter.SetUpAt 的 optional / NotFound 判断
+
 pkg/registry/core/pod/storage/storage.go
   BindingREST.Create
   BindingREST.setPodNodeAndMetadata
@@ -2596,6 +2779,9 @@ pkg/kubelet/pod_workers.go
 pkg/kubelet/volumemanager/volume_manager.go
   volumeManager.Run
   volumeManager.WaitForAttachAndMount
+
+pkg/volume/util/operationexecutor/operation_generator.go
+  MountVolume.SetUp error 与 EventRecorderFunc
 ```
 
 ### 20.2 二遍断点
@@ -2619,12 +2805,6 @@ pkg/kubelet/container/cache.go
   GetNewerThan
   getIfNewerThan
   subscribe
-
-pkg/volume/configmap/configmap.go
-  configMapVolumeMounter.SetUpAt
-
-pkg/volume/util/operationexecutor/operation_generator.go
-  MountVolume.SetUp error 与 EventRecorderFunc
 ```
 
 ### 20.3 当前仓库已有测试锚点
@@ -2705,6 +2885,8 @@ reading go.work: ...\go.work:3: invalid go version '1.26.0': must match format 1
 
 把本章压回一条因果链：
 
+**读图方法：从上往下读。** 这是一条状态与责任的接力，不是一条从 scheduler 一口气调用到 containerd 的同步函数栈。
+
 ```text
 Spring Boot 滚动发布创建 game-api-new-x
   -> scheduler 选 worker-05
@@ -2714,7 +2896,7 @@ Spring Boot 滚动发布创建 game-api-new-x
   -> 首次空 snapshot 也能打开安全的 sourcesReady 门
   -> syncLoop 快速分发，不承载长事务
   -> podManager 登记 desired，allocationManager 做本地 admission
-  -> podWorkers 用 per-UID latest-value worker 守住串行和终止单调性
+  -> podWorkers 用“最新工单 + 容量 1 的门铃”守住同 UID 串行和终止单调性
   -> podWorkerLoop 等 runtime status，再调用可重入 SyncPod
   -> SyncPod 等 volume 控制环给出 mounted 或 error，而 volume manager 独立重试 ConfigMap SetUp
   -> ConfigMap 补齐后，当前 wait 或后续 SyncPod 都可继续
@@ -2725,11 +2907,13 @@ Spring Boot 滚动发布创建 game-api-new-x
 如果你只能记四句话，就记这四句：
 
 1. **Bind 是持久责任转移，不是 scheduler 对 kubelet的一次创建命令。**
-2. **Watch 负责传变化，snapshot + UID diff 才负责恢复业务生命周期。**
+2. **Watch 对象通知负责传变化，snapshot + UID diff 才负责恢复 Pod 生命周期；Kubernetes Event 只是诊断记录。**
 3. **同 UID 串行、不同 UID允许并行；普通更新取最新，termination 只能向前。**
 4. **SyncPod 是可重入收敛，不是一次性 CREATE，也不是失败就全量回滚的数据库事务。**
 
 下一课从本章唯一停止线继续：
+
+**读图方法：从上往下读。** 这是第 12 课继续追的 runtime 内部阶段，本章没有提前证明它们成功。
 
 ```text
 kl.containerRuntime.SyncPod(...)
