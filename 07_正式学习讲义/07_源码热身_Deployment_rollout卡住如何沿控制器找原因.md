@@ -327,7 +327,7 @@ controller 重启后，重新读取这些对象，就能接着算。
 |---|---|---|---|
 | 进程和网络都会失败 | 把目标与状态放进 API 对象 | controller 重启后可重新计算 | 一个对象改完，其他组件不会立刻同时看到 |
 | 对象变化通知可能重复、合并 | 每次重新看当前状态（level-based） | 不必按顺序重放所有通知 | 重复执行也不能把副本越加越多（幂等） |
-| 多个组件各自工作 | 用多个小 controller 分工 | 一个组件出问题时，其他控制逻辑不必全停 | 一个组件改完，另一个组件可能过一会儿才看到 |
+| 多个职责的反馈速度不同 | 分控制循环，并把交接状态写入 API 对象 | 某一步失败或进程重启后，可以按当前对象恢复，不必保住一条长调用栈 | 链路和排障更长；同进程退出时多个循环仍会一起暂停 |
 | 发布中途目标可能变化 | 始终读取最新 `spec` | 可以中途直接转向新版本（rollover） | 中间版本不保证完整发布 |
 | 可用性比发布速度更重要 | 在策略里写清“最多多建几个、最多少用几个” | 新版本异常时先保留旧容量 | 资源不足或新版本异常时，发布会等住 |
 
@@ -376,6 +376,24 @@ kubelet
 1. 哪些 Pod 属于旧模板，哪些属于新模板？
 2. 每个版本当前应该保留多少副本？
 
+这里的判断者是 **Deployment controller**，不是 API Server，也不是 Deployment 对象自己在运行代码：
+
+- Deployment controller 读取 Deployment 的最新模板和发布策略，找出哪个 RS 是新版本、哪些是旧版本，再计算这一轮每个 RS 的目标副本数；
+- API Server 只像共享账本一样保存 Deployment、RS、Pod 的目标和状态，不替 Deployment 计算新旧版本各留几个；
+- ReplicaSet controller 只根据某一个 RS 的 `spec.replicas` 创建或删除 Pod，不决定 v1、v2 之间怎样分配副本。
+
+还要分清 RS 上的两种数：
+
+```text
+RS.spec.replicas
+  = 这个版本希望保持几个 Pod，是目标数
+
+RS.status.replicas
+  = RS controller 随后观察和汇总到几个 Pod，是结果数
+```
+
+所以“旧 RS 缩到 0”只表示 `oldRS.spec.replicas=0`，也就是旧版本现在不再希望保留 Pod；它不等于旧 RS 对象立刻被删除。旧 RS 对象通常还会作为发布历史保留，超过 `revisionHistoryLimit` 后才按清理条件处理。
+
 Deployment 根据 Pod template 计算 `pod-template-hash`，不同模板对应不同 ReplicaSet。于是 rollout 不再是“把一批 Pod 原地改成另一个版本”，而是：
 
 ```text
@@ -387,59 +405,155 @@ Deployment 根据 Pod template 计算 `pod-template-hash`，不同模板对应�
 
 旧 RS 缩到 0 后通常不会立刻全部删除。当前源码的注释直接给出两个原因：保留历史，以及提供回滚能力；清理数量由 `revisionHistoryLimit` 约束。
 
-### 2.3 为什么不把所有逻辑塞进 Deployment controller
+### 2.3 先承认：拆开后，每一块简单了，整体协作却更复杂
 
-假设 Deployment controller 一个人包办所有事情：
+你的担心是对的。不能因为 Kubernetes 选择了分层，就只讲它的好处。
+
+**这张表逐行从左往右读，每一行只比较同一个问题。**
+
+| 看哪里 | 变简单的部分 | 变复杂的部分 |
+|---|---|---|
+| 单个 controller | 只需要理解自己负责的判断 | 必须相信下层以后会把结果写回来 |
+| 故障恢复 | 重启后可以重新读取对象，不必恢复一条旧调用栈 | 必须处理重复通知、旧 cache 和中间状态 |
+| 状态传递 | 每一步都有 Deployment、RS 或 Pod 可以观察 | 状态不会瞬间传完，排障链更长 |
+| 整个架构 | 版本编排、副本维护、节点执行分开处理 | 组件更多，并共同依赖 API Server 这本总账 |
+
+所以准确说法是：
+
+> Kubernetes 没有消灭复杂度，而是把“大程序内部缠在一起的复杂度”，换成了“多个组件通过 API 对象接力的复杂度”。
+
+从当前实现产生的效果看，它更看重“中途停下后还能恢复”，而不是让一次调用看起来最短。这是根据源码和官方控制器模型做出的设计解读，不冒充作者当年的原话。
+
+### 2.4 它为什么不是一条同步调用链，崩溃后又怎样继续
+
+前面画出的 `Deployment → RS → Pod` 是对象管理关系。真正推动发布的是多轮状态接力，不是一条从 Deployment 一直阻塞到 kubelet 的函数调用链。
+
+先分清：
 
 ```text
-既决定 v1/v2 各留几个，
-又直接创建 Pod，
-还负责节点启动、探针和流量。
+同步调用链：A 调 B 后原地等待，B 再调 C 并继续等待。
+
+Kubernetes 状态接力：A 把目标写进 API 对象后结束本轮；
+                    B 稍后观察到变化，再做自己那一步。
 ```
 
-代码看起来少了几个对象，实际上所有变化都挤进一个大控制器，任何一步出问题都更难判断是谁负责。
+下面继续使用本章数字：
 
-Kubernetes 把它拆成几个小 controller：
+```text
+old=3/3、new=1/0
+斜杠前是 RS.spec.replicas，斜杠后是 RS.status.availableReplicas。
+```
 
-- Deployment controller 只需要消费 RS 汇总出的副本事实；
-- RS controller 不需要理解 rollout 策略，只维持一个模板的数量；
-- kubelet 不需要知道这是 v1 还是 v2，只负责本节点 Pod 的实际生命周期；
-- 各层把目标和结果写到 API 对象里，不要求互相直接同步调用。
-
-大白话说：每个人管一摊，出了问题先找对应负责人。这里说的是代码职责分开，不代表每个 controller 一定是独立进程。
-
-### 2.4 API 对象是一块共享白板
-
-这条协作链可以画成两条方向相反的流：
+**这张图时间从上往下；横向各列只是不同角色。指向 API Server 的实线箭头表示一次 API 读写，这个单独请求可能等待 API Server 返回；从 API Server 发出的虚线箭头表示后面的组件稍后观察到对象变化。只有 kubelet 到容器运行时那一根箭头是节点本地调用。整张图没有一条从 Deployment 持续等待到 Pod Ready 的调用栈。**
 
 ```mermaid
-flowchart TB
-    U["用户写 Deployment.spec<br/>声明版本与发布策略"] --> D["Deployment controller<br/>计算新旧 RS 目标"]
-    D -->|"写 ReplicaSet.spec.replicas"| R["ReplicaSet controller<br/>维持单版本副本数"]
-    R -->|"创建或删除 Pod"| P["Pod"]
-    K["kubelet<br/>启动容器并执行 readiness"] -->|"写 Pod.status"| P
-    P -->|"读取 Pod.status Ready"| R
-    R -->|"写 ReplicaSet.status"| D
-    D -->|"写 Deployment.status/conditions"| U
+sequenceDiagram
+    participant U as 用户或发布平台
+    participant A as API Server
+    participant D as Deployment controller
+    participant R as ReplicaSet controller
+    participant S as scheduler
+    participant K as kubelet
+    participant C as 容器运行时
+
+    U->>A: 把 Deployment 模板从 v1 改成 v2
+    D->>A: 创建 new RS，并写 newRS.spec=1
+    Note over D: 继续完成本轮能做的判断，但不等待 Pod Ready
+    A-->>R: 稍后观察到 RS 变化
+    R->>A: 根据 spec=1 创建 Pod
+    A-->>S: 属于本 scheduler 且 nodeName 为空的 Pod 入队
+    S->>A: 写节点绑定
+    A-->>K: kubelet 观察到分给本节点的 Pod
+    K->>C: 通过 CRI 启动并对账容器
+    K->>A: PATCH Pod.status（包括 Ready 结果）
+    A-->>R: 稍后观察到 Pod 状态变化
+    R->>A: 汇总并写 RS.status.readyReplicas / availableReplicas
+    A-->>D: 稍后观察到 RS 状态变化
+    D->>A: 下一轮安全时把 oldRS.spec 从 3 改成 2
 ```
 
-这张图从上往下看时，有两种方向：
+controller 也不一定每次都直接读取 API Server。可以先这样理解：
 
 ```text
-目标往下传：Deployment → RS → Pod
-事实往上报：Pod → RS.status → Deployment.status
+API Server：总账
+informer cache：controller 手边的总账复印件
+watch：总账变化后，异步把新页送过来
 ```
 
-这些动作不是一次完成的。比如 Deployment 刚把 RS 的副本数改成 1，Pod 不会在同一行 Go 代码里立刻变成 Ready。
+所以写成功后，不能假设手边的复印件在下一行代码里已经更新。controller 要等新状态回来，再重新计算。
 
-所以 controller 必须接受下面这些正常情况：
+本课固定提交还能确认一个很重要的事实：Deployment controller 和 RS controller 通常同处一个 `kube-controller-manager` 进程，只是两套不同的控制循环，并不是两个微服务。
 
-- 重复观察同一个状态；
-- 暂时看见新旧状态混合的快照；
-- 写入之后下一次 cache 更新尚未来到；
-- 处理失败后重新入队。
+如果整个 `kube-controller-manager` 退出，两套循环都会暂停。但下面这些内容仍保存在 API Server：
 
-这正是后面“做一步就返回”的背景。
+```text
+Deployment 的 v2 目标
+oldRS.spec=3
+newRS.spec=1
+已经存在的 Pod 和 status
+```
+
+进程重启或新的 leader 接管后，可以重新读取这些对象，从当前状态继续计算。它不需要恢复一条已经消失的 Go 调用栈，也不需要记住“上次执行到第几行”。
+
+源码还会反复计算“应该等于多少”，而不是盲目执行“再加一个”。这使重复通知和重试不容易把副本越加越多。更细的 queue、expectations 和 ownerReference 机制放在第 19 节第二遍阅读。
+
+### 2.5 什么情况值得拆，什么情况说明拆过头
+
+Kubernetes 源码里没有“达到多少分就拆成 controller”的通用公式。第一次可以只问四个问题：
+
+1. **有没有一份独立、持久、可观察的交接物？** 本例有 RS 和 Pod；如果只有函数里的临时变量，就不适合硬拆成异步组件。
+2. **下一步晚几秒执行是否仍然正确？** rollout 可以等待下一轮；如果几步必须同时成功，就更适合放在一起。
+3. **双方各自负责什么，能不能一句话说清？** Deployment 决定版本份额，RS 维护某一个版本的 Pod 数量。
+4. **独立恢复或扩容的收益，是否大于状态传播和排障成本？** 如果永远一起改、一起发、同步互等，通常没有继续拆的价值。
+
+因此，Kubernetes 也没有把每个 helper 函数都做成 controller：
+
+```text
+普通计算只拆成函数；
+需要长期维护一份状态时，才可能拆成控制循环；
+必须在不同运行位置工作时，才进一步拆成独立进程或节点组件。
+```
+
+可以记成一句话：
+
+> 有独立状态、独立规则和独立重试价值，才值得拆；只是为了让代码仓库小一点，不值得拆成独立服务。
+
+### 2.6 和公司 Java 微服务很像，但不能直接照搬
+
+相同点是：两者都希望责任更清楚，也希望某部分可以独立修改和恢复。
+
+**这张表逐行从左往右读，每一行只比较同一个问题。**
+
+| Kubernetes controller 链 | 常见 Java 微服务请求链 |
+|---|---|
+| 后台不断对账，写完目标后可以结束本轮 | 用户正在等待这一次请求返回 |
+| 主要靠 API 对象和后续 watch 接力 | 经常是 A 同步调用 B，再等待 C |
+| 很多步骤允许几秒后继续 | 在线请求通常要求几十或几百毫秒内完成 |
+| 失败后按当前 `spec/status` 重算 | 调用失败后，要决定重试、返回失败，还是撤销前面已经做过的动作 |
+
+如果你们公司的请求经常变成：
+
+```text
+网关 → A → B → C → D → 数据库
+```
+
+并且出现下面情况，就可能拆得太细：
+
+- 一个需求总要同时修改很多服务；
+- 这些服务总是一起发布、一起扩容；
+- 它们仍然直接读写同一批表；
+- 某个小服务一超时，整条请求立即失败；
+- 没人能说清每个服务独立拥有的业务状态。
+
+这类系统虽然部署分开了，变化和故障却仍绑在一起，常被称为“分布式单体”。
+
+还要避免一个错误类比：Kubernetes 用 API Server 保存控制面状态，不等于业务微服务也应该随意共享数据库表。Kubernetes API 另外定义了对象版本、watch、`spec/status` 和写冲突等协作规则；普通共享数据库不会自动提供这些边界。
+
+本节最终只需要记住：
+
+> 链路变长确实是代价。Kubernetes 接受这个代价，是为了让每一步都有持久记录，进程恢复后能够重新计算；但这种理由不能自动证明任何微服务拆分都是合理的。
+
+下一节继续看：对象变化怎样只负责叫醒 controller，而不是携带“下一步必须执行什么”的命令。更完整的 Ready 反馈链在第 10 节，多轮 reconcile 在第 11 节，handler 和 queue 源码在第 19.8 节。
 
 ---
 
@@ -3423,9 +3537,13 @@ readiness 只检查 JVM 进程，必要配置和缓存尚未准备好，探针�
 
 为什么 Deployment controller 重启后不需要从一份内存中的“第几步”继续？同一个 key 重复入队又为什么不应反复加副本？
 
-### 题 5【首遍】：组件边界
+### 题 5【首遍】：组件边界与拆分代价
 
-谁创建或缩放 ReplicaSet？谁比较 `activePods` 数量与 `RS.spec.replicas`，再真正创建或删除 Pod？谁产生 Ready 信号？谁把 Pod Ready 汇总为 RS Available？
+请分三步回答：
+
+1. 谁创建或缩放 ReplicaSet？谁比较 `activePods` 与 `RS.spec.replicas`，再创建或删除 Pod？谁产生 Pod Ready，谁汇总 `RS.status.readyReplicas/availableReplicas`？
+2. `Deployment → RS → Pod` 为什么是对象和状态接力链，而不是一条从 Deployment 一直阻塞到 kubelet 的同步调用链？
+3. 一个 Java 请求同步经过六个小服务，能否只凭“Kubernetes 也是分层的”就证明这种拆分合理？至少说出两个可能拆得太细的信号。
 
 ### 题 6【二遍】：首次 Create 的细节
 
@@ -3474,13 +3592,19 @@ controller 会相信 Ready/Available 已经增加，然后可能缩健康旧副�
 
 #### 题 5
 
+第一步的责任链是：
+
 ```text
 Deployment controller：创建或缩放 RS。
-ReplicaSet controller：比较 activePods 数量与 RS.spec.replicas，再创建或删除 Pod。
+ReplicaSet controller：比较 activePods 与 RS.spec.replicas，再创建或删除 Pod。
 kubelet：执行 readiness，并写 Pod Ready。
-ReplicaSet controller：汇总 Ready 和 minReadySeconds，写 RS Available。
+ReplicaSet controller：汇总 Pod Ready 和 minReadySeconds，写 `RS.status.readyReplicas/availableReplicas`。
 Deployment controller：读取 RS status，再决定下一轮动作。
 ```
+
+第二步：Deployment 写完 RS 目标后，还会完成本轮能做的判断，然后返回；它不会原地等 Pod Ready。RS、scheduler、kubelet 分别在以后观察 API 对象并完成自己的步骤，反馈再经 Pod/RS status 回来。单次 API 请求可能同步等待 API Server，但不存在一条从 Deployment 持续阻塞到 kubelet Ready 的调用栈。Deployment 和 RS controller 在标准实现里通常仍同处 `kube-controller-manager`，所以控制循环分开也不等于两个微服务。
+
+第三步：不能照搬。若六个 Java 服务每次都同步互等、总是一起修改和发布、共享同一批表、不能独立扩容，或者一个小服务超时就让整条请求失败，说明它可能只是增加了网络链路，没有换来独立状态和独立恢复价值。
 
 #### 题 6
 
@@ -3502,7 +3626,7 @@ Condition 属于 controller 对现状的报告；自动 rollback 会修改用户
 
 不要求背函数名和行号。你能够：
 
-- 解释 Deployment、RS、Pod/kubelet 为什么分层；
+- 解释 Deployment、RS、Pod/kubelet 为什么分层，并说明这不是端到端同步 RPC，同时说出状态传播和跨组件排障的代价；
 - 不看源码推导容量上限和可用性下限；
 - 算出 `maxScaledDown`，并说明为什么要减 new RS unavailable；
 - 解释两道缩旧保护的差别；
@@ -3536,6 +3660,12 @@ Condition 属于 controller 对现状的报告；自动 rollback 会修改用户
 
 ### 本课固定提交的当前源码
 
+- [kube-controller-manager 构造 Deployment 与 RS 两套控制循环](https://github.com/kubernetes/kubernetes/blob/301946d15e67a4a2e8a5fb8292eb836acd366d78/cmd/kube-controller-manager/app/apps.go#L94-L147)
+- [controller-manager 分别运行各 controller loop](https://github.com/kubernetes/kubernetes/blob/301946d15e67a4a2e8a5fb8292eb836acd366d78/cmd/kube-controller-manager/app/controllermanager.go#L751-L779)
+- [scheduler 接收未绑定 Pod 的对象变化](https://github.com/kubernetes/kubernetes/blob/301946d15e67a4a2e8a5fb8292eb836acd366d78/pkg/scheduler/eventhandlers.go#L126-L169)
+- [scheduler 默认 Bind 写入 Pod 绑定](https://github.com/kubernetes/kubernetes/blob/301946d15e67a4a2e8a5fb8292eb836acd366d78/pkg/scheduler/framework/plugins/defaultbinder/default_binder.go#L50-L74)
+- [kubelet 只 watch 分配到本节点的 Pod](https://github.com/kubernetes/kubernetes/blob/301946d15e67a4a2e8a5fb8292eb836acd366d78/pkg/kubelet/config/apiserver.go#L35-L65)
+- [kubelet status manager 回写 Pod status](https://github.com/kubernetes/kubernetes/blob/301946d15e67a4a2e8a5fb8292eb836acd366d78/pkg/kubelet/status/status_manager.go#L1150-L1188)
 - [deployment_controller.go](https://github.com/kubernetes/kubernetes/blob/301946d15e67a4a2e8a5fb8292eb836acd366d78/pkg/controller/deployment/deployment_controller.go)
 - [rolling.go](https://github.com/kubernetes/kubernetes/blob/301946d15e67a4a2e8a5fb8292eb836acd366d78/pkg/controller/deployment/rolling.go)
 - [deployment sync.go](https://github.com/kubernetes/kubernetes/blob/301946d15e67a4a2e8a5fb8292eb836acd366d78/pkg/controller/deployment/sync.go)
