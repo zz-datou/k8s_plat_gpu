@@ -32,6 +32,16 @@
 
 当前案例覆盖多云 EKS/ACK 迁移、Argo CD 字段所有权、Ingress/MSE/ALB、404/405/413/503/504/CORS、CI BuildKit DNS、证据保全，以及 GPU Pending、CDI、Xid、vLLM 和 time-slicing 演练。它是旁路练习，不新增第 22 课，也不改变冻结主线。
 
+## 独立专题讲义（不改变冻结主线）
+
+以下专题用于把多个正式课程一次性串成完整生产因果链，不新增第 22 课，不改变 07～21 的冻结顺序，也不自动推进个人学习进度。
+
+- [Kubernetes Scheduler 全景：从生产实战到业务平台、GPU 与源码](专题/01_Kubernetes_Scheduler从生产实战到业务平台_GPU与源码全景_新手独立讲义.md)
+  - 生产问题：从一个 `Pending` Pod 出发，贯通 Filter/Score、Assume/Bind、失败重排、抢占、平台治理、GPU 设备供给、Kueue/Volcano 与生产排障。
+  - 必要前置：认识 Pod、Node、Deployment、resources request、label/affinity 和 taint/toleration；不要求先掌握 Go。
+  - 插入理由：作为面向新手的独立全景复盘，横向串联第 08～10 课 scheduler 主线和第 15～21 课 GPU 平台主线，适合值班前查阅或学完分章后回看。
+  - 验证边界：固定 Kubernetes commit `301946d15e67a4a2e8a5fb8292eb836acd366d78`；静态源码与教学审校已完成，Go 单测受本机工具链版本阻塞，真实集群/GPU 实验未执行。
+
 ## 唯一大纲与冻结规则
 
 ```text
