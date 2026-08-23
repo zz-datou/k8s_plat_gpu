@@ -1,10 +1,10 @@
 # Kubernetes Scheduler 全景：从一个 Pending Pod 到业务平台、GPU 与源码
 
-> 新手独立篇：以跨区域 AWS EKS、Argo CD 与 Kustomize 的真实平台治理为背景，写给第一次系统学习 scheduler 和 Go 源码的运维工程师
+> 新手独立篇：以公司 AWS EKS 发布容量与 Pod 调度场景为背景，写给第一次系统学习 scheduler 和 Go 源码的运维工程师
 
 这篇讲义不要求你先读本目录的第 01 篇，也不要求你已经掌握 Go。你只需要知道 Pod、Node、Deployment、request、taint 这些日常运维概念。
 
-本文的生产底座来自一次真实的平台基线治理：团队在两个 AWS 区域维护 dev、UAT、prod 三套 EKS 环境，通过 Argo CD ApplicationSet 发现各服务的 Kustomize overlay，再由 Deployment/ReplicaSet 创建 Pod。为适合公开学习，内部集群名、仓库地址、服务名和镜像版本均做了脱敏；凡是副本数、request、Node 名、GPU 数量等没有明确写成“审计事实”的数字，都是为了手算因果链而设置的教学变量。
+本次改写只把**调度场景案例**套回公司实际：香港 dev、新加坡 UAT/prod 是不同的 AWS EKS 集群，平台服务位于 `platform` namespace；已核实的副本、rollout、resource 与 topology 字段会标成“公司基线”，Node 余额、Event、优先级、PVC、GPU 和延迟数字则明确标成“教学推演”。
 
 本文只抓住一条中心因果链：
 
@@ -69,13 +69,11 @@
 
 ### 0.2 值班开场：90 秒判断问题还在不在 scheduler
 
-**运维现场小案例：** 发布平台报警 `platform/platform-aggregator-new-7f8d9` 一直 Pending。先不要重启 scheduler，也不要删 Pod。把名字换成现场值后执行：
+**运维现场小案例：** 发布平台报警 `platform/activity-new-7f8d9` 一直 Pending。先不要重启 scheduler，也不要删 Pod。把名字换成现场值后执行：
 
 ```powershell
-$KubeContext = kubectl config current-context
 $Namespace = 'platform'
-$PodName = 'platform-aggregator-new-7f8d9'
-Write-Host "context=$KubeContext namespace=$Namespace pod=$PodName"
+$PodName = 'activity-new-7f8d9'
 
 # 第一屏：对象身份、负责它的 scheduler、是否已经选定 Node、是否有 gate。
 kubectl get pod -n $Namespace $PodName `
@@ -103,38 +101,26 @@ kubectl get events -n $Namespace `
 
 这三组命令能证明 API Server **当前保存的对象状态**，不能直接证明 scheduler 内存队列位置，也不能还原已经过期、被聚合或被限流的全部 Event 历史。后文会把这些边界逐项拆开。
 
-### 0.3 先固定真实平台背景，再读六个复合案例
+### 0.3 全文反复使用的六个调度场景
 
-这份讲义采用“真实治理事实 + 脱敏教学变量”的双层写法。真实部分来自平台基线巡检和分批发布复盘；教学部分用来稳定演示 Scheduler 的 request、Filter、Score、抢占、卷和 GPU 机制。两者不能混写成“公司线上已经发生过完全相同的事故”。
+这里不再把 GitOps 同步事故当主角，只保留真正会进入 Scheduler 判断的 Pod、Node 和容量事实。每个案例先区分三类信息：
 
-截至 2026-07-17 的一次基线审计看到的环境轮廓如下。数量使用当时审计的近似规模，不作为永远不变的资产台账，也不代表 2026-08-24 未复核的当前值：
+- **公司基线：** 已从实际 EKS/Deployment 基线核实的环境、namespace、服务、replicas、rollout、resources 或 topology 字段。
+- **教学推演：** 为了手算 Filter、Score、抢占、队列而构造的 Node 余额、Event、priority、PDB、PVC、GPU 和延迟数字。
+- **隔离实验：** 当前材料没有证明公司现网已经使用的 GPU、Kueue、Volcano、自定义 scheduler 等能力。
 
-| 环境 | 实际治理轮廓 | 与 Scheduler 直接相关的发布含义 |
-|---|---|---|
-| 香港 dev（`ap-east-1`） | 约 20 个 GitOps 受管应用；Argo CD 只在低峰自动同步；live image 与临时 replicas 由发布/扩缩容流程保留 | GitOps 仍管理 rollout、探针和生命周期；同步产生的新 Pod 仍要满足瞬时 surge 容量 |
-| 新加坡 UAT（`ap-southeast-1`） | 约 20 个受管应用；全天自动同步；image 保留 live 值，replicas 由 Git 管理 | 一次提交多个服务就可能同时触发多个 ReplicaSet；真正分批应按批次提交，或先建立 UAT 专属同步护栏 |
-| 新加坡 prod（`ap-southeast-1`） | 约 20 个 live Deployment；人工发布；生产纳管按独立项目推进 | 不能照搬 dev 的忽略规则或副本数；必须逐服务确认容量、拓扑、维护窗口和回滚判据 |
-
-实际平台基线中，Deployment 采用 `maxSurge: 1`、`maxUnavailable: 0`，并配有 `terminationGracePeriodSeconds: 90`、`preStop sleep 15` 以及 startup/readiness/liveness probes。前两项直接改变滚动发布时的瞬时 Pod 数；后几项影响流量摘除和旧 Pod 退出时间，但不替代 Scheduler 的 request 账。
-
-nonprod overlay 的基线通常只显式声明 resource limits。它不等于“Scheduler 一定按零 request 调度”：API 默认、LimitRange 或其他 admission 可能补出 request；若只写 limit 且没有其他默认，Kubernetes 还可能把该 limit 用作 request。现场必须读取 API Server 最终保存的 Pod，不能把本讲义的 `1400m` 教学数字当作公司模板事实。
-
-公司环境使用托管 EKS，控制面 kube-scheduler Pod 通常不会像自管集群那样直接暴露给 `kubectl -n kube-system logs`。实际值班先看 Pod/Condition/Event、Node、PVC 与 Argo/Application 证据；只有事先启用并获授权时，再到 CloudWatch 控制面 scheduler 日志按 namespace/name 与时间窗查询。后文直接读取 scheduler Pod 的命令主要用于自管控制面或隔离实验。
-
-还发生过一次很有代表性的 dev 分批同步事件：当时的手动 Sync 命令加入了操作级参数，生成的 operation syncOptions 没有继承 Application 中完整的 `RespectIgnoreDifferences=true`，一个服务的 live image 被 Git 中的 bootstrap image 短暂覆盖。处置顺序是停止后续批次、按同步前快照恢复、核对 Application operation、执行无差异 Sync 验证，再继续发布。这个事件的根因在 GitOps 字段所有权与同步参数，不在 kube-scheduler；它之所以与本文有关，是错误 rollout 会创建新 ReplicaSet/Pod，并把问题继续传到调度和节点兑现链。
-
-后文六个复合案例都沿用这套平台语境：
-
-| 编号 | 业务背景 | 初始矛盾 | 主要用来理解 |
+| 编号 | 调度场景 | 公司事实与教学设定 | 主要用来理解 |
 |---|---|---|---|
-| A：平台聚合服务发布 | `platform/platform-aggregator`（脱敏代称），按真实 rollout 基线发布；4 副本与 `1400m CPU/1792Mi` 是教学变量 | 旧版本正常，新 surge Pod 因在线池只剩 `800m` 而 Pending | request、Filter、QueueingHint、发布容量 |
-| B：支付恢复抢占演练 | `platform/pay-recovery` 是脱敏演练对象，priority `100000`；目标池被低优先级报表 Pod 占满 | 高优先级 Pod 出现 nomination，但受害者仍在优雅退出 | PrioritySort、PostFilter、PDB、异步抢占 |
-| C：账务存储扩展 | 脱敏 StatefulSet `finance/ledger-close` 的 Pod 为 `ledger-close-0`；C1 是 WFFC 拓扑交集为空，C2 是调整供给/约束并绑定后又出现 CSI mount 失败 | 同一业务在“选 Node 前”和“已有 Node 后”属于不同责任域 | VolumeBinding、拓扑、绑定前后责任域 |
-| D：GPU 训练扩展 | `ml/train-a100` 请求 `2 GPU/8 CPU/64Gi`；GPU 节点与数字均为教学模型 | 有节点 GPU 空闲，还要同时满足型号、CPU、内存和卷 | GPU 标量、碎片、Assume、Device Plugin |
-| E：团队队列扩展 | 团队 `vision` 提交 8-Pod、每 Pod 1-GPU 的教学任务，进入 Kueue `vision-lq` | Workload 可能未 Admitted；或已准入但只有 6 个 Pod 可放 | Kueue 准入、Pod 调度、gang/Volcano 边界 |
-| F：多服务发布洪峰 | 以 UAT 全天自动同步的真实发布形态为底座，拆成三个不同教学时间窗：F1 activeQ 洪峰、F2 自定义 Score 变慢、F3 Bind/API 抖动 | scheduler Pod Running，但创建到绑定延迟仍可能升高；各卡数字不是同一张快照 | GitOps 批次、队列、扩展点延迟、SLO |
+| A：HK dev 单服务 rollout | 实际首批服务 `platform/activity`；公司 nonprod 基线是 `replicas=1`、`maxSurge=1`、`maxUnavailable=0`、应用 limits `1 CPU/4Gi` | 本文教学快照假设 API 最终整 Pod request 为 `1 CPU/4Gi`；只有一台 Node 同时满足池标签与污点，但只余 `800m CPU/3Gi`，新 surge Pod Pending | request、Filter、QueueingHint、发布瞬时容量 |
+| B：prod 关键服务抢占演练 | 公司 prod 基线是单 Pod `requests=limits=2 CPU/4Gi`，并按 hostname 做 `maxSkew=1/DoNotSchedule` 分散 | `player-recovery`、priority `100000`、受害 Pod/PDB/nomination 均为教学设定；priority 不能绕过资源和拓扑硬约束 | PrioritySort、PostFilter、PDB、异步抢占 |
+| C：AWS EKS 卷拓扑实验 | `scheduler-lab/storage-wffc-0` 使用 `WaitForFirstConsumer` PVC；不借用真实平台服务名暗示现网一定使用该卷 | C1 是选点前 AZ/卷拓扑交集为空；C2 是绑定后出现 `FailedMount` | VolumeBinding、拓扑、绑定前后责任域 |
+| D：GPU 调度实验 | `ml-lab/train-a100` 请求 `2 GPU/8 CPU/64Gi`；卡型、节点和余量都是实验数据 | 当前公司 EKS 是否存在 GPU Node、Device Plugin 或 GPU scheduler 未核实 | GPU 标量、碎片、Assume、Device Plugin |
+| E：批任务队列实验 | `batch-lab` 中 8-Pod、每 Pod 1-GPU 的 Kueue/Volcano 教学任务 | 当前公司集群是否安装 Kueue/Volcano 未核实；准入、6 个可放等数字均为实验设定 | Workload 准入、逐 Pod 调度、gang 边界 |
+| F：SG UAT 多服务发布峰值 | 审计时 UAT 有 18 个受管应用，其中 17 个尚待补齐基线；只有 PodTemplate 真正变化的 Deployment 才会 rollout | 选 6 个实际服务做还原性推演：若都为单副本、最终 request 为 `1 CPU/4Gi`，第一波最多新增 6 个 surge Pod，即 `6 CPU/24Gi` 调度合同 | activeQ、NodeResourcesFit、发布批次与调度吞吐 |
 
-阅读案例卡时始终先问：“现在是哪一个环境、哪个 Git revision、哪个 Application、哪个 Pod UID、哪个时刻、哪一层还没有完成？”同样写着 `Pending`，案例 A 可能卡在 Filter，案例 C 可能卡在卷协同，案例 E 可能连 Pod 都还没创建，案例 D 也可能已经绑定后才在设备兑现阶段失败。GPU、Kueue、Volcano 和自定义 scheduler 章节是在真实平台治理约束上的教学扩展，不代表当前公司生产环境已经部署了同样组件。
+A 和 F 是按公司真实服务与基线做的调度推演，不等于现场已经出现过完全相同的 FailedScheduling；B 只复用真实 prod 资源/拓扑合同；C、D、E 是隔离教学实验。后文看到具体 Node 名、余额、Event 文案或延迟时，都应按这个证据等级理解。
+
+公司使用托管 EKS。实际值班先看当前 kube-context、Pod/Condition/Event、Node 与 PVC；只有控制面 scheduler 日志已经启用且有权限时，才到 CloudWatch 按时间窗查询。后文直接读取 `kube-system` 中 kube-scheduler Pod 的命令只适用于自管控制面或隔离实验。
 ---
 
 ## 1. 当前源码基线、事实边界与阅读约定
@@ -183,43 +169,21 @@ nonprod overlay 的基线通常只显式声明 resource limits。它不等于“
 - 教学伪代码一律使用 `text`，不伪装成真实 Go。
 - 每段真实源码后都按“输入、判断、动作、结果”收束，并只补当前真正需要的 Go 语法。
 
-### 1.4 原技术基线与本次背景适配分别做了哪些验证
 
-下面第一组是背景适配前的完整技术审校记录，不能自动视为本次 GitHub 直接编辑后重新执行的结果：
+### 1.4 本文验证边界
 
-```text
-通过：固定 commit 的静态源码逐函数核对
-通过：核心调度、GPU/DRA、平台运维三路独立只读审校并回修
-通过：validate_lesson.py --self-test
-通过：validate_lesson.py --require-java --require-gpu --strict
-结果：errors=0，warnings=0
-通过：第 2～23 节逐小节案例覆盖检查；共 128 张案例卡，3.7 本身为命令案例
-通过：65 个 PowerShell 代码块静态语法解析；parse failures=0
+原讲义在固定源码快照上曾完成静态源码核对、案例覆盖检查、讲义校验脚本和 PowerShell 代码块解析；这些结果属于原讲义基线，不应被写成本次公司场景改写重新执行后的结果。
 
-未执行：Kubernetes Go 单元测试
-原因：本机 go version 为 1.19.4，而当前 go.work 要求 go 1.26.0；
-      Go 1.19 在读取 go.work 时即因版本格式和 godebug 指令退出，测试尚未开始编译。
-
-未执行：真实集群 apply、抢占、GPU 或 DRA 实验
-原因：本文编写过程没有获得一套明确隔离的测试集群与设备环境。
-```
-
-本次 2026-08-24 背景适配遵守“不落本地”的要求，只在内存中处理远端 blob，并做了以下提交前检查：
+本次只通过 GitHub Contents API 直接修改讲义，没有克隆仓库或在本地运行校验器，因此本次能确认的是：
 
 ```text
-通过：第 0～27 节主章节均存在且顺序完整
-通过：128 个“运维现场小案例”标题保持不变
-通过：183 对 Markdown fenced code block 成对闭合
-通过：66 个 PowerShell fenced block 均仍有完整开闭边界
-通过：旧 A 服务名与旧生产 namespace 命令入口已清理；ml-prod GPU 教学 namespace 保留
-通过：未写入真实集群 context、内部仓库地址、Secret、ConfigMap 数据或真实镜像 tag
-通过：A/B nomination、C1/C2 卷阶段、F 的 Score/profile 表述做了一致性回查
-
-未重新执行：validate_lesson.py、65 个旧 PowerShell 块的原静态解析器、Kubernetes Go 单元测试、真实集群实验
-原因：本次按要求不 checkout、不落本地；新增的第 23.9 PowerShell 块仅完成结构与人工语义检查。
+已核对：章节编号、案例卡数量、代码围栏闭合和关键场景名称
+已核对：公司事实与教学推演的标识边界
+未执行：validate_lesson.py、PowerShell parser、Kubernetes Go 单元测试
+未执行：真实 EKS apply、抢占、卷、GPU、Kueue 或 Volcano 实验
 ```
 
-因此，背景适配前的 `errors=0, warnings=0` 是历史技术基线，不应冒充本次已重跑。无论哪个版本，“讲义覆盖并通过静态审校”都不等于“读者已完成实验”，也不等于当前开发快照已在本机通过全部测试。第 22 节必须在隔离环境另行执行并保存证据。
+读者若要把某个案例变成现场结论，必须重新采集目标集群的最终 Pod、Node、Event、PVC、Deployment 和控制面日志证据。讲义中的教学 Node 余额、Event 文案与延迟数字不能反向当作公司事故记录。
 
 ---
 
@@ -247,7 +211,7 @@ Pod.spec.schedulerName 能匹配当前 scheduler 的某个 profile
 **背景：** 案例 A 的一个测试副本把 `schedulerName` 误写成 `defaut-scheduler`。Node 很空，但两分钟内没有任何负责它的 scheduler。
 
 ```powershell
-$Namespace = 'platform'; $PodName = 'platform-aggregator-typo'
+$Namespace = 'platform'; $PodName = 'activity-typo'
 kubectl get pod -n $Namespace $PodName `
   -o custom-columns='NAME:.metadata.name,SCHEDULER:.spec.schedulerName,NODE:.spec.nodeName,GATES:.spec.schedulingGates[*].name'
 
@@ -273,7 +237,7 @@ scheduler 不是找“宇宙中绝对最优”的 Node。它做的是：
 **背景：** 案例 A 中 `worker-a` CPU 不足，`worker-b` label 不匹配，`worker-c` 有未容忍污点。
 
 ```powershell
-$Namespace = 'platform'; $PodName = 'platform-aggregator-new-7f8d9'
+$Namespace = 'platform'; $PodName = 'activity-new-7f8d9'
 kubectl get pod -n $Namespace $PodName -o yaml
 kubectl get nodes `
   -o custom-columns='NAME:.metadata.name,UNSCHEDULABLE:.spec.unschedulable,CPU:.status.allocatable.cpu,MEMORY:.status.allocatable.memory,POOL:.metadata.labels.workload-tier,TAINTS:.spec.taints[*].key'
@@ -333,7 +297,7 @@ flowchart LR
 **背景：** 案例 C 已经有 `spec.nodeName=worker-a`，但 Event 是 `FailedMount`。值班同学却先重启了 scheduler。
 
 ```powershell
-$Namespace = 'finance'; $PodName = 'ledger-close-0'
+$Namespace = 'scheduler-lab'; $PodName = 'storage-wffc-0'
 kubectl get pod -n $Namespace $PodName `
   -o custom-columns='NAME:.metadata.name,PHASE:.status.phase,NODE:.spec.nodeName,SCHEDULED:.status.conditions[?(@.type=="PodScheduled")].status'
 kubectl get events -n $Namespace `
@@ -356,10 +320,10 @@ kubectl get events -n $Namespace `
 
 #### 运维现场小案例：有 nomination，为什么还是不能宣告成功
 
-**背景：** 案例 B 的 `pay-recovery` 已被提名到 `worker-a`，低优先级报表 Pod 仍在 30 秒优雅退出。
+**背景：** 案例 B 的 `player-recovery` 已被提名到 `worker-a`，低优先级报表 Pod 仍在 90 秒优雅退出；`preStop sleep 15` 包含在该 90 秒内。
 
 ```powershell
-$Namespace = 'platform'; $PodName = 'pay-recovery'
+$Namespace = 'platform'; $PodName = 'player-recovery'
 kubectl get pod -n $Namespace $PodName `
   -o jsonpath='uid={.metadata.uid}{" nominated="}{.status.nominatedNodeName}{" nodeName="}{.spec.nodeName}{" scheduled="}{range .status.conditions[?(@.type=="PodScheduled")]}{.status}{"/"}{.reason}{end}{"\n"}'
 kubectl get pods -n $Namespace `
@@ -370,103 +334,97 @@ kubectl get pods -n $Namespace `
 
 ---
 
-## 3. 先不敲命令：手算一次平台服务滚动发布
 
-这一节把真实平台发布链作为事实底座：Kustomize overlay 经 Argo CD 进入 Deployment，基线使用 `maxSurge: 1`、`maxUnavailable: 0`，新 Pod 在 readiness 通过后才接流量。为了让读者能逐步手算，4 个副本、sidecar、request 和三台 Node 仍是固定教学变量，不是从公司生产清单抄出的资源规格。
+## 3. 先不敲命令：手算一次 HK dev 单副本滚动发布
 
-还要先守住一条边界：如果 Argo Sync 先改错了 image、replicas 或 Pod template，根因在 GitOps desired/live 所有权；只有新 Pod 已创建且 `spec.nodeName` 仍为空时，才进入本节的 Scheduler 主线。
+这一节只围绕公司实际的 `platform/activity` 发布合同展开。Deployment 字段属于公司基线；Node 名、余额和 FailedScheduling 输出是为了训练 Scheduler 手算而构造的同尺度快照，不冒充已经发生过的生产事故。
 
-### 3.1 业务背景
+### 3.1 公司基线与本次教学快照
 
-- 环境：以香港 dev 的发布方式为底座，但对象名和资源数字已脱敏
+**公司基线：**
+
+- 环境：香港 dev EKS，region `ap-east-1`
 - namespace：`platform`
-- Deployment：`platform-aggregator`
-- 交付入口：`apps/<service>/aws/overlays/<region>/<env>` 经 Kustomize 渲染，由 Argo CD ApplicationSet/Application 协调到集群
-- 字段所有权：本例假定 image/replicas 由发布流程保留，rollout、探针和生命周期由 GitOps 管理
-- 应用：Spring Boot；启动阶段有类加载、JIT 和缓存预热，readiness 通过后才接流量
-- 滚动策略：`maxSurge: 1`、`maxUnavailable: 0`
-- 当前已有 4 个旧 Pod；发布新版本时多创建第 5 个 surge Pod
-- 新 Pod 包含业务容器和 service-mesh sidecar
-- 最终保存到 API Server 的 request：
+- Deployment：`activity`；它是实际 HK dev 首批 canary 服务之一
+- `replicas: 1`
+- `maxSurge: 1`、`maxUnavailable: 0`
+- 应用容器只显式配置 limits：`1 CPU / 4Gi`
+- `terminationGracePeriodSeconds: 90`、`preStop sleep 15`，并有 startup/readiness/liveness probes
 
-| 容器 | CPU request | memory request |
-|---|---:|---:|
-| `platform-aggregator` | `1200m` | `1536Mi` |
-| `mesh-proxy` | `200m` | `256Mi` |
-| **整个 Pod 常驻阶段合计** | **`1400m`** | **`1792Mi`** |
+因此一次 PodTemplate 更新最多同时存在 1 个旧 Pod 和 1 个新 surge Pod。若新 Pod 还没调度成功，旧 Pod 必须继续 Available；`preStop` 和 90 秒 grace 还没有开始，不能把首次 Pending 归因于优雅终止。
 
-这里故意使用 request，而不是 Java 进程此刻的 CPU 使用率。scheduler 做的是容量承诺：只要 Pod 还被视为占用该 Node，这份 request 就在账上。readiness 为 False 也不会自动把 request 从 scheduler 账本里减掉。
+**本次教学快照：** 假设没有 LimitRange、额外 admission 默认、sidecar、init container 或 Pod overhead，API Server 最终保存的 activity Pod request 由 limit 默认得到 `1 CPU / 4Gi`。现场若不同，必须以最终 Pod 对象为准。
 
-与真实 nonprod overlay 的区别也要说清：平台基线通常只显式给 limits；最终 request 可能来自 API 默认、LimitRange 或其他 admission。本例直接把最终 Pod 写成 `1400m`，只是为了固定手算输入。现场必须以 `kubectl get pod ... -o yaml/jsonpath` 看到的最终对象为准。
+| 容器 | CPU request | memory request | 证据等级 |
+|---|---:|---:|---|
+| `activity` | `1000m` | `4Gi` | 教学快照；真实现场需回读 API |
+| **整个 Pod 合计** | **`1000m`** | **`4Gi`** | 本例假设无其他容器与 overhead |
 
-Pod 的相关约束可以简化成：
+用于手算的最终 Pod 片段：
 
 ```yaml
 apiVersion: v1
 kind: Pod
 metadata:
-  name: platform-aggregator-new-7f8d9
+  name: activity-new-7f8d9
   namespace: platform
   labels:
-    app: platform-aggregator
+    app: activity
 spec:
   schedulerName: default-scheduler
   nodeSelector:
     workload-tier: online
   containers:
-    - name: platform-aggregator
-      image: registry.example.invalid/platform-aggregator:v2
+    - name: activity
+      image: registry.example.invalid/activity:v2
       resources:
         requests:
-          cpu: 1200m
-          memory: 1536Mi
-    - name: mesh-proxy
-      image: registry.example.invalid/mesh-proxy:v1
-      resources:
-        requests:
-          cpu: 200m
-          memory: 256Mi
+          cpu: 1
+          memory: 4Gi
+        limits:
+          cpu: 1
+          memory: 4Gi
 ```
 
-镜像地址是教学占位值，不需要执行。
+镜像地址、Node 名、池标签和下面的容量数字都是教学占位；真实基线只提供环境、服务与 Deployment 合同。
 
-#### 运维现场小案例：业务容器写的是 1200m，scheduler 为什么按整 Pod 的 1400m 算
+#### 运维现场小案例：基线只写 limits，现场必须回读最终 Pod request
 
-- **现象：** `platform-aggregator` 发布后 Pending，研发只拿业务容器的 request 解释容量，漏掉了 mesh sidecar。
-- **只读命令：** `kubectl get pod -n platform platform-aggregator-new-7f8d9 -o jsonpath='{range .spec.containers[*]}{.name}{" cpu="}{.resources.requests.cpu}{" mem="}{.resources.requests.memory}{"\n"}{end}{"overhead="}{.spec.overhead}{"\n"}'`
-- **关键输出（教学示意）：** `platform-aggregator cpu=1200m`、`mesh-proxy cpu=200m`，常驻容器 CPU 合计 `1400m`。
-- **能证明：** API Server 最终保存的 Pod 合同包含哪些常驻容器及 request；这是 scheduler 实际读取的对象，而不是发布前的 values 文件。
-- **不能证明：** 仅凭这条命令不能证明 Pod 已进入调度队列，也不能用 request 推出 Java 进程此刻真的用了多少 CPU。
-- **源码映射：** `pkg/scheduler/framework/plugins/noderesources/fit.go` 的 `computePodResourceRequest`、`fitsRequest`。
+- **现象：** nonprod 清单里应用容器只显式写了 `limits: 1 CPU/4Gi`，值班人直接拿模板判断 Scheduler 账。
+- **只读命令：** `kubectl get deploy -n platform activity -o jsonpath='{range .spec.template.spec.containers[*]}template/{.name}{" req="}{.resources.requests}{" limit="}{.resources.limits}{"\n"}{end}'`；`kubectl get pod -n platform -l app=activity -o jsonpath='{range .items[0].spec.containers[*]}pod/{.name}{" req="}{.resources.requests}{" limit="}{.resources.limits}{"\n"}{end}{"overhead="}{.items[0].spec.overhead}{"\n"}'`
+- **关键输出（教学预期）：** 在没有其他默认、注入或 overhead 的本例中，最终应用容器 request 为 `1 CPU/4Gi`；若现场输出不同，后续所有手算立即以现场最终 Pod 为准。
+- **能证明：** Deployment 模板与 API 最终 Pod 合同是否一致，也能发现 admission 注入的资源项。
+- **不能证明：** 这组只读输出不能说明是谁修改了对象，也不能把讲义假设当成当前集群事实。
+- **源码映射：** Scheduler 消费已持久化的 Pod；`resource.PodRequests` 汇总最终 Pod request。
 
-### 3.2 三台 Node 的当前调度账
+### 3.2 三台 Node 的教学调度账
 
-只列与本案有关的事实：
+只列与本案有关的事实；内存也一起对账，避免只算 CPU：
 
-| Node | `workload-tier` | taint | CPU Allocatable | 已计入 Requested | CPU 余额 | 对本 Pod 的结论 |
-|---|---|---|---:|---:|---:|---|
-| `worker-a` | `online` | 无 | `4000m` | `3200m` | `800m` | 资源不足 |
-| `worker-b` | `batch` | 无 | `8000m` | `5000m` | `3000m` | label 不匹配 |
-| `worker-c` | `online` | `dedicated=gpu:NoSchedule` | `8000m` | `5500m` | `2500m` | Pod 没有对应 toleration |
+| Node | `workload-tier` | taint | CPU Allocatable / Requested / 余额 | memory Allocatable / Requested / 余额 | 对本 Pod 的结论 |
+|---|---|---|---|---|---|
+| `worker-a` | `online` | 无 | `4000m / 3200m / 800m` | `16Gi / 13Gi / 3Gi` | CPU、memory 都不足 |
+| `worker-b` | `batch` | 无 | `8000m / 5000m / 3000m` | `32Gi / 20Gi / 12Gi` | label 不匹配 |
+| `worker-c` | `online` | `dedicated=gpu:NoSchedule` | `8000m / 5500m / 2500m` | `64Gi / 30Gi / 34Gi` | Pod 没有对应 toleration |
 
-把本 Pod 的 `1400m` 代进去：
+把本 Pod 的 `1000m / 4Gi` 代进去：
 
 ```text
-worker-a: 1400m > 4000m - 3200m = 800m     -> NodeResourcesFit 拒绝
-worker-b: CPU 足够，但 workload-tier != online -> NodeAffinity 拒绝
-worker-c: CPU 足够、label 匹配，但不容忍 NoSchedule taint -> TaintToleration 拒绝
+worker-a: 1000m > 800m，且 4Gi > 3Gi             -> NodeResourcesFit 拒绝
+worker-b: CPU/内存足够，但 workload-tier != online -> NodeAffinity 拒绝
+worker-c: 资源和 label 通过，但不容忍 NoSchedule  -> TaintToleration 拒绝
 ```
 
-结果是 0 个可行 Node。正确动作不是“挑一个差不多的”，而是保持 Pod 未绑定并记录失败原因。
+结果是 0 个可行 Node。FailedScheduling 里的原因计数可能重叠、文案也随版本变化；上表是为了手算集合交集，不冒充真实 Event 原文。
 
 #### 运维现场小案例：把三台 Node 的“余额、标签、污点”放到同一张证据桌上
 
-- **现象：** 值班群说“集群总共还有 6 核”，但 `platform-aggregator` 仍是 Pending。
-- **只读命令：** `kubectl get nodes worker-a worker-b worker-c -o custom-columns='NAME:.metadata.name,CPU:.status.allocatable.cpu,TIER:.metadata.labels.workload-tier,UNSCHED:.spec.unschedulable,TAINTS:.spec.taints'`; 再逐台执行 `kubectl describe node <node>` 看 `Allocated resources`。
-- **关键输出（教学示意）：** `worker-a` 只余 `800m`；`worker-b` 是 `batch`；`worker-c` 有 `dedicated=gpu:NoSchedule`。
-- **能证明：** Node API 的 allocatable、标签、污点，以及 `describe` 汇总的已绑定 Pod request，足以解释三个不同的硬拒绝方向。
-- **不能证明：** `describe node` 看不到刚被 scheduler Assume、尚未 Bind 的瞬时占账，也不能证明三个拒绝原因按什么顺序执行。
-- **源码映射：** `pkg/scheduler/framework/types.go` 的 `NodeInfo.Requested`，以及 `nodeaffinity`、`tainttoleration`、`noderesources` 三类 Filter 插件。
+- **现象：** 值班群说“集群总 CPU 还有很多”，但 `activity` 的新 surge Pod 仍是 Pending。
+- **只读命令：** `kubectl get nodes worker-a worker-b worker-c -o custom-columns='NAME:.metadata.name,CPU:.status.allocatable.cpu,MEM:.status.allocatable.memory,TIER:.metadata.labels.workload-tier,UNSCHED:.spec.unschedulable,TAINTS:.spec.taints'`; 再逐台执行 `kubectl describe node <node>` 看 `Allocated resources`。
+- **关键输出（教学示意）：** `worker-a` 只余 `800m/3Gi`；`worker-b` 是 `batch`；`worker-c` 有 `dedicated=gpu:NoSchedule`。
+- **能证明：** Node allocatable、标签、污点和已绑定 Pod request 支持三个硬拒绝方向。
+- **不能证明：** `describe node` 看不到刚被 scheduler Assume、尚未 Bind 的瞬时占账，也不能证明原因计数互斥。
+- **源码映射：** `NodeInfo.Requested`，以及 `nodeaffinity`、`tainttoleration`、`noderesources` Filter。
 
 ### 3.3 先预测，再往下读
 
@@ -482,8 +440,8 @@ worker-c: CPU 足够、label 匹配，但不容忍 NoSchedule taint -> TaintTole
 
 #### 运维现场小案例：先写预测，再用 FailedScheduling 对答案
 
-- **现象：** `platform-aggregator` 没有 `nodeName`，大家分别猜“CPU”“污点”“标签”，但没有人先保留原始证据。
-- **只读命令：** `kubectl describe pod -n platform platform-aggregator-new-7f8d9`; `kubectl get events -n platform --field-selector involvedObject.name=platform-aggregator-new-7f8d9 --sort-by='.metadata.creationTimestamp'`
+- **现象：** `activity` 没有 `nodeName`，大家分别猜“CPU”“污点”“标签”，但没有人先保留原始证据。
+- **只读命令：** `kubectl describe pod -n platform activity-new-7f8d9`; `kubectl get events -n platform --field-selector involvedObject.name=activity-new-7f8d9 --sort-by='.metadata.creationTimestamp'`
 - **关键输出（教学示意）：** `0/3 nodes are available: 1 Insufficient cpu, 1 didn't match Pod's node affinity/selector, 1 had untolerated taint ...`。
 - **能证明：** 本轮（或被聚合的若干轮）没有可行 Node，并给出 scheduler 对候选节点的拒绝摘要，可用来校正手算。
 - **不能证明：** 原因计数不保证互斥，Event 还可能聚合、限流；它不能证明插件调用顺序，也不能证明实时 CPU 使用率。
@@ -491,37 +449,35 @@ worker-c: CPU 足够、label 匹配，但不容忍 NoSchedule taint -> TaintTole
 
 ### 3.4 唯一改变题目的事实
 
-一分钟后，`worker-a` 上一个无关的批处理 Pod 完成并被删除，它原来占 `1000m` request。
+一分钟后，`worker-a` 上一个无关 Job Pod 完成并被删除；它原来请求 `500m CPU / 2Gi memory`。
 
 ```text
-删除前：worker-a Requested = 3200m，余额 = 800m
-删除后：worker-a Requested = 2200m，余额 = 1800m
-本 Pod：request = 1400m
-结论：1400m <= 1800m，资源条件现在通过
+删除前：worker-a Requested = 3200m / 13Gi，余额 = 800m / 3Gi
+删除后：worker-a Requested = 2700m / 11Gi，余额 = 1300m / 5Gi
+本 Pod：request = 1000m / 4Gi
+结论：CPU 与 memory 资源条件现在都通过
 ```
 
 因为 `worker-a` 的 label 匹配且没有拒绝本 Pod 的 taint，它成为唯一可行 Node。当前源码在 `len(feasibleNodes) == 1` 时直接使用这个 Node，不需要再运行 Score 来比较多个候选。
 
 #### 运维现场小案例：资源释放后，观察“值得重试”而不是宣称“必定成功”
 
-- **现象：** `worker-a` 上的批处理 Pod 结束后，`platform-aggregator` 随后被绑定到该节点。
-- **只读命令：** `kubectl get pod -n platform platform-aggregator-new-7f8d9 -w -o custom-columns='CREATED:.metadata.creationTimestamp,NAME:.metadata.name,NODE:.spec.nodeName,REASON:.status.conditions[?(@.type=="PodScheduled")].reason'`; 另窗查看 `kubectl get events -n platform --sort-by='.metadata.creationTimestamp' | Select-Object -Last 30`。这里的 `CREATED` 是 Pod 创建时间，不是每次 watch 更新发生的时间；精确时间线要结合 Event、带时间戳的组件日志或另行采样。
-- **关键输出（教学示意）：** 先看到 `NODE=<none>`，资源释放事件之后变为 `NODE=worker-a`、`PodScheduled=True`。
-- **能证明：** API 中最终发生了绑定，并能建立“资源事实变化在前、成功绑定在后”的时间线。
-- **不能证明：** 时间相邻不等于已证明某个 QueueingHint 必然触发；即使被唤醒，释放量不足时下一轮仍会失败。
-- **源码映射：** `pkg/scheduler/backend/queue/scheduling_queue.go` 的事件重排逻辑，以及 `pkg/scheduler/schedule_one.go` 中 `len(feasibleNodes) == 1` 的分支。
+- **现象：** `worker-a` 上的 Job Pod 结束后，`activity` 随后被绑定到该节点。
+- **只读命令：** `kubectl get pod -n platform activity-new-7f8d9 -w -o custom-columns='CREATED:.metadata.creationTimestamp,NAME:.metadata.name,NODE:.spec.nodeName,REASON:.status.conditions[?(@.type=="PodScheduled")].reason'`; 另窗查看 `kubectl get events -n platform --sort-by='.metadata.creationTimestamp' | Select-Object -Last 30`。这里的 `CREATED` 是 Pod 创建时间，不是每次 watch 更新时间。
+- **关键输出（教学示意）：** 先看到 `NODE=<none>`，资源释放之后变为 `NODE=worker-a`、`PodScheduled=True`。
+- **能证明：** API 中最终发生绑定，并能建立“资源事实变化在前、成功绑定在后”的时间线。
+- **不能证明：** 时间相邻不等于已证明某个 QueueingHint 必然触发；即使被唤醒，也必须重新验证全部硬条件。
+- **源码映射：** 调度队列的事件重排逻辑，以及 `len(feasibleNodes) == 1` 分支。
 
 ### 3.5 过滤矩阵图
 
-这张图从上往下读。菱形是必须回答“是/否”的硬条件；任何一项失败都会淘汰当前 Node。Score 只会接收全部硬条件都通过的 Node。
-
 ```mermaid
 flowchart TD
-    P["platform-aggregator-new<br/>CPU request=1400m"] --> A{"Node label 匹配吗？"}
+    P["activity-new<br/>request=1 CPU / 4Gi"] --> A{"Node label 匹配吗？"}
     A -- "否：worker-b" --> X1["淘汰"]
     A -- "是" --> B{"NoSchedule taint 被容忍吗？"}
     B -- "否：worker-c" --> X2["淘汰"]
-    B -- "是" --> C{"Allocatable - Requested >= 1400m？"}
+    B -- "是" --> C{"CPU >= 1 且 memory >= 4Gi？"}
     C -- "否：释放前的 worker-a" --> X3["淘汰"]
     C -- "是：释放后的 worker-a" --> F["Feasible Node"]
     F --> S["若有多个候选才进入 Score 比较"]
@@ -529,34 +485,33 @@ flowchart TD
 
 #### 运维现场小案例：用一张只读矩阵防止“看见空闲节点就拍脑袋”
 
-- **现象：** 三台 Node 各自看起来都有优点，但没有一台同时满足全部合同。
-- **只读命令：** `kubectl get pod -n platform platform-aggregator-new-7f8d9 -o yaml`; `kubectl get nodes worker-a worker-b worker-c -o custom-columns='NAME:.metadata.name,TIER:.metadata.labels.workload-tier,CPU:.status.allocatable.cpu,TAINTS:.spec.taints'`
-- **关键输出（教学示意）：** Pod 要求 `workload-tier=online`、无 GPU taint toleration、CPU `1400m`；每台 Node 分别在资源、标签或污点一列失败。
-- **能证明：** Pod 声明与 Node 事实可手工做硬条件交集，帮助复核为何可行集合为零。
-- **不能证明：** 这张静态矩阵没有 scheduler cache 中 assumed Pod，也不能替代卷、端口、拓扑等其他 Filter 的检查。
-- **源码映射：** `pkg/scheduler/schedule_one.go` 的 `findNodesThatPassFilters`，它对候选 Node 调 `RunFilterPluginsWithNominatedPods`。
+- **现象：** 三台 Node 各自看起来都有余量，但没有一台同时满足整份合同。
+- **只读命令：** `kubectl get pod -n platform activity-new-7f8d9 -o yaml`; `kubectl get nodes worker-a worker-b worker-c -o custom-columns='NAME:.metadata.name,TIER:.metadata.labels.workload-tier,CPU:.status.allocatable.cpu,MEM:.status.allocatable.memory,TAINTS:.spec.taints'`
+- **关键输出（教学示意）：** Pod 要求 `workload-tier=online`、不容忍 GPU taint、request `1 CPU/4Gi`；每台 Node 分别在资源、标签或污点列失败。
+- **能证明：** Pod 声明与 Node 事实可以手工做硬条件交集。
+- **不能证明：** 静态矩阵没有 scheduler cache 中 assumed Pod，也未覆盖卷、端口和 topology 等其他 Filter。
+- **源码映射：** `findNodesThatPassFilters` 对候选 Node 运行 Filter 插件。
 
 ### 3.6 这个现场真正暴露的不是“scheduler 坏了”
 
 它暴露的是发布容量与平台策略共同作用：
 
-- `maxSurge: 1` 允许临时多出一个 Pod，但不凭空创造 Node 容量；
-- `maxUnavailable: 0` 保护业务可用性，也使平台更需要预留发布余量；
-- nodeSelector 把在线业务限制到特定节点池；
-- GPU 节点 taint 防止普通业务误占昂贵资源；
-- request 决定 scheduler 的容量承诺；
-- readiness 决定业务能否接流量，但不替代 scheduler request 账。
+- `maxSurge: 1` 允许单副本服务在发布时临时出现第二个 Pod，但不凭空创造 Node 容量；
+- `maxUnavailable: 0` 要求新 Pod 可用前保留旧 Pod，因此新 Pod Pending 时旧 Pod不会先被删除；
+- nodeSelector、taint/toleration 与资源 request 共同决定可行 Node 交集；
+- readiness 决定新 Pod 何时可接流量，但不替代 scheduler 的 request 账；
+- `preStop sleep 15` 位于 `terminationGracePeriodSeconds: 90` 内部，只会影响开始删除后的退出尾部，不是新 Pod 首次 Pending 的原因。
 
-正确的平台问题不是“怎么让 scheduler 强行选一台”，而是：发布冗余、节点池规模、request 基线和隔离策略是不是一起设计过。
+正确的平台问题不是“怎么让 scheduler 强行选一台”，而是：单副本发布的第二份瞬时容量、节点池余量、request 基线和隔离策略是否一起设计过。
 
-#### 运维现场小案例：一次 Pending 同时暴露发布策略和节点池容量
+#### 运维现场小案例：单副本服务为什么发布时会出现第二只 Pod
 
-- **现象：** 平时 4 副本稳定，一到 `maxSurge: 1` 发布就出现第 5 个 Pod Pending，回滚后又“恢复正常”。
-- **只读命令：** `kubectl get deploy -n platform platform-aggregator -o jsonpath='replicas={.spec.replicas}{" surge="}{.spec.strategy.rollingUpdate.maxSurge}{" unavailable="}{.spec.strategy.rollingUpdate.maxUnavailable}{" updated="}{.status.updatedReplicas}{" available="}{.status.availableReplicas}{"\n"}'`; `kubectl get rs,pod -n platform -l app=platform-aggregator -o wide`
-- **关键输出（教学示意）：** `replicas=4 surge=1 unavailable=0`，旧、新 ReplicaSet 在发布窗口合计需要容纳 5 个 Pod。
-- **能证明：** 发布控制器确实制造了瞬时第 5 份容量合同，Pending 与发布窗口相交，而不是 scheduler 凭空多算一只 Pod。
-- **不能证明：** 仅凭副本数不能断定根因一定是 CPU；还要把最终 Pod request 与 label、taint、卷、拓扑一起核对。
-- **源码映射：** scheduler 侧仍落到 `pkg/scheduler/schedule_one.go` 的 `schedulePod` Filter 结果；`maxSurge` 只是上游 Deployment 控制器改变待调度 Pod 数量。
+- **现象：** `activity` 稳定态只有 1 个 Running Pod；PodTemplate 更新后出现 1 个旧 Pod和 1 个新 Pod，新 Pod Pending，旧 Pod 仍继续服务。
+- **只读命令：** `kubectl get deploy -n platform activity -o jsonpath='replicas={.spec.replicas}{" surge="}{.spec.strategy.rollingUpdate.maxSurge}{" unavailable="}{.spec.strategy.rollingUpdate.maxUnavailable}{" updated="}{.status.updatedReplicas}{" available="}{.status.availableReplicas}{"\n"}'`；`kubectl get rs,pod -n platform -l app=activity -o wide`
+- **关键输出（教学示意）：** `replicas=1 surge=1 unavailable=0`；发布窗口最多是“旧 1 + 新 1”，新 Pod 要 `1 CPU/4Gi`，唯一合规 Node 只余 `800m/3Gi`。
+- **能证明：** Deployment 确实创建了第二份瞬时调度合同；旧 Pod 保留符合可用性策略，新 Pod 的资源形状在教学快照中放不下。
+- **不能证明：** 仅凭“两个 Pod”不能断言根因一定是 CPU；仍要核对最终 Pod request、标签、污点、卷和拓扑。
+- **源码映射：** Deployment controller 决定新旧 ReplicaSet 数量；scheduler 仍在 `schedulePod` 的 Filter 阶段逐 Node 判断。
 
 ### 3.7 把案例 A 的白板数字换成现场命令
 
@@ -564,15 +519,15 @@ flowchart TD
 
 ```powershell
 $Namespace = 'platform'
-$Deployment = 'platform-aggregator'
-$PodName = 'platform-aggregator-new-7f8d9'
+$Deployment = 'activity'
+$PodName = 'activity-new-7f8d9'
 $NodeName = 'worker-a'
 
 # 1. 发布瞬时需求来自哪个滚动策略。
 kubectl get deployment -n $Namespace $Deployment `
   -o jsonpath='replicas={.spec.replicas}{" maxSurge="}{.spec.strategy.rollingUpdate.maxSurge}{" maxUnavailable="}{.spec.strategy.rollingUpdate.maxUnavailable}{" updated="}{.status.updatedReplicas}{" available="}{.status.availableReplicas}{"\n"}'
 
-# 2. 看 API Server 最终保存的每个容器 request；不要只看 Helm values。
+# 2. 看 API Server 最终保存的每个容器 request；不要只看 Kustomize overlay 或 Deployment 模板。
 kubectl get pod -n $Namespace $PodName `
   -o jsonpath='{range .spec.initContainers[*]}init/{.name}{" cpu="}{.resources.requests.cpu}{" mem="}{.resources.requests.memory}{"\n"}{end}{range .spec.containers[*]}app/{.name}{" cpu="}{.resources.requests.cpu}{" mem="}{.resources.requests.memory}{" gpu="}{.resources.requests.nvidia\.com/gpu}{"\n"}{end}{"overhead="}{.spec.overhead}{"\n"}'
 
@@ -661,16 +616,16 @@ API 里短时间只看到 B 未绑定，并不能证明 scheduler 没把 A 计�
 
 #### 运维现场小案例：Binding 失败后，另一只 Pod 为什么突然成功
 
-**背景：** 案例 A 中 Pod-A Assume 了 `worker-a` 的最后 `1400m`，API Binding 临时失败；Pod-B 曾因这笔账 Pending。A 被 Forget 后，B 被内部资源释放事件唤醒并成功绑定。
+**背景：** 案例 A 中 Pod-A Assume 了 `worker-a` 的最后 `1000m`，API Binding 临时失败；Pod-B 曾因这笔账 Pending。A 被 Forget 后，B 被内部资源释放事件唤醒并成功绑定。
 
 ```powershell
 $Namespace = 'platform'
-kubectl get pods -n $Namespace -l app=platform-aggregator -w `
+kubectl get pods -n $Namespace -l app=activity -w `
   -o custom-columns='NAME:.metadata.name,UID:.metadata.uid,NODE:.spec.nodeName,SCHEDULED:.status.conditions[*].reason'
 
 # 有控制面日志权限时按两个 UID 和同一时间窗关联；托管集群可能需使用云平台控制面日志。
 kubectl logs -n kube-system -l component=kube-scheduler --since=10m --prefix | `
-  Select-String 'platform-aggregator|Binding|ForgetPod|FailedScheduling'
+  Select-String 'activity|Binding|ForgetPod|FailedScheduling'
 ```
 
 Pod-B 随后出现 `spec.nodeName` 能证明它最终成功绑定，不能单独证明就是 A 的 Forget 唤醒了它。后一个因果需要 scheduler 时间线或隔离实验。这个边界正对应“不重复承诺、失败可补偿、只有 Bind 才交接”三条不变量。
@@ -699,7 +654,7 @@ Pod-B 随后出现 `spec.nodeName` 能证明它最终成功绑定，不能单独
 
 #### 运维现场小案例：`top` 15%，为什么仍报 CPU 不足
 
-**背景：** 案例 A 的 `worker-a` 实际 CPU 只有 15%，但 Allocatable `4000m`、已请求 `3200m`，新 Pod 要 `1400m`。
+**背景：** 案例 A 的 `worker-a` 实际 CPU 只有 15%，但 Allocatable `4000m`、已请求 `3200m`，新 Pod 要 `1000m`。
 
 ```powershell
 $NodeName = 'worker-a'
@@ -729,10 +684,10 @@ Score：都能放时，更愿意放哪一台？
 
 #### 运维现场小案例：CPU 最高分也救不了未容忍污点
 
-**背景：** 案例 A 的 `worker-c` 最空，却有 `dedicated=gpu:NoSchedule`，普通平台服务 Pod 没有 toleration。
+**背景：** 案例 A 的 `worker-c` 最空，却有 `dedicated=gpu:NoSchedule`，普通 `activity` Pod 没有 toleration。
 
 ```powershell
-$Namespace = 'platform'; $PodName = 'platform-aggregator-new-7f8d9'; $NodeName = 'worker-c'
+$Namespace = 'platform'; $PodName = 'activity-new-7f8d9'; $NodeName = 'worker-c'
 kubectl get node $NodeName -o jsonpath='{.spec.taints}{"\n"}'
 kubectl get pod -n $Namespace $PodName -o jsonpath='{.spec.tolerations}{"\n"}'
 kubectl get events -n $Namespace --field-selector "involvedObject.name=$PodName" --sort-by='.metadata.creationTimestamp'
@@ -756,7 +711,7 @@ kubectl get events -n $Namespace --field-selector "involvedObject.name=$PodName"
 **背景：** 案例 A 的批处理 Pod 在 `10:00:05` 删除，新 Pod 在同一窗口仍收到一次旧 snapshot 计算出的 `Insufficient cpu`，随后重试成功。
 
 ```powershell
-$Namespace = 'platform'; $PodName = 'platform-aggregator-new-7f8d9'
+$Namespace = 'platform'; $PodName = 'activity-new-7f8d9'
 kubectl get pod -n $Namespace $PodName --watch-only --output-watch-events -o yaml
 
 $PodUid = kubectl get pod -n $Namespace $PodName -o jsonpath='{.metadata.uid}'
@@ -778,7 +733,7 @@ Binding 需要访问 API 或外部系统，延迟更不可控。Assume 已经在
 
 #### 运维现场小案例：选点很快，为什么 `nodeName` 还是写得慢
 
-**背景：** 案例 F 中 Filter/Score 延迟正常，但 API Server 写延迟上升，异步 Bind 堆积；scheduler 主循环仍能继续计算后续 Pod。
+**背景：** 案例 F 的吞吐教学变体中，Filter/Score 延迟正常，但 API Server 写延迟上升，异步 Bind 堆积；scheduler 主循环仍能继续计算后续 Pod。
 
 下面是两条独立 PromQL，必须逐条执行；不能把整个代码块一次粘进 Prometheus 表达式框。
 
@@ -812,7 +767,7 @@ Framework 保留轻量主干，把具体规则放到扩展点。代价是插件�
 
 #### 运维现场小案例：升级后只有 GPU profile 调度变慢
 
-**背景：** 案例 F 中 `default-scheduler` 正常，`gpu-binpack-scheduler` 的自定义 Score 插件 p99 从 20 ms 变成 800 ms。
+**背景：** 隔离的 GPU profile 性能实验中，`default-scheduler` 正常，`gpu-binpack-scheduler` 的自定义 Score 插件 p99 从 20 ms 变成 800 ms；这不是公司 UAT 场景 F 的既有配置。
 
 ```powershell
 # 自管控制面可先确认 scheduler Pod、镜像、启动参数和挂载配置。
@@ -838,12 +793,12 @@ QueueingHint 的核心思想是：
 
 > 上轮由哪个插件拒绝，就优先问那个插件“这次变化是否可能让结果不同”。
 
-#### 运维现场小案例：删了一个 1000m Pod，为什么 platform-aggregator 被重新尝试
+#### 运维现场小案例：删了一个 500m/2Gi Pod，为什么 activity 被重新尝试
 
 **背景：** 案例 A 上轮由 `NodeResourcesFit` 拒绝。`worker-a` 的批任务自然结束后，删除事件可能释放 request；无关 Secret 更新则不该触发同样的全量重算。
 
 ```powershell
-$Namespace = 'platform'; $PodName = 'platform-aggregator-new-7f8d9'
+$Namespace = 'platform'; $PodName = 'activity-new-7f8d9'
 kubectl get pod -n $Namespace $PodName -w `
   -o custom-columns='CREATED:.metadata.creationTimestamp,NODE:.spec.nodeName,SCHEDULED:.status.conditions[?(@.type=="PodScheduled")].reason'
 
@@ -874,7 +829,7 @@ kubectl get pod -n $Namespace $PodName -w `
 
 #### 运维现场小案例：都是 Pending，处置方向为什么完全不同
 
-**背景：** 案例 F 同时出现 30 个 active、20 个 backoff、200 个 unschedulable 和 8 个 gated Pod。
+**背景：** 独立容量压测同时构造 30 个 active、20 个 backoff、200 个 unschedulable 和 8 个 gated Pod；这些数字用于认识队列分类，不是公司 UAT 场景 F 的实测。
 
 ```promql
 sum by (queue) (scheduler_pending_pods)
@@ -909,7 +864,7 @@ flowchart LR
 **背景：** 案例 A 连续失败后，Event 时间看起来是 1、2、4、8 秒附近逐步拉开；中途节点变化又可能提前触发有价值的重试。
 
 ```powershell
-$Namespace = 'platform'; $PodName = 'platform-aggregator-new-7f8d9'
+$Namespace = 'platform'; $PodName = 'activity-new-7f8d9'
 $PodUid = kubectl get pod -n $Namespace $PodName -o jsonpath='{.metadata.uid}'
 kubectl get events -n $Namespace --field-selector "involvedObject.uid=$PodUid" `
   --sort-by='.metadata.creationTimestamp' `
@@ -942,7 +897,7 @@ Done：结束调度队列的 in-flight 跟踪
 **背景：** 案例 A 的一次调度已经结束 in-flight 跟踪，但后续异步 Bind 失败，API 仍是 `NODE=<none>`。
 
 ```powershell
-$Namespace = 'platform'; $PodName = 'platform-aggregator-new-7f8d9'
+$Namespace = 'platform'; $PodName = 'activity-new-7f8d9'
 kubectl get pod -n $Namespace $PodName `
   -o jsonpath='uid={.metadata.uid}{" nodeName="}{.spec.nodeName}{"\n"}'
 kubectl get events -n $Namespace --field-selector "involvedObject.name=$PodName" --sort-by='.metadata.creationTimestamp'
@@ -976,10 +931,10 @@ flowchart LR
 
 #### 运维现场小案例：PVC 为什么会从 Filter 一直参与到 PreBind
 
-**背景：** 案例 C1 的 Pod `ledger-close-0` 使用 WFFC PVC。`worker-a` 的 CPU/label 都通过，但卷只能在 `zone-b` 供给。
+**背景：** 案例 C 的 `storage-wffc-0` 使用 WFFC PVC。`worker-a` 的 CPU/label 都通过，但卷只能在 `zone-b` 供给。
 
 ```powershell
-$Namespace = 'finance'; $PodName = 'ledger-close-0'
+$Namespace = 'scheduler-lab'; $PodName = 'storage-wffc-0'
 kubectl get pod -n $Namespace $PodName -o yaml
 kubectl get pvc -n $Namespace -o wide
 kubectl get storageclass -o custom-columns='NAME:.metadata.name,MODE:.volumeBindingMode,PROVISIONER:.provisioner'
@@ -1080,7 +1035,7 @@ kubectl get events -n $Namespace --sort-by='.metadata.creationTimestamp' | Selec
 **背景：** 案例 D 预期使用 `gpu-binpack-scheduler`，但升级后 Pod 行为像默认 profile。先核对实际责任路由和进程配置来源。
 
 ```powershell
-$Namespace = 'ml'; $PodName = 'train-a100'
+$Namespace = 'ml-lab'; $PodName = 'train-a100'
 kubectl get pod -n $Namespace $PodName -o jsonpath='{.spec.schedulerName}{"\n"}'
 
 # 自管控制面：检查 scheduler 镜像、命令、参数、volumeMount；配置也可能来自节点本地文件。
@@ -1143,8 +1098,8 @@ flowchart TD
 
 #### 运维现场小案例：拿一个 Pod 实例串起“选点—占位—绑定”证据
 
-- **现象：** `platform-aggregator` 最终调度成功，但团队只看到 `Scheduled` Event，不知道源码主线从哪开始追。
-- **只读命令：** `$podKey='platform/platform-aggregator-new-7f8d9'; $uid=kubectl get pod -n platform platform-aggregator-new-7f8d9 -o jsonpath='{.metadata.uid}'; kubectl logs -n kube-system -l component=kube-scheduler --since=15m --tail=-1 --prefix | Select-String -SimpleMatch $podKey; kubectl get events -n platform --field-selector "involvedObject.uid=$uid" --sort-by='.metadata.creationTimestamp'`
+- **现象：** `activity` 最终调度成功，但团队只看到 `Scheduled` Event，不知道源码主线从哪开始追。
+- **只读命令：** `$podKey='platform/activity-new-7f8d9'; $uid=kubectl get pod -n platform activity-new-7f8d9 -o jsonpath='{.metadata.uid}'; kubectl logs -n kube-system -l component=kube-scheduler --since=15m --tail=-1 --prefix | Select-String -SimpleMatch $podKey; kubectl get events -n platform --field-selector "involvedObject.uid=$uid" --sort-by='.metadata.creationTimestamp'`
 - **关键输出（教学示意）：** 常规 scheduler 日志可能在同一 `namespace/name` 上出现 scheduling 或 `Successfully bound pod to node`；Event 再用 UID 隔离同名重建对象。
 - **能证明：** 日志命中时可把该名字在限定时间窗内缩小到 scheduling/binding 线索；UID 能严格限定 API Event 属于哪一个 Pod 实例。
 - **不能证明：** 固定源码的常规日志多用 `klog.KObj(pod)`，通常只打印 `namespace/name`，不能承诺搜索 UID 一定命中；同名快速重建还必须结合 UID、时间窗和 leader/实例前缀。普通日志缺行也不代表函数没执行。
@@ -1260,7 +1215,7 @@ func (sched *Scheduler) schedulePod(
 #### 运维现场小案例：成功日志里的两个数字对应哪条源码分支
 
 - **现象：** 大集群里同一类 Pod 有时很快绑定，有时 Score 延迟明显，想先确认本轮评估规模。
-- **只读命令：** `kubectl logs -n kube-system -l component=kube-scheduler --since=15m --prefix | Select-String 'Successfully bound pod to node.*platform-aggregator-new.*evaluatedNodes.*feasibleNodes'`
+- **只读命令：** `kubectl logs -n kube-system -l component=kube-scheduler --since=15m --prefix | Select-String 'Successfully bound pod to node.*activity-new.*evaluatedNodes.*feasibleNodes'`
 - **关键输出（教学示意）：** `evaluatedNodes=3 feasibleNodes=1`；若 `feasibleNodes=1`，源码直接返回唯一节点，不运行多候选 Score。
 - **能证明：** 在开启 V(2) 且日志未丢失时，可读出该次成功调度返回的评估节点数与可行节点数。
 - **不能证明：** 只看到 `feasibleNodes>1` 不能知道每个 Score 插件的分数；`feasibleNodes=0` 也不会走“成功绑定”这条日志。
@@ -1326,8 +1281,8 @@ go sched.runBindingCycle(ctx, state, fwk, scheduleResult, assumedPodInfo, start,
 
 #### 运维现场小案例：前一只 Pod 还在绑定，后一只为什么已开始选点
 
-- **现象：** 同一秒内 `platform-aggregator-new-a` 的绑定链还在等待存储，日志里 `platform-aggregator-new-b` 已进入调度。
-- **只读命令：** `kubectl logs -n kube-system -l component=kube-scheduler --since=10m --timestamps --prefix | Select-String 'platform-aggregator-new-a|platform-aggregator-new-b|Successfully bound|binding'`
+- **现象：** 自管控制面隔离实验中，同一秒内 `scheduler-lab/bind-a` 的 binding cycle 还在等待，`bind-b` 已进入 scheduling cycle。
+- **只读命令：** `kubectl logs -n kube-system -l component=kube-scheduler --since=10m --timestamps --prefix | Select-String 'scheduler-lab/bind-a|scheduler-lab/bind-b|Successfully bound|binding'`
 - **关键输出（教学示意）：** B 的 scheduling 时间戳落在 A 的 binding 开始与完成之间。
 - **能证明：** 有完整时间戳和相应日志时，能证明两个 Pod 的阶段发生了时间重叠，符合 binding cycle 异步执行。
 - **不能证明：** API Event 的先后顺序不能单独证明 goroutine；异步也不表示同一 Pod 可以同时跑两个 scheduling cycle。
@@ -1353,14 +1308,15 @@ PostFilter 的目标通常是为未来一轮创造条件，例如选择 victim �
 
 当前固定提交还有一个需要二遍知道的边界：PostFilter 自身若返回 Error，`schedulingAlgorithm` 会记录日志和诊断消息，但最后仍以原来的 FitError/Unschedulable 返回。不能用一句“所有 error 都原样逐层上抛”概括这里的真实控制流。
 
-#### 运维现场小案例：出现 nominatedNodeName，为什么 Pod 仍然是 Pending
 
-- **现象：** 案例 B 的高优先级 `pay-recovery` 显示 `nominatedNodeName=worker-a`，但 `spec.nodeName` 仍为空。
-- **只读命令：** `kubectl get pod -n platform pay-recovery -o jsonpath='node={.spec.nodeName}{" nominated="}{.status.nominatedNodeName}{" scheduled="}{.status.conditions[?(@.type=="PodScheduled")].status}{" reason="}{.status.conditions[?(@.type=="PodScheduled")].reason}{"\n"}'`; `kubectl get events -n platform --field-selector involvedObject.name=pay-recovery --sort-by='.metadata.creationTimestamp'`
-- **关键输出（教学示意）：** `node=`、`nominated=worker-a`、`scheduled=False`，并可能仍有 `FailedScheduling`。
-- **能证明：** scheduler 已记录一个未来优先尝试的提名节点，但 API 中尚未完成绑定。
-- **不能证明：** nomination 不是锁、不是预留成功，也不保证下一轮能通过 Filter；更不能证明 victim 已全部退出。
-- **源码映射：** `pkg/scheduler/schedule_one.go` 的 `schedulingAlgorithm`，以及 `pkg/scheduler/framework/preemption/preemption.go` 的 `Evaluator.Preempt`。
+#### 运维现场小案例：B 场景出现 nominatedNodeName，为什么仍是 Pending
+
+- **现象：** 高优先级教学 Pod `platform/player-recovery` 显示 `nominatedNodeName=worker-a`，但 `spec.nodeName` 仍为空。
+- **只读命令：** `kubectl get pod -n platform player-recovery -o jsonpath='node={.spec.nodeName}{" nominated="}{.status.nominatedNodeName}{" scheduled="}{.status.conditions[?(@.type=="PodScheduled")].status}{" reason="}{.status.conditions[?(@.type=="PodScheduled")].reason}{"\n"}'`；`kubectl get events -n platform --field-selector involvedObject.name=player-recovery --sort-by='.metadata.creationTimestamp'`
+- **关键输出（教学示意）：** `node=`、`nominated=worker-a`、`scheduled=False`，受害者可能仍在删除。
+- **能证明：** scheduler 已写入潜在落点提示，但 API 中尚未完成 Binding。
+- **不能证明：** nomination 不是锁、不是资源预留成功，也不保证下一轮能通过资源与 hostname topology spread 等全部 Filter。
+- **源码映射：** `schedule_one.go` 的 `schedulingAlgorithm` 与 `framework/preemption/preemption.go` 的 `Evaluator.Preempt`。
 
 ### 7.5 大集群为什么不保证扫描全部 Node
 
@@ -1398,33 +1354,29 @@ PostFilter 的目标通常是为未来一轮创造条件，例如选择 victim �
 
 ## 8. 最重要的一本账：Pod request 与 Node Requested 怎样相遇
 
-### 8.1 scheduler 不是只看业务主容器
 
-本案的 Java 主容器只写了 `1200m`，但 scheduler 看到的常驻阶段是：
+### 8.1 scheduler 看的是 API 中最终整只 Pod，不只是模板里的应用容器
 
-```text
-platform-aggregator 1200m + mesh-proxy 200m = 1400m
-```
+案例 A 的公司 nonprod 基线只说明应用容器 limits 为 `1 CPU/4Gi`。在没有 LimitRange、额外 admission 默认、sidecar、init container、Pod-level resources 或 RuntimeClass overhead 的教学条件下，最终 Pod request 按 `1 CPU/4Gi` 手算。
 
-完整 Pod request 还可能受以下内容影响：
+真实现场不能从这个假设倒推出结果，必须读取 API Server 最终保存的 Pod，因为 request 还可能受这些内容影响：
 
-- 所有普通业务/sidecar 容器的 request 相加；
+- 所有普通业务容器和 sidecar 的 request 相加；
 - 普通 init container 的阶段峰值；
 - restartable init container 与后续阶段的并发关系；
 - Pod-level resources（目标版本启用时）；
 - RuntimeClass 定义的 Pod overhead；
-- admission 注入或默认化后的最终 Pod spec。
+- LimitRange、mutating admission 或其他平台注入。
 
-因此排障必须看 API Server 最终保存的 Pod，不能只看 Deployment 模板，也不能只抽查第一个 container。
+#### 运维现场小案例：教学 sidecar 变体怎样把 1 核 Pod 变成 1.2 核
 
-#### 运维现场小案例：主容器只要 1200m，整只 Pod 为什么算得更多
-
-- **现象：** 研发只查 `containers[0]`，算出节点能放；scheduler 却报 `Insufficient cpu`。
-- **只读命令：** `kubectl get pod -n platform platform-aggregator-new-7f8d9 -o jsonpath='{range .spec.initContainers[*]}init/{.name}{" cpu="}{.resources.requests.cpu}{"\n"}{end}{range .spec.containers[*]}app/{.name}{" cpu="}{.resources.requests.cpu}{"\n"}{end}{"overhead="}{.spec.overhead}{"\n"}'`
-- **关键输出（教学示意）：** 同时列出业务容器、mesh sidecar、init container 和 Pod overhead。
-- **能证明：** API 中最终参与资源计算的各组成项是什么，能发现 admission 注入的 sidecar 或 RuntimeClass overhead。
-- **不能证明：** 逐项列出并不等于把 init 直接与常驻容器全相加；还必须按该资源的 Pod 级计算规则求值。
+- **现象：** 隔离 namespace `scheduler-lab` 中复制一份 `activity-with-agent`；应用容器要 `1000m/4Gi`，注入的 `ops-agent` 要 `200m/256Mi`，节点按 1 核估算后仍出现 `Insufficient cpu`。
+- **只读命令：** `kubectl get pod -n scheduler-lab activity-with-agent -o jsonpath='{range .spec.initContainers[*]}init/{.name}{" cpu="}{.resources.requests.cpu}{" mem="}{.resources.requests.memory}{"\n"}{end}{range .spec.containers[*]}app/{.name}{" cpu="}{.resources.requests.cpu}{" mem="}{.resources.requests.memory}{"\n"}{end}{"overhead="}{.spec.overhead}{"\n"}'`
+- **关键输出（教学示意）：** 常驻容器合计 `1200m/4352Mi`；该 sidecar 和 namespace 都是隔离教学变体，不是公司 `activity` 的已核实现状。
+- **能证明：** 最终 Pod 中每个资源组成项可见，能发现 admission 注入或默认化。
+- **不能证明：** 逐项列出不等于把所有 init 与常驻容器直接相加；还要按 Pod 级资源计算规则求峰值。
 - **源码映射：** `pkg/scheduler/framework/plugins/noderesources/fit.go` 的 `computePodResourceRequest`。
+
 
 ### 8.2 为什么 init container 不是简单全部相加
 
@@ -1432,31 +1384,29 @@ platform-aggregator 1200m + mesh-proxy 200m = 1400m
 
 ```text
 常驻阶段：所有同时运行的 app/sidecar request 求和
-初始化阶段：按可能同时存活的组合算每种资源峰值
-整个 Pod：对每种资源取所有阶段中的最大值
+初始化阶段：按可能同时存活的组合，分别计算每种资源峰值
+整个 Pod：对每种资源取各阶段最大值
 最后再按 API 语义加入 Pod overhead 等项
 ```
 
-CPU 与 memory 要分别算峰值，不是先找“最大的那个容器”再把整个资源向量照搬。
-
-如果本案另有一个普通 init container 请求 `2000m CPU / 512Mi`：
+CPU 与 memory 要分别算峰值，不是先找“最大的那个容器”再照搬完整资源向量。沿用案例 A 的单容器教学快照，如果另加一个普通 init container，请求 `2000m CPU/512Mi`：
 
 ```text
-常驻阶段 CPU = 1400m
+常驻阶段 CPU = 1000m
 init 阶段 CPU = 2000m
-Pod CPU request = max(1400m, 2000m) = 2000m
+Pod CPU request = max(1000m, 2000m) = 2000m
 ```
 
-这时释放后的 `worker-a` 余额只有 `1800m`，仍然放不下。你不能因为 init 只跑几十秒就让 scheduler 忽略它的启动峰值。
+案例 A 的 Job 释放 `500m/2Gi` 后，`worker-a` 余额是 `1300m/5Gi`，仍放不下这个 2 核启动峰值。init 只跑几十秒，也不能让 scheduler 忽略它。
 
-#### 运维现场小案例：一个短命的迁移 init 让发布仍然放不下
+#### 运维现场小案例：短命 init 让资源释放后的 Node 仍放不下
 
-- **现象：** `platform-aggregator` 常驻容器合计 `1400m`，新增 `db-migrate` init 请求 `2000m` 后仍报 CPU 不足。
-- **只读命令：** `kubectl get pod -n platform platform-aggregator-new-7f8d9 -o jsonpath='{range .spec.initContainers[*]}{.name}{"="}{.resources.requests.cpu}{"\n"}{end}{range .spec.containers[*]}{.name}{"="}{.resources.requests.cpu}{"\n"}{end}'`; `kubectl describe node worker-a | Select-String -Pattern 'Allocatable:|Allocated resources:|cpu' -Context 0,8`
-- **关键输出（教学示意）：** 常驻合计 `1400m`，最大 init 为 `2000m`，所以本案 Pod CPU request 取 `2000m`，大于节点余额 `1800m`。
-- **能证明：** 最终 Pod spec 和节点 API 账支持这次手算，并解释短时 init 也必须有启动容量。
-- **不能证明：** 该简式不能覆盖所有 restartable init/sidecar 与 Pod-level resources 组合；复杂 Pod 应以本提交实现和最终 spec 为准。
-- **源码映射：** `staging/src/k8s.io/component-helpers/resource/helpers.go` 的 Pod request 计算，被 `computePodResourceRequest` 使用。
+- **现象：** 隔离变体中，`activity` 常驻阶段是 `1000m/4Gi`，新增 `db-migrate` init 请求 `2000m/512Mi`；Job 结束后仍报 CPU 不足。
+- **只读命令：** `kubectl get pod -n scheduler-lab activity-with-init -o jsonpath='{range .spec.initContainers[*]}{.name}{"="}{.resources.requests.cpu}{"/"}{.resources.requests.memory}{"\n"}{end}{range .spec.containers[*]}{.name}{"="}{.resources.requests.cpu}{"/"}{.resources.requests.memory}{"\n"}{end}'`；`kubectl describe node worker-a | Select-String -Pattern 'Allocatable:|Allocated resources:|cpu|memory' -Context 0,8`
+- **关键输出（教学示意）：** Pod CPU 峰值 `2000m`，Node 余额 `1300m`。
+- **能证明：** 最终 Pod spec 与 Node API 请求账支持本次阶段峰值手算。
+- **不能证明：** 简式不能覆盖所有 restartable init、Pod-level resources 和 overhead 组合；复杂场景须按目标版本实现核对。
+- **源码映射：** `staging/src/k8s.io/component-helpers/resource/helpers.go` 的 Pod request 计算。
 
 ### 8.3 NodeInfo 不是 Node API 对象的别名
 
@@ -1475,13 +1425,13 @@ NodeInfo.Requested
 
 Assumed Pod 必须马上进入 Requested。否则两个连续调度周期都可能看到同一份余额，各自认为能放，最后超卖。
 
-#### 运维现场小案例：`describe node` 看似还有 1400m，下一只 Pod 却被拒绝
+#### 运维现场小案例：`describe node` 看似还有 1000m，下一只 Pod 却被拒绝
 
 - **现象：** 第一只 Pod 已被 scheduler Assume、Bind 尚未被 informer 确认；第二只相同 Pod 紧接着选点失败。
-- **只读命令：** `kubectl describe node worker-a`; `kubectl logs -n kube-system -l component=kube-scheduler --since=5m --timestamps --prefix | Select-String 'worker-a|Assume|platform-aggregator-new'`
+- **只读命令：** `kubectl describe node worker-a`; `kubectl logs -n kube-system -l component=kube-scheduler --since=5m --timestamps --prefix | Select-String 'worker-a|Assume|activity-new'`
 - **关键输出（教学示意）：** API 汇总仍显示旧账，而 scheduler 日志时间线显示前一只 Pod 已进入 assume/binding 窗口。
 - **能证明：** 两类证据可能存在短暂传播窗口；结合源码可解释 scheduler 为何先在内部 NodeInfo 占账防超卖。
-- **不能证明：** 普通 `kubectl describe node` 无法直接列出 assumed Pod；缺少足够日志时不能凭“差了 1400m”断言一定是 Assume。
+- **不能证明：** 普通 `kubectl describe node` 无法直接列出 assumed Pod；缺少足够日志时不能凭“差了 1000m”断言一定是 Assume。
 - **源码映射：** `pkg/scheduler/framework/types.go` 的 `NodeInfo.AddPod/update`，`pkg/scheduler/backend/cache/cache.go` 的 `AssumePod`。
 
 ### 8.4 第二组真实源码：资源不足的公式到底在哪里
@@ -1578,10 +1528,10 @@ for rName, rQuant := range podRequest.ScalarResources {
 代回本案：
 
 ```text
-podRequest.MilliCPU = 1400
+podRequest.MilliCPU = 1000
 worker-a Allocatable = 4000
 worker-a Requested = 3200
-1400 > 4000 - 3200 = 800
+1000 > 4000 - 3200 = 800
 => Insufficient cpu
 ```
 
@@ -1595,11 +1545,12 @@ worker-a Requested = 3200
 #### 运维现场小案例：把 `Insufficient cpu` 翻译成一条可复算的不等式
 
 - **现象：** Event 只说 CPU 不足，值班人需要判断差多少，而不是立刻扩容。
-- **只读命令：** `kubectl get pod -n platform platform-aggregator-new-7f8d9 -o yaml`; `kubectl describe node worker-a`; `kubectl get node worker-a -o jsonpath='allocatableCPU={.status.allocatable.cpu}{"\n"}'`
-- **关键输出（教学示意）：** `PodRequest=1400m`、`Requested=3200m`、`Allocatable=4000m`，即 `1400m + 3200m > 4000m`。
+- **只读命令：** `kubectl get pod -n platform activity-new-7f8d9 -o yaml`; `kubectl describe node worker-a`; `kubectl get node worker-a -o jsonpath='allocatableCPU={.status.allocatable.cpu}{"\n"}'`
+- **关键输出（教学示意）：** `PodRequest=1000m`、`Requested=3200m`、`Allocatable=4000m`，即 `1000m + 3200m > 4000m`。
 - **能证明：** 在忽略本案无关维度后，API 中 request、已绑定账和 allocatable 能复核资源 Filter 的核心比较方向。
 - **不能证明：** `describe` 仍不含 assumed Pod，且真实 Filter 还会处理标量资源、零 request、Pod-level resources 等版本细节。
 - **源码映射：** `pkg/scheduler/framework/plugins/noderesources/fit.go` 的 `fitsRequest` 与 `InsufficientResource`。
+
 
 ### 8.5 request、limit、usage 与 OOM 的关系
 
@@ -1610,36 +1561,30 @@ worker-a Requested = 3200
 | usage | metrics/监控 | 某个采样窗口实际消耗多少 | scheduler 当初为何接受或拒绝 |
 | working set / RSS / JVM heap 等 | 运行态排障 | 内存在哪里消耗 | Pod 调度 request 是否合理的唯一答案 |
 
-常见错误直觉：
+公司 prod 基线为单 Pod `requests=limits=2 CPU/4Gi`。这是一份调度合同，不表示 Pod 此刻正在使用 2 核，也不保证任意 Node 都能容纳它。
 
-```text
-kubectl top node 很低
-  ≠ scheduler 的 Requested 很低
-  ≠ 可以无风险降低 request
-  ≠ GPU 设备当前没有被分配
-```
+#### 运维现场小案例：prod Node 使用率只有 15%，2 核 Pod 仍 Pending
 
-#### 运维现场小案例：`top` 很低时，先并排三本账再讨论调参
+- **现象：** `platform/player` 的教学新副本请求 `2 CPU/4Gi`；候选 Node usage 约 15%，业务因此认为一定放得下。
+- **只读命令：** `kubectl top node worker-prod-a`；`kubectl describe node worker-prod-a`；`kubectl get pod -n platform player-new -o jsonpath='{range .spec.containers[*]}{.name}{" request="}{.resources.requests.cpu}{"/"}{.resources.requests.memory}{" limit="}{.resources.limits.cpu}{"/"}{.resources.limits.memory}{"\n"}{end}'`
+- **关键输出（教学示意）：** Node `Allocatable=8 CPU/32Gi`、已承诺 `6500m/29Gi`，只余 `1500m/3Gi`；usage 约 15%，新 Pod 要 `2 CPU/4Gi`。
+- **能证明：** request 余额在 CPU 和 memory 两维都不足，低 usage 与 FailedScheduling 并不矛盾。
+- **不能证明：** 这一教学余额不是公司事故数据；单个低峰采样也不能证明 request 应该下调。
+- **源码映射：** `fitsRequest` 比较 Pod request、NodeInfo Requested 与 Allocatable；OOM 和运行态 usage 不由它判定。
 
-- **现象：** `worker-a` CPU usage 15%，但 Pending Pod 报 CPU 不足，业务要求立刻把 request 减半。
-- **只读命令：** `kubectl top node worker-a`; `kubectl top pod -n platform -l app=platform-aggregator --containers`; `kubectl get pod -n platform platform-aggregator-new-7f8d9 -o jsonpath='{range .spec.containers[*]}{.name}{" request="}{.resources.requests.cpu}{" limit="}{.resources.limits.cpu}{"\n"}{end}'`
-- **关键输出（教学示意）：** usage 是采样值；Pod 合同仍是 `1200m+200m`，limit 可能又是另一组数字。
-- **能证明：** usage、request、limit 是不同数据源和语义，低 usage 不会自动改写 scheduler 的容量承诺。
-- **不能证明：** 一个低峰采样不能证明长期基线，更不能证明降低 request 后不会发生争用、限流、OOM 或发布抖动。
-- **源码映射：** scheduler 的硬账仍在 `pkg/scheduler/framework/plugins/noderesources/fit.go` 的 `fitsRequest`；OOM 与运行态 usage 不由该函数判定。
 
 ### 8.6 QoS 不是独立的“调度优先级”
 
-Guaranteed、Burstable、BestEffort 会影响 kubelet驱逐、cgroup 与运行态资源管理，但普通 NodeResourcesFit 的核心仍是最终 request 账。不能写成“Guaranteed Pod 会被 scheduler 自动优先挑 Node”或“BestEffort 永远排在队尾”。队列顺序主要由 PrioritySort 和 profile 决定。
+Guaranteed、Burstable、BestEffort 会影响 kubelet 驱逐、cgroup 与运行态资源管理，但普通 NodeResourcesFit 的核心仍是最终 request 账。不能写成“Guaranteed Pod 会被 scheduler 自动优先挑 Node”或“BestEffort 永远排在队尾”。队列先后主要由 PrioritySort 和 profile 决定。
 
-#### 运维现场小案例：Guaranteed Pod 为什么仍可能排在高优先级 Burstable 后面
+#### 运维现场小案例：教学对照中 Guaranteed 为什么仍排在高优先级 Burstable 后面
 
-- **现象：** 在这个 QoS 教学变体中，平台为 `platform-aggregator` 的所有容器补齐了相等的 request/limit，使其成为 Guaranteed；它仍没有比 priority 更高的 Burstable Pod 先被尝试。
-- **只读命令：** `kubectl get pods -n platform -o custom-columns='NAME:.metadata.name,QOS:.status.qosClass,PRIORITY:.spec.priority,CLASS:.spec.priorityClassName,NODE:.spec.nodeName'`; `kubectl get priorityclass`
-- **关键输出（教学示意）：** `platform-aggregator QOS=Guaranteed PRIORITY=0`，另一只 `QOS=Burstable PRIORITY=100000`。
-- **能证明：** API 中 QoS 与调度 priority 是两组独立字段，不能用 QoS 名字推断队列先后。
-- **不能证明：** 静态列表不能还原每次 Pop 顺序；同 priority 下还涉及入队时间和 profile 的 QueueSort 配置。
-- **源码映射：** `pkg/scheduler/framework/plugins/queuesort/priority_sort.go` 的 `Less`，而 Node 资源可行性仍由 `NodeResourcesFit` 判断。
+- **现象：** 隔离实验创建两只 Pending Pod：`qos-guaranteed` 的每个容器都满足 CPU/内存 request=limit、priority=0；`priority-burstable` 的 request<limit、priority=100000。
+- **只读命令：** `kubectl get pods -n scheduler-lab -o custom-columns='NAME:.metadata.name,QOS:.status.qosClass,PRIORITY:.spec.priority,CLASS:.spec.priorityClassName,NODE:.spec.nodeName'`；`kubectl get priorityclass`
+- **关键输出（教学示意）：** `qos-guaranteed QOS=Guaranteed PRIORITY=0`，另一只 `QOS=Burstable PRIORITY=100000`。
+- **能证明：** API 中 QoS 与调度 priority 是两组独立事实，不能用 QoS 名字推断队列先后。
+- **不能证明：** 静态列表不能还原每次 Pop 顺序；同 priority 还涉及入队时间与 QueueSort 配置。
+- **源码映射：** `queuesort/priority_sort.go` 的 `Less`；Node 可行性仍由 `NodeResourcesFit` 判断。
 
 ---
 
@@ -1662,8 +1607,8 @@ Guaranteed、Burstable、BestEffort 会影响 kubelet驱逐、cgroup 与运行�
 
 #### 运维现场小案例：一条 FailedScheduling 先拆成八类只读证据
 
-- **现象：** `platform-aggregator` Event 同时出现 CPU、污点和标签原因，值班人想直接重启 scheduler。
-- **只读命令：** `kubectl get pod -n platform platform-aggregator-new-7f8d9 -o yaml`; `kubectl describe pod -n platform platform-aggregator-new-7f8d9`; `kubectl get nodes -o custom-columns='NAME:.metadata.name,UNSCHED:.spec.unschedulable,LABELS:.metadata.labels,TAINTS:.spec.taints'`
+- **现象：** `activity` Event 同时出现 CPU、污点和标签原因，值班人想直接重启 scheduler。
+- **只读命令：** `kubectl get pod -n platform activity-new-7f8d9 -o yaml`; `kubectl describe pod -n platform activity-new-7f8d9`; `kubectl get nodes -o custom-columns='NAME:.metadata.name,UNSCHED:.spec.unschedulable,LABELS:.metadata.labels,TAINTS:.spec.taints'`
 - **关键输出（教学示意）：** Pod 最终约束、request、PVC/hostPort 与 Node 的 labels、taints、unschedulable 状态能够逐项对照。
 - **能证明：** API 中有哪些硬合同，以及 FailedScheduling 摘要指向哪些规则领域，足以建立第一版排查清单。
 - **不能证明：** YAML 静态对照不能重建当轮 snapshot、assumed Pod 或插件并发顺序；也不能覆盖未采集的 PV/现有 Pod 分布。
@@ -1697,8 +1642,8 @@ profile addedAffinity 与 Pod 自己的 affinity      -> 共同生效，用户 Y
 
 #### 运维现场小案例：偏好 online 不是“只能去 online”
 
-- **现象：** 教学变体 `platform-aggregator-canary` 只写 preferred affinity 偏好 `workload-tier=online`，最后却绑定到 `batch` 节点，团队认为规则失效。
-- **只读命令：** `kubectl get pod -n platform platform-aggregator-canary -o jsonpath='{.spec.affinity.nodeAffinity}{"\nnode="}{.spec.nodeName}{"\n"}'`; `kubectl get node worker-b -o jsonpath='{.metadata.labels.workload-tier}{"\n"}'`
+- **现象：** 教学变体 `activity-canary` 只写 preferred affinity 偏好 `workload-tier=online`，最后却绑定到 `batch` 节点，团队认为规则失效。
+- **只读命令：** `kubectl get pod -n platform activity-canary -o jsonpath='{.spec.affinity.nodeAffinity}{"\nnode="}{.spec.nodeName}{"\n"}'`; `kubectl get node worker-b -o jsonpath='{.metadata.labels.workload-tier}{"\n"}'`
 - **关键输出（教学示意）：** 规则位于 `preferredDuringSchedulingIgnoredDuringExecution`，最终节点标签为 `batch`。
 - **能证明：** Pod 声明的是软偏好而非硬门槛；没有 online 可行节点或其他插件总分更高时，去 batch 不违反该合同。
 - **不能证明：** 只看 Pod YAML不能看到 profile 的 `addedAffinity`，也不能还原其他 Score 插件和权重为何压过此偏好。
@@ -1719,78 +1664,61 @@ profile addedAffinity 与 Pod 自己的 affinity      -> 共同生效，用户 Y
 
 #### 运维现场小案例：Node 已 cordon，为什么上面的旧 Pod 还在跑
 
-- **现象：** `worker-c` 显示 `SchedulingDisabled`，旧业务 Pod 仍 Running，新 `platform-aggregator` 却不再进入该节点。
+- **现象：** `worker-c` 显示 `SchedulingDisabled`，旧业务 Pod 仍 Running，新 `activity` 却不再进入该节点。
 - **只读命令：** `kubectl get node worker-c -o jsonpath='unschedulable={.spec.unschedulable}{" taints="}{.spec.taints}{"\n"}'`; `kubectl get pods -A --field-selector spec.nodeName=worker-c -o wide`
 - **关键输出（教学示意）：** `unschedulable=true`，旧 Pod 仍有 `NODE=worker-c`。
 - **能证明：** cordon 是 Node 的当前不可调度标记，不等于已执行 drain，也不会仅凭该字段删除既有 Pod。
 - **不能证明：** 只读快照不能证明谁、何时 cordon；若有 `NoExecute`，既有 Pod 是否驱逐还要核对 toleration 与 taint-eviction controller。
 - **源码映射：** 新 Pod 的硬检查分别在 `pkg/scheduler/framework/plugins/nodeunschedulable/node_unschedulable.go` 和 `pkg/scheduler/framework/plugins/tainttoleration/taint_toleration.go`。
 
+
 ### 9.4 卷为什么也是调度问题
 
-Pod 还没去 Node，但本地盘、PV zone、CSI attach 上限、延迟绑定 StorageClass 等事实已经可能决定它能去哪里。`WaitForFirstConsumer` 的设计目的之一，就是让卷绑定和 Pod 选点协同，避免先绑定到错误拓扑的 PV 后再发现 Pod 无处可去。
-
-两类 Pending 先区分：
+Pod 还没去 Node，但本地盘、PV zone、CSI attach 上限、延迟绑定 StorageClass 等事实已经可能决定它能去哪里。`WaitForFirstConsumer` 的目的之一，是让卷选择与 Pod 选点协同，避免先把卷绑定到错误拓扑后再发现 Pod 无处可去。
 
 ```text
-Immediate：PVC 通常先尝试绑定；没有合适 PV/动态供给失败时，Pod 可能在调度前受阻
-WaitForFirstConsumer：等到 scheduler 有候选 Node，才把卷选择与 Node 拓扑一起决定
+Immediate：PVC 可能先绑定，scheduler 再受 PV nodeAffinity 约束
+WaitForFirstConsumer：等到 scheduler 有候选 Node，再让卷选择与节点拓扑协同
+绑定后 FailedMount：通常已离开普通选点主线，转查 kubelet/CSI
 ```
 
-WFFC 场景不要手填 `spec.nodeName`：它会绕过 scheduler，PVC 可能因此一直等不到 scheduler 参与的消费者拓扑选择；若必须限制节点，应使用 node affinity/selector 等正常调度约束。
+#### 运维现场小案例：C 场景的 WFFC PVC 为什么和 Pod 一起 Pending
 
-`VolumeBinding` 也不只是一个 Filter：它会跨 PreFilter、Filter、Reserve、PreBind 与 Unreserve 保存、假设、持久化或回滚卷选择。排障证据至少包括 PVC、PV、StorageClass、PV nodeAffinity、CSINode、CSIStorageCapacity；Binding 完成后还可能在 VolumeAttachment、attach 或 mount 阶段失败，那已经是控制器/kubelet/CSI 兑现链。
+- **现象：** 隔离实验 `scheduler-lab/storage-wffc-0` 与 PVC 都 Pending，StorageClass 是 `WaitForFirstConsumer`。
+- **只读命令：** `kubectl get pod,pvc -n scheduler-lab -o wide`；`kubectl get sc,pv -o wide`；`kubectl get events -n scheduler-lab --sort-by='.metadata.creationTimestamp'`
+- **关键输出（教学示意）：** PVC 尚未绑定；候选 Node 的 AZ、PV/CSI 可用拓扑与 Pod 其他硬约束没有共同交集。
+- **能证明：** 卷还处在需要与选点协同的阶段，不能把“PVC Pending”直接当作 CSI 节点挂载失败。
+- **不能证明：** 该实验不代表公司平台服务现网使用了同一 StorageClass；绑定后出现 `FailedMount` 也不是重新打分能解决。
+- **源码映射：** `VolumeBinding` 的 PreFilter/Filter/Reserve/PreBind，以及绑定后的 kubelet/CSI 路径。
 
-不过节点侧真正 mount/attach 仍可能在 Bind 后失败。看到 `PodScheduled=True` 但 `ContainerCreating`、`FailedMount`，责任域已从普通选点主线转向 kubelet/volume 路径。
 
-#### 运维现场小案例：PVC Pending 到底是在等 Node，还是存储真的坏了
+### 9.5 prod hostname 分散：拓扑规则与资源余额可以同时把交集压空
 
-- **现象：** 案例 C1 的 `finance/ledger-close-0` 与 PVC 都 Pending，StorageClass 使用 `WaitForFirstConsumer`。
-- **只读命令：** `kubectl get pod,pvc -n finance -o wide`; `kubectl get pv`; `kubectl get storageclass -o custom-columns='NAME:.metadata.name,MODE:.volumeBindingMode,PROVISIONER:.provisioner'`; `kubectl get csinode,csistoragecapacity -A`
-- **关键输出（教学示意）：** PVC 未绑定，SC 的 `MODE=WaitForFirstConsumer`，候选拓扑容量需要与 Pod 选点一起决定。
-- **能证明：** 卷合同、binding mode、已有 PV/CSI 拓扑对象的 API 状态，可区分正常延迟绑定与明显缺对象。
-- **不能证明：** 这些对象不能证明 provision、attach、mount 已成功；`PodScheduled=True` 后的 `FailedMount` 已不是普通 Filter 根因。
-- **源码映射：** `pkg/scheduler/framework/plugins/volumebinding/volume_binding.go` 的 `PreFilter`、`Filter`、`Reserve`、`PreBind`、`Unreserve`。
+公司 prod 基线包含按 `kubernetes.io/hostname` 的 topology spread：`maxSkew=1`、`whenUnsatisfiable=DoNotSchedule`。这是一条硬可靠性合同。下面用 `platform/player` 构造同尺度推演，不声称这是线上实际副本分布。
 
-### 9.5 topologySpread 是平台可靠性规则，不只是“尽量平均”
-
-它可以表达：同一服务的 Pod 尽量或必须跨 zone/hostname 分散。平台要关注：
-
-- Node 是否真的有相应 `topologyKey` label；
-- selector 是否精确匹配本工作负载；
-- `maxSkew` 与 `whenUnsatisfiable`；
-- 新增一个 zone/Node 后 domain 集合如何变化；
-- 与 podAntiAffinity、nodeSelector、GPU 型号标签组合后，交集是否变成空集。
-
-先手算一个三 zone 例子。假设选择器匹配的现有 Pod 数是：
+假设三台 eligible Node 上，selector 匹配的现有 Pod 分布为：
 
 ```text
-zone-a = 3
-zone-b = 2
-zone-c = 2
-maxSkew = 1
+host-a = 1
+host-b = 1
+host-c = 0
+新 Pod request = 2 CPU / 4Gi
 ```
 
-新 Pod 若放到 zone-a，放置后计数为 `4/2/2`，候选域与全局最小值的差为 `4-2=2`；若 `whenUnsatisfiable: DoNotSchedule`，这个节点会被硬过滤。放到 zone-b 后是 `3/3/2`，最大差仍为 1，可以通过。若使用 `ScheduleAnyway`，不满足理想分布不会硬淘汰，而会作为 Score 偏好影响排名。
+- 放到 host-a 后是 `2/1/0`，最大值与最小值相差 2，超过 `maxSkew=1`；
+- 放到 host-b 同样变成 `1/2/0`，也违反硬拓扑规则；
+- 放到 host-c 可变成 `1/1/1`，拓扑上通过，但教学快照中 host-c 只余 `1.5 CPU/3Gi`，又被 NodeResourcesFit 拒绝。
 
-还要知道五个细节：
+因此 0 个可行 Node 不是某个插件“误判”，而是 `PodTopologySpread ∩ NodeResourcesFit = ∅`。平台还要核对 selector 是否只统计目标工作负载、eligible domain、`minDomains`、`nodeAffinityPolicy` 与 `nodeTaintsPolicy`。
 
-- `maxSkew` 比的是假设放置后的目标域计数与 global minimum；
-- eligible domain 数少于 `minDomains` 时，global minimum 按 0 处理；
-- `nodeAffinityPolicy`、`nodeTaintsPolicy` 会改变哪些节点/域参与计算；
-- selector 应明确匹配本工作负载的 Pod label，否则你以为统计“自己”，实际可能漏计自己；
-- scale-to-zero 的 zone 若当前一台带该 topology label 的 Node 都没有，scheduler 不能凭云厂商未来可能创建它就把它当作现存可选域。
+#### 运维现场小案例：最均衡的 host 资源不够，资源够的 host 又会破坏 maxSkew
 
-策略越多不是越安全。每加一条硬约束，都在缩小可行集合；多条单独合理的规则，组合后可能让整个业务无处可放。
-
-#### 运维现场小案例：`3/2/2` 时为什么 zone-a 被硬过滤
-
-- **现象：** `maxSkew=1`、`DoNotSchedule` 的 `platform-aggregator` 无法再落到 zone-a，却能落到 zone-b。
-- **只读命令：** `kubectl get pod -n platform platform-aggregator-new-7f8d9 -o jsonpath='{.spec.topologySpreadConstraints}{"\n"}'`; `kubectl get pods -n platform -l app=platform-aggregator -o custom-columns='NAME:.metadata.name,NODE:.spec.nodeName'`; `kubectl get nodes -L topology.kubernetes.io/zone`
-- **关键输出（教学示意）：** 现有分布 `zone-a=3, zone-b=2, zone-c=2`；假设放到 a 后变 `4/2/2`，skew 为 2。
-- **能证明：** Pod 的约束、Node domain 标签和匹配 Pod 分布支持手算候选域是否违反硬 `maxSkew`。
-- **不能证明：** 静态统计未必与 scheduler 当轮 snapshot 同时；还必须应用 `minDomains`、nodeAffinityPolicy、nodeTaintsPolicy 等完整语义。
-- **源码映射：** `pkg/scheduler/framework/plugins/podtopologyspread/filtering.go` 的 `PreFilter`、`Filter`，软约束另在同目录 `scoring.go`。
+- **现象：** prod 教学副本无法调度；host-a/b 有资源却被拓扑过滤，host-c 是唯一能补齐分布的域却只余 `1.5 CPU/3Gi`。
+- **只读命令：** `kubectl get pod -n platform player-new -o jsonpath='{.spec.topologySpreadConstraints}{"\n"}'`；`kubectl get pods -n platform -l app=player -o custom-columns='NAME:.metadata.name,NODE:.spec.nodeName'`；`kubectl get nodes -L kubernetes.io/hostname`；再逐台查看 `kubectl describe node <node>`。
+- **关键输出（教学示意）：** 分布 `1/1/0`；约束 `maxSkew=1/DoNotSchedule`；host-c 余额小于 `2 CPU/4Gi`。
+- **能证明：** 在同一快照上可复算“a/b 违反拓扑、c 违反资源”，硬约束交集为空。
+- **不能证明：** 分布与余额是教学数据；静态 API 采样也不等于 scheduler 当轮 snapshot，且错误 selector 会让整个手算失真。
+- **源码映射：** `podtopologyspread/filtering.go` 的 PreFilter/Filter 与 `noderesources/fit.go` 的 Filter。
 
 ---
 
@@ -1812,8 +1740,8 @@ maxSkew = 1
 
 #### 运维现场小案例：100 分偏好为什么救不了未容忍污点
 
-- **现象：** `worker-c` 很空、镜像也在本地，但有 `dedicated=gpu:NoSchedule`，普通 `platform-aggregator` 仍不能去。
-- **只读命令：** `kubectl get pod -n platform platform-aggregator-new-7f8d9 -o yaml`; `kubectl get node worker-c -o jsonpath='taints={.spec.taints}{" labels="}{.metadata.labels}{"\n"}'`; `kubectl describe pod -n platform platform-aggregator-new-7f8d9`
+- **现象：** `worker-c` 很空、镜像也在本地，但有 `dedicated=gpu:NoSchedule`，普通 `activity` 仍不能去。
+- **只读命令：** `kubectl get pod -n platform activity-new-7f8d9 -o yaml`; `kubectl get node worker-c -o jsonpath='taints={.spec.taints}{" labels="}{.metadata.labels}{"\n"}'`; `kubectl describe pod -n platform activity-new-7f8d9`
 - **关键输出（教学示意）：** FailedScheduling 包含 untolerated taint；任何镜像或资源偏好分都只对 feasibleNodes 生效。
 - **能证明：** 该 Node 在硬 Filter 阶段被排除，因此不属于本轮 Score 候选集。
 - **不能证明：** Event 不会展示“如果去掉污点它能得多少分”，也不能据此建议绕过 GPU 隔离合同。
@@ -1831,7 +1759,7 @@ resourceScore = (capacity - requestedAfterPod) / capacity * 100
 
 多个配置资源再按资源权重求平均。真实代码使用整数运算，且 `requested` 包含当前准备放入的 Pod。
 
-例如有两个已通过 Filter 的 Node，本 Pod 为 `1400m`：
+例如有两个已通过 Filter 的 Node，本 Pod 为 `1000m`：
 
 | Node | CPU capacity | 放入前 requested | 放入后 requested | CPU 剩余比例 |
 |---|---:|---:|---:|---:|
@@ -1842,8 +1770,8 @@ resourceScore = (capacity - requestedAfterPod) / capacity * 100
 
 #### 运维现场小案例：手算 worker-d 与 worker-e，但不把手算冒充最终总分
 
-- **现象：** 两台 Node 都能放 `1400m`，想验证默认资源倾向为何更喜欢 `worker-d`。
-- **只读命令：** `kubectl describe node worker-d`; `kubectl describe node worker-e`; `kubectl get pod -n platform platform-aggregator-new-7f8d9 -o jsonpath='{range .spec.containers[*]}{.resources.requests.cpu}{"\n"}{end}'`
+- **现象：** 两台 Node 都能放 `1000m`，想验证默认资源倾向为何更喜欢 `worker-d`。
+- **只读命令：** `kubectl describe node worker-d`; `kubectl describe node worker-e`; `kubectl get pod -n platform activity-new-7f8d9 -o jsonpath='{range .spec.containers[*]}{.resources.requests.cpu}{"\n"}{end}'`
 - **关键输出（教学示意）：** d 放入后 CPU request 占 `42.5%`，e 占 `73.75%`；只看 CPU，LeastAllocated 给 d 更高分。
 - **能证明：** API 账支持按当前默认公式复算单个资源的相对倾向。
 - **不能证明：** `describe node` 不含 assumed Pod，且最终总分还含 memory、其他 Score 插件、归一化与权重，不能仅凭 CPU 宣告最终节点。
@@ -1862,7 +1790,7 @@ GPU 平台可能想对 GPU 采用装箱以减少碎片，却对 CPU/memory 或�
 #### 运维现场小案例：平台说“已经启用 GPU 装箱”，先找实际 profile 证据
 
 - **现象：** GPU Pod 仍被摊开到很多节点，平台文档却写着 `MostAllocated`。
-- **只读命令：** `kubectl get pod -n ml train-a100 -o jsonpath='scheduler={.spec.schedulerName}{"\n"}'`; `$sp=kubectl get pod -n kube-system -l component=kube-scheduler -o jsonpath='{.items[0].metadata.name}'; kubectl get pod -n kube-system $sp -o yaml`
+- **只读命令：** `kubectl get pod -n ml-lab train-a100 -o jsonpath='scheduler={.spec.schedulerName}{"\n"}'`; `$sp=kubectl get pod -n kube-system -l component=kube-scheduler -o jsonpath='{.items[0].metadata.name}'; kubectl get pod -n kube-system $sp -o yaml`
 - **关键输出（教学示意）：** Pod 使用哪个 schedulerName，以及 scheduler Pod 的 `--config`、镜像、挂载来源。
 - **能证明：** 工作负载路由到哪个 profile，并能定位进程声称读取的配置入口。
 - **不能证明：** Pod spec 本身不展开最终插件参数；仅看到 `--config` 路径也不能证明文件内容、热更新或托管控制面实际实现。
@@ -1874,8 +1802,8 @@ GPU 平台可能想对 GPU 采用装箱以减少碎片，却对 CPU/memory 或�
 
 #### 运维现场小案例：十只同模板 Pod 分布不同，不能直接归因于“随机打散”
 
-- **现象：** 十只 `platform-aggregator` 被分到多个同规格 Node，团队断言 scheduler 在普通 Score 平局时必然随机。
-- **只读命令：** `kubectl get pods -n platform -l app=platform-aggregator -o custom-columns='NAME:.metadata.name,NODE:.spec.nodeName,UID:.metadata.uid' --sort-by=.metadata.creationTimestamp`
+- **现象：** 隔离实验的十只 `score-demo` Pod 被分到多个同规格 Node，团队断言 scheduler 在普通 Score 平局时必然随机。
+- **只读命令：** `kubectl get pods -n scheduler-lab -l app=score-demo -o custom-columns='NAME:.metadata.name,NODE:.spec.nodeName,UID:.metadata.uid' --sort-by=.metadata.creationTimestamp`
 - **关键输出（教学示意）：** Pod 分布在 `worker-d/e/f`，但各轮 NodeInfo、拓扑分、镜像状态可能都已变化。
 - **能证明：** 最终 API 放置结果以及每个 Pod 实例的身份和顺序，可用于发现分布现象。
 - **不能证明：** 结果分散不能证明 `Randomizer` 被赋值；本提交普通 Framework Score 路径与含 extender 的路径边界不同。
@@ -1887,8 +1815,8 @@ GPU 平台可能想对 GPU 采用装箱以减少碎片，却对 CPU/memory 或�
 
 #### 运维现场小案例：已经 Scheduled，为什么仍然 ImagePullBackOff
 
-- **现象：** `platform-aggregator` 已有 `NODE=worker-d`，随后因私有仓库认证失败进入 `ImagePullBackOff`。
-- **只读命令：** `kubectl get pod -n platform platform-aggregator-new-7f8d9 -o wide`; `kubectl describe pod -n platform platform-aggregator-new-7f8d9`; `kubectl get events -n platform --field-selector involvedObject.name=platform-aggregator-new-7f8d9 --sort-by='.metadata.creationTimestamp'`
+- **现象：** `activity` 已有 `NODE=worker-d`，随后因私有仓库认证失败进入 `ImagePullBackOff`。
+- **只读命令：** `kubectl get pod -n platform activity-new-7f8d9 -o wide`; `kubectl describe pod -n platform activity-new-7f8d9`; `kubectl get events -n platform --field-selector involvedObject.name=activity-new-7f8d9 --sort-by='.metadata.creationTimestamp'`
 - **关键输出（教学示意）：** `PodScheduled=True` 在前，随后出现 kubelet 的 `Failed to pull image`。
 - **能证明：** scheduler 已完成节点持久化，当前失败位于节点侧镜像兑现链，而不是普通 Filter/Score 未完成。
 - **不能证明：** 不能从最终 Node 反推出 ImageLocality 分数，更不能证明镜像层在选点时完整、可用且认证有效。
@@ -1925,18 +1853,18 @@ sequenceDiagram
     participant I as informer
 
     S->>S: Filter/Score 得到 worker-a
-    S->>C: Assume，内存先记 platform-aggregator 占 1400m
+    S->>C: Assume，内存先记 activity 占 1000m
     Note over C,A: 此时 API 中可能仍显示 NODE=<none>
     S->>B: goroutine 异步绑定
-    B->>A: Binding(platform-aggregator, worker-a)
+    B->>A: Binding(activity, worker-a)
     A-->>I: watch 到 spec.nodeName=worker-a
     I->>C: 把 assumed Pod 收敛成真实已绑定 Pod
 ```
 
 #### 运维现场小案例：API 只能看见窗口两端，看不见中间的 Assume
 
-- **现象：** `platform-aggregator` 选点后短暂停留在 `NODE=<none>`，随后才变成 `worker-a`。
-- **只读命令：** `kubectl get pod -n platform platform-aggregator-new-7f8d9 -w -o custom-columns='NAME:.metadata.name,NODE:.spec.nodeName,SCHEDULED:.status.conditions[?(@.type=="PodScheduled")].status,REASON:.status.conditions[?(@.type=="PodScheduled")].reason'`
+- **现象：** `activity` 选点后短暂停留在 `NODE=<none>`，随后才变成 `worker-a`。
+- **只读命令：** `kubectl get pod -n platform activity-new-7f8d9 -w -o custom-columns='NAME:.metadata.name,NODE:.spec.nodeName,SCHEDULED:.status.conditions[?(@.type=="PodScheduled")].status,REASON:.status.conditions[?(@.type=="PodScheduled")].reason'`
 - **关键输出（教学示意）：** 同一 Pod 先显示 `NODE=<none>`，之后显示 `NODE=worker-a`、`SCHEDULED=True`。
 - **能证明：** API 中 `spec.nodeName` 从空到持久化值的责任交接；后续 kubelet 才能按该 Node 接手。
 - **不能证明：** watch 看不到内存里的 `SuggestedHost`、Assume、Reserve 各自何时发生，也不能用轮询间隔精确测 binding 延迟。
@@ -2032,10 +1960,10 @@ func (sched *Scheduler) assumeAndReserve(
 - `*framework.QueuedPodInfo` 是指针；`DeepCopy()` 用新对象隔离修改。
 - `nil` 在这里按返回位置理解：第二个返回值 `nil` 表示没有失败 Status，不是“对象不存在”。
 
-#### 运维现场小案例：Reserve 插件拒绝后，为什么 Node 不能一直少 1400m
+#### 运维现场小案例：Reserve 插件拒绝后，为什么 Node 不能一直少 1000m
 
-- **现象：** 自定义资源 Reserve 返回拒绝，`platform-aggregator` 未绑定；下一只 Pod 仍应能重新使用刚才的通用容量。
-- **只读命令：** `kubectl get pod -n platform platform-aggregator-new-7f8d9 -o wide`; `kubectl logs -n kube-system -l component=kube-scheduler --since=10m --timestamps --prefix | Select-String 'platform-aggregator-new-7f8d9|Reserve|Unreserve|ForgetPod'`
+- **现象：** 自定义资源 Reserve 返回拒绝，`activity` 未绑定；下一只 Pod 仍应能重新使用刚才的通用容量。
+- **只读命令：** `kubectl get pod -n platform activity-new-7f8d9 -o wide`; `kubectl logs -n kube-system -l component=kube-scheduler --since=10m --timestamps --prefix | Select-String 'activity-new-7f8d9|Reserve|Unreserve|ForgetPod'`
 - **关键输出（教学示意）：** `NODE=<none>`，受控高日志级别显示 Reserve 失败后进入 Unreserve/Forget 相关路径。
 - **能证明：** API 未绑定；若日志完整，还能定位原始 Reserve 拒绝及随后补偿发生的时间关系。
 - **不能证明：** `kubectl describe node` 不直接展示 assumed 账；缺少插件日志时不能仅凭容量恢复断言所有插件私有状态都已正确清理。
@@ -2055,7 +1983,7 @@ Framework 契约要求 `Unreserve` 幂等，甚至可能在对应 Reserve 没有
 #### 运维现场小案例：节点通用账恢复了，PVC 选择为什么还要单独核对
 
 - **现象：** 绑定失败后 CPU 余额恢复，但使用 WFFC 的 PVC 仍保留需要调查的卷对象状态。
-- **只读命令：** `kubectl get pod -n platform platform-aggregator-new-7f8d9 -o wide`; `kubectl get pvc -n platform -o yaml`; `kubectl get pv -o wide`
+- **只读命令：** `kubectl get pod -n platform activity-new-7f8d9 -o wide`; `kubectl get pvc -n platform -o yaml`; `kubectl get pv -o wide`
 - **关键输出（教学示意）：** Pod 没有 `nodeName`；PVC/PV 展示的是卷控制面事实，而不是 scheduler 通用 NodeInfo CPU 账。
 - **能证明：** API 中 Pod 与卷对象当前各自处于什么状态，提醒值班人不要把“Forget 通用占账”误当成“所有插件状态都已撤销”。
 - **不能证明：** kubectl 无法直接观察 `Unreserve` 是否被逆序调用或是否幂等；这需要源码、插件指标/日志或受控测试。
@@ -2078,7 +2006,7 @@ Wait 适合表达“单个 Pod 已选好位置，但必须等一个协调条件�
 #### 运维现场小案例：自定义 gang profile 的 Pod 选好位置后仍不 Bind
 
 - **现象：** `train-a100` 使用自定义 schedulerName，Permit 插件等待同组成员到齐；API 中 `nodeName` 仍为空。
-- **只读命令：** `kubectl get pod -n ml train-a100 -o jsonpath='scheduler={.spec.schedulerName}{" node="}{.spec.nodeName}{" nominated="}{.status.nominatedNodeName}{"\n"}'`; `kubectl logs -n kube-system -l component=kube-scheduler --since=10m --prefix | Select-String 'train-a100|Permit|waiting|reject|timeout'`
+- **只读命令：** `kubectl get pod -n ml-lab train-a100 -o jsonpath='scheduler={.spec.schedulerName}{" node="}{.spec.nodeName}{" nominated="}{.status.nominatedNodeName}{"\n"}'`; `kubectl logs -n kube-system -l component=kube-scheduler --since=10m --prefix | Select-String 'train-a100|Permit|waiting|reject|timeout'`
 - **关键输出（教学示意）：** `scheduler=gpu-gang-scheduler node=`，插件日志明确记录 Permit Wait，稍后才 Allow 或 timeout。
 - **能证明：** 只有在实际自定义 profile 日志明确时，才能把这次空 `nodeName` 定位为 Permit 等待而非普通 Filter 失败。
 - **不能证明：** 普通默认 Pod 的空 `nodeName` 不代表 Permit Wait；本提交原生 GangScheduling 默认关闭，也不能靠 nomination 代替等待证据。
@@ -2116,8 +2044,8 @@ binding := &v1.Binding{
 
 #### 运维现场小案例：`Scheduled` 只证明写入 Node，不证明应用已经启动
 
-- **现象：** `platform-aggregator` 出现 Normal `Scheduled`，但容器仍在 `ContainerCreating`。
-- **只读命令：** `kubectl get pod -n platform platform-aggregator-new-7f8d9 -o jsonpath='uid={.metadata.uid}{" node="}{.spec.nodeName}{" phase="}{.status.phase}{"\n"}'`; `kubectl get events -n platform --field-selector involvedObject.name=platform-aggregator-new-7f8d9 --sort-by='.metadata.creationTimestamp'`
+- **现象：** `activity` 出现 Normal `Scheduled`，但容器仍在 `ContainerCreating`。
+- **只读命令：** `kubectl get pod -n platform activity-new-7f8d9 -o jsonpath='uid={.metadata.uid}{" node="}{.spec.nodeName}{" phase="}{.status.phase}{"\n"}'`; `kubectl get events -n platform --field-selector involvedObject.name=activity-new-7f8d9 --sort-by='.metadata.creationTimestamp'`
 - **关键输出（教学示意）：** `node=worker-a phase=Pending`，Event 先有 `Scheduled`，后续可能是 `FailedMount` 或 `Pulling`。
 - **能证明：** Binding 已使 API 中 `spec.nodeName` 持久化，普通 scheduler 选点责任完成。
 - **不能证明：** 不证明 Sandbox、卷挂载、镜像拉取、GPU Allocate 或 readiness 已成功；这些属于节点兑现链。
@@ -2125,10 +2053,10 @@ binding := &v1.Binding{
 
 ### 11.6 绑定失败为什么还要唤醒其他 Pod
 
-假设 Pod A 已 Assume 了最后 `1400m` 余额，异步 Bind 很慢。这期间 Pod B 开始调度，它看到 A 的 assumed 账后因资源不足进入等待。随后 A Bind 失败：
+假设 Pod A 已 Assume 了最后 `1000m` 余额，异步 Bind 很慢。这期间 Pod B 开始调度，它看到 A 的 assumed 账后因资源不足进入等待。随后 A Bind 失败：
 
 ```text
-A: Unreserve + Forget，释放 1400m
+A: Unreserve + Forget，释放 1000m
 B: 如果完全不知道这次释放，就可能继续睡在 unschedulablePods
 ```
 
@@ -2138,7 +2066,7 @@ B: 如果完全不知道这次释放，就可能继续睡在 unschedulablePods
 
 #### 运维现场小案例：A 绑定失败后，B 为什么突然又被尝试
 
-- **现象：** A 曾 Assume `worker-a` 最后 1400m，B 因 CPU 不足等待；A Bind 失败后，B 很快再次进入调度。
+- **现象：** A 曾 Assume `worker-a` 最后 1000m，B 因 CPU 不足等待；A Bind 失败后，B 很快再次进入调度。
 - **只读命令：** `kubectl logs -n kube-system -l component=kube-scheduler --since=10m --timestamps --prefix | Select-String 'pod-a|pod-b|Binding|Forget|FailedScheduling'`; `kubectl get pods -n platform pod-a pod-b -o wide`
 - **关键输出（教学示意）：** A 的 binding error/清理在前，B 的新调度尝试或成功绑定在后。
 - **能证明：** 在完整日志下可建立“失败释放临时账—另一 Pod 重新尝试”的时间线，与补偿唤醒设计一致。
@@ -2158,7 +2086,7 @@ B: 如果完全不知道这次释放，就可能继续睡在 unschedulablePods
 #### 运维现场小案例：看到 Pod 又入队，先问漏清了哪一本账
 
 - **现象：** 自定义 Reserve 失败后同一 Pod 重试，平台怀疑出现“幽灵占用”或重复 in-flight 记录。
-- **只读命令：** `$podKey='platform/platform-aggregator-new-7f8d9'; $uid=kubectl get pod -n platform platform-aggregator-new-7f8d9 -o jsonpath='{.metadata.uid}'; kubectl logs -n kube-system -l component=kube-scheduler --since=15m --tail=-1 --prefix | Select-String -SimpleMatch $podKey; kubectl get events -n platform --field-selector "involvedObject.uid=$uid" --sort-by='.metadata.creationTimestamp'; kubectl get pod -n platform platform-aggregator-new-7f8d9 -o wide`
+- **只读命令：** `$podKey='platform/activity-new-7f8d9'; $uid=kubectl get pod -n platform activity-new-7f8d9 -o jsonpath='{.metadata.uid}'; kubectl logs -n kube-system -l component=kube-scheduler --since=15m --tail=-1 --prefix | Select-String -SimpleMatch $podKey; kubectl get events -n platform --field-selector "involvedObject.uid=$uid" --sort-by='.metadata.creationTimestamp'; kubectl get pod -n platform activity-new-7f8d9 -o wide`
 - **关键输出（教学示意）：** API 只给最终 nodeName/Condition，详细日志可能分别出现 queue completion、plugin rollback、cache forget 线索。
 - **能证明：** `namespace/name` 日志、UID Event 与最终 API 状态在同一时间窗互相印证时，可判断应该深入队列、插件还是 cache；UID 负责对象身份，不能替代日志实际打印的键。
 - **不能证明：** kubectl 没有 `Done/Forget/Unreserve` 状态字段；只有源码或可观测性明确记录时，才能断言具体哪个清理漏掉。
@@ -2216,8 +2144,8 @@ B: 如果完全不知道这次释放，就可能继续睡在 unschedulablePods
 
 #### 运维现场小案例：同名 Pod 已重建，旧失败不能写到新对象上
 
-- **现象：** Deployment 快速重建了 `platform-aggregator-new-7f8d9`，告警仍引用旧 Pod 的 FailedScheduling。
-- **只读命令：** `$IncidentUID='<告警中保存的旧UID>'; kubectl get pod -n platform platform-aggregator-new-7f8d9 -o jsonpath='currentUID={.metadata.uid}{" rv="}{.metadata.resourceVersion}{" node="}{.spec.nodeName}{"\n"}'; "incidentUID=$IncidentUID"`
+- **现象：** Deployment 快速重建了 `activity-new-7f8d9`，告警仍引用旧 Pod 的 FailedScheduling。
+- **只读命令：** `$IncidentUID='<告警中保存的旧UID>'; kubectl get pod -n platform activity-new-7f8d9 -o jsonpath='currentUID={.metadata.uid}{" rv="}{.metadata.resourceVersion}{" node="}{.spec.nodeName}{"\n"}'; "incidentUID=$IncidentUID"`
 - **关键输出（教学示意）：** `incidentUID=111...`，`currentUID=222...`；名称相同但对象实例不同。
 - **能证明：** 当前 Pod 的 UID/resourceVersion/nodeName，并能确认历史证据是否属于同一个对象实例。
 - **不能证明：** 这条 API 查询不能直接证明 FailureHandler 当时执行了哪一个分支；需要 scheduler 日志或源码来确认重排决策。
@@ -2244,7 +2172,7 @@ sequenceDiagram
     participant S as scheduling cycle
     participant E as Node/Pod informer event
 
-    Q->>S: Pop platform-aggregator，并记 in-flight 边界
+    Q->>S: Pop activity，并记 in-flight 边界
     E-->>Q: 旧 Pod Delete，资源可能释放
     Note over Q: 把事件记到 in-flight event 链
     S->>S: 本轮旧 snapshot 得到 FitError
@@ -2255,8 +2183,8 @@ sequenceDiagram
 
 #### 运维现场小案例：资源删除发生在调度中间，为什么下一轮没有睡死
 
-- **现象：** `worker-a` 的旧 Pod 在 `platform-aggregator` 本轮计算期间被删除，本轮仍失败，但很快又发生一次尝试。
-- **只读命令：** `kubectl get events -n platform --sort-by='.metadata.creationTimestamp' -o custom-columns='TIME:.metadata.creationTimestamp,OBJ:.involvedObject.name,REASON:.reason,COUNT:.count,MESSAGE:.message' | Select-Object -Last 40`; `kubectl logs -n kube-system -l component=kube-scheduler --since=10m --timestamps --prefix | Select-String 'platform-aggregator-new|Checking events for in-flight pod'`
+- **现象：** `worker-a` 的旧 Pod 在 `activity` 本轮计算期间被删除，本轮仍失败，但很快又发生一次尝试。
+- **只读命令：** `kubectl get events -n platform --sort-by='.metadata.creationTimestamp' -o custom-columns='TIME:.metadata.creationTimestamp,OBJ:.involvedObject.name,REASON:.reason,COUNT:.count,MESSAGE:.message' | Select-Object -Last 40`; `kubectl logs -n kube-system -l component=kube-scheduler --since=10m --timestamps --prefix | Select-String 'activity-new|Checking events for in-flight pod'`
 - **关键输出（教学示意）：** 删除/失败/重试在时间线上交错；V(5) 日志可能显示检查 in-flight events。
 - **能证明：** 有完整日志时可确认调度器为该 in-flight Pod 回看了调度期间发生的事件。
 - **不能证明：** Kubernetes Event 可能聚合、限流，单靠 Event 时间不能精确重建 `Pop` 边界或内部 queue transition。
@@ -2274,12 +2202,12 @@ worker-c -> TaintToleration
 
 如果 `worker-a` 上一个已绑定 Pod 删除，NodeResourcesFit 可以判断它可能释放 request；这值得唤醒。本案若只是某个无关 Secret 更新，则上述插件通常没有理由认为结果会改变。
 
-QueueingHint 是“值得重算”的提示，不是“保证下一次成功”。释放 `500m` 也可能触发重试，但本 Pod 仍需要 `1400m`，下一轮照样失败。
+QueueingHint 是“值得重算”的提示，不是“保证下一次成功”。释放 `500m` 也可能触发重试，但本 Pod 仍需要 `1000m`，下一轮照样失败。
 
 #### 运维现场小案例：删 Secret 没动静，释放 CPU 后却重新尝试
 
-- **现象：** `platform-aggregator` 上轮被 `NodeResourcesFit` 拒绝；无关 Secret 更新未改变结果，节点上已绑定 Pod 删除后出现重试。
-- **只读命令：** `kubectl get events -n platform --sort-by='.metadata.creationTimestamp' | Select-Object -Last 40`; `kubectl logs -n kube-system -l component=kube-scheduler --since=10m --prefix | Select-String 'platform-aggregator-new|QueueingHint|NodeResourcesFit'`
+- **现象：** `activity` 上轮被 `NodeResourcesFit` 拒绝；无关 Secret 更新未改变结果，节点上已绑定 Pod 删除后出现重试。
+- **只读命令：** `kubectl get events -n platform --sort-by='.metadata.creationTimestamp' | Select-Object -Last 40`; `kubectl logs -n kube-system -l component=kube-scheduler --since=10m --prefix | Select-String 'activity-new|QueueingHint|NodeResourcesFit'`
 - **关键输出（教学示意）：** 高日志级别下，NodeResourcesFit 对资源相关事件给出值得 Queue 的线索；无关对象没有同类证据。
 - **能证明：** 日志明确记录时，可确认哪个上轮 rejector 对哪个 ClusterEvent 参与了 QueueingHint 判断。
 - **不能证明：** 被 Queue 只代表值得重算，不保证资源已足够；普通 kubectl 也看不到完整的内部 Queue/QueueSkip 结果。
@@ -2299,8 +2227,8 @@ QueueingHint 是“值得重算”的提示，不是“保证下一次成功”�
 
 #### 运维现场小案例：失败间隔在变长，为什么不能据此断言是固定 1/2/4 秒
 
-- **现象：** 同一个 `platform-aggregator` 多次失败，Event 的 count 增长但不再高频刷屏。
-- **只读命令：** `kubectl get events -n platform --field-selector involvedObject.name=platform-aggregator-new-7f8d9 --sort-by='.metadata.creationTimestamp' -o custom-columns='FIRST:.firstTimestamp,LAST:.lastTimestamp,COUNT:.count,REASON:.reason,MESSAGE:.message'`; `kubectl logs -n kube-system -l component=kube-scheduler --since=15m --timestamps --prefix | Select-String 'platform-aggregator-new-7f8d9'`
+- **现象：** 同一个 `activity` 多次失败，Event 的 count 增长但不再高频刷屏。
+- **只读命令：** `kubectl get events -n platform --field-selector involvedObject.name=activity-new-7f8d9 --sort-by='.metadata.creationTimestamp' -o custom-columns='FIRST:.firstTimestamp,LAST:.lastTimestamp,COUNT:.count,REASON:.reason,MESSAGE:.message'`; `kubectl logs -n kube-system -l component=kube-scheduler --since=15m --timestamps --prefix | Select-String 'activity-new-7f8d9'`
 - **关键输出（教学示意）：** 聚合 Event 只显示 `COUNT` 与时间范围；完整日志才可能看到多次 attempt 的实际时间点。
 - **能证明：** Pod 确实重复失败且被 Event 聚合，日志时间可用于观察现场节奏。
 - **不能证明：** Event 聚合值不能反推出每次精确 backoff；实际初始/上限值还可能被组件配置覆盖，且事件唤醒会影响观察间隔。
@@ -2326,7 +2254,7 @@ QueueingHint 是“值得重算”的提示，不是“保证下一次成功”�
 #### 运维现场小案例：告警系统只采 Event，为什么会把旧原因当成当前状态
 
 - **现象：** 历史 Event 仍有 `Insufficient cpu`，但 Pod 当前已绑定；另一只 Pod 的 Condition 仍是 `SchedulerError`。
-- **只读命令：** `kubectl get pod -n platform platform-aggregator-new-7f8d9 -o jsonpath='node={.spec.nodeName}{range .status.conditions[?(@.type=="PodScheduled")]}{" status="}{.status}{" reason="}{.reason}{" updated="}{.lastTransitionTime}{end}{"\n"}'`; `kubectl get events -n platform --field-selector involvedObject.name=platform-aggregator-new-7f8d9 --sort-by='.metadata.creationTimestamp'`
+- **只读命令：** `kubectl get pod -n platform activity-new-7f8d9 -o jsonpath='node={.spec.nodeName}{range .status.conditions[?(@.type=="PodScheduled")]}{" status="}{.status}{" reason="}{.reason}{" updated="}{.lastTransitionTime}{end}{"\n"}'`; `kubectl get events -n platform --field-selector involvedObject.name=activity-new-7f8d9 --sort-by='.metadata.creationTimestamp'`
 - **关键输出（教学示意）：** 当前 `node=worker-a status=True`，Event 列表仍保留或聚合过往失败观察。
 - **能证明：** Condition/nodeName 给当前 API 汇总，Event 给离散历史观察；两者必须按时间和对象 UID一起读。
 - **不能证明：** Condition 也可能短暂落后于 scheduler 内存；Event 不保证完整、严格有序或永久保留。
@@ -2361,13 +2289,14 @@ PostFilter 自身 Error
 #### 运维现场小案例：同样 NODE 为空，沿 Status 传播找不同责任方
 
 - **现象：** A 是 `Unschedulable`，B 是 `SchedulerError`，C 有 nomination 但当前轮仍失败。
-- **只读命令：** `kubectl get pods -n platform -o jsonpath='{range .items[*]}{.metadata.name}{" node="}{.spec.nodeName}{" nominated="}{.status.nominatedNodeName}{range .status.conditions[?(@.type=="PodScheduled")]}{" reason="}{.reason}{" message="}{.message}{end}{"\n"}{end}'`; `kubectl logs -n kube-system -l component=kube-scheduler --since=10m --prefix | Select-String 'PostFilter|SchedulerError|platform-aggregator'`
+- **只读命令：** `kubectl get pods -n platform -o jsonpath='{range .items[*]}{.metadata.name}{" node="}{.spec.nodeName}{" nominated="}{.status.nominatedNodeName}{range .status.conditions[?(@.type=="PodScheduled")]}{" reason="}{.reason}{" message="}{.message}{end}{"\n"}{end}'`; `kubectl logs -n kube-system -l component=kube-scheduler --since=10m --prefix | Select-String 'PostFilter|SchedulerError|activity'`
 - **关键输出（教学示意）：** API 分类显示业务拒绝、内部错误和 nomination；日志补足具体插件/阶段。
 - **能证明：** 能先按当前 API 状态把排障分流，再用日志定位是 Filter/Score/基础设施还是 PostFilter 旁支。
 - **不能证明：** Condition message 不是稳定机器接口；尤其 PostFilter Error 在本提交会被记录，却仍以原 FitError/Unschedulable 向外返回。
 - **源码映射：** `pkg/scheduler/schedule_one.go` 的 `schedulingAlgorithm`/`handleSchedulingFailure`、`pkg/scheduler/framework/runtime/framework.go:RunPostFilterPlugins`、`pkg/scheduler/backend/queue/scheduling_queue.go:AddUnschedulableIfNotPresent`。
 
 ---
+
 ## 13. 优先级与抢占：不是“高优先级 Pod 直接把低优先级 Pod 踢掉”
 
 ### 13.1 先把两个概念拆开
@@ -2400,11 +2329,11 @@ flowchart TD
 
 #### 运维现场小案例：高优先级先排队，不等于已经抢占
 
-- **背景：** 案例 B 的 `platform/pay-recovery` 优先级为 `100000`，但仍 Pending；值班同学看到“高优先级”就判断 scheduler 会立刻删低优先级 Pod。
+- **背景：** 案例 B 的 `platform/player-recovery` 优先级为 `100000`，但仍 Pending；值班同学看到“高优先级”就判断 scheduler 会立刻删低优先级 Pod。
 - **只读命令：**
   ```powershell
-  kubectl get pod -n platform pay-recovery -o custom-columns='NAME:.metadata.name,PRI:.spec.priority,NODE:.spec.nodeName,NOMINATED:.status.nominatedNodeName'
-  kubectl get events -n platform --field-selector involvedObject.name=pay-recovery --sort-by='.metadata.creationTimestamp'
+  kubectl get pod -n platform player-recovery -o custom-columns='NAME:.metadata.name,PRI:.spec.priority,NODE:.spec.nodeName,NOMINATED:.status.nominatedNodeName'
+  kubectl get events -n platform --field-selector involvedObject.name=player-recovery --sort-by='.metadata.creationTimestamp'
   ```
 - **示例证据（教学示意）：** `PRI=100000`、`NODE=<none>`、`NOMINATED=<none>`，Event 只说明本轮不可调度。
 - **能证明：** API 中的最终优先级、尚未绑定状态，以及 Pod 至少经历过一次调度观察。
@@ -2438,10 +2367,10 @@ flowchart TD
 
 #### 运维现场小案例：6 核恢复 Pod 如何挑受害者
 
-- **背景：** 案例 B 的教学变体中，`pay-recovery` 需要 6 核，`worker-a` 上两个低优先级报表 Pod 各占 3 核；业务问“scheduler 是不是随便删一个”。
+- **背景：** 案例 B 的教学变体中，`player-recovery` 需要 6 核，`worker-a` 上两个低优先级报表 Pod 各占 3 核；业务问“scheduler 是不是随便删一个”。
 - **只读命令：**
   ```powershell
-  kubectl get pod -n platform pay-recovery -o custom-columns='NODE:.spec.nodeName,NOMINATED:.status.nominatedNodeName,PRI:.spec.priority'
+  kubectl get pod -n platform player-recovery -o custom-columns='NODE:.spec.nodeName,NOMINATED:.status.nominatedNodeName,PRI:.spec.priority'
   kubectl get pods -A --field-selector spec.nodeName=worker-a -o custom-columns='NS:.metadata.namespace,NAME:.metadata.name,PRI:.spec.priority,DELETING:.metadata.deletionTimestamp'
   ```
 - **示例证据（教学示意）：** preemptor 提名 `worker-a`；只有最终受害者出现 `deletionTimestamp`。
@@ -2478,7 +2407,7 @@ flowchart TD
 
 ### 13.4 `nominatedNodeName` 只是预约提示
 
-假设高优先级 Pod `pay-recovery` 抢占后被提名到 `worker-a`：
+假设高优先级 Pod `player-recovery` 抢占后被提名到 `worker-a`：
 
 ```text
 status.nominatedNodeName = worker-a
@@ -2496,12 +2425,12 @@ spec.nodeName           = ""
 
 因此排障时必须同时看 `spec.nodeName` 与 `status.nominatedNodeName`，不能只看后者就宣布“已经调度成功”。
 
-#### 运维现场小案例：有 nomination，为什么 30 秒内仍未绑定
+#### 运维现场小案例：有 nomination，十分钟后仍未绑定
 
-- **背景：** 案例 B 的 `platform/pay-recovery` 显示提名 `worker-a`，业务把它当成“调度成功”，但受害者仍在 30 秒优雅退出。
+- **背景：** 案例 B 的 `platform/player-recovery` 显示提名 `worker-a`，业务把它当成“调度成功”，但受害者仍在 90 秒优雅退出；`preStop sleep 15` 包含在该窗口内。
 - **只读命令：**
   ```powershell
-  kubectl get pod -n platform pay-recovery -o custom-columns='UID:.metadata.uid,NODE:.spec.nodeName,NOMINATED:.status.nominatedNodeName,PHASE:.status.phase'
+  kubectl get pod -n platform player-recovery -o custom-columns='UID:.metadata.uid,NODE:.spec.nodeName,NOMINATED:.status.nominatedNodeName,PHASE:.status.phase'
   kubectl get pods -A --field-selector spec.nodeName=worker-a -o custom-columns='NS:.metadata.namespace,NAME:.metadata.name,DELETING:.metadata.deletionTimestamp,GRACE:.spec.terminationGracePeriodSeconds'
   ```
 - **示例证据（教学示意）：** `NODE=<none>`、`NOMINATED=worker-a`；受害者已有删除时间但尚未退出。
@@ -2558,11 +2487,11 @@ description: "高排队优先级，但不主动抢占其他 Pod"
 
 #### 运维现场小案例：`Never` 仍排队靠前，但不主动抢占
 
-- **背景：** 案例 B 的教学变体把 `pay-recovery` 改用 `business-high-non-preempting`；它比普通 Pod 更早被尝试，却没有受害者。
+- **背景：** 案例 B 的教学变体把 `player-recovery` 改用 `business-high-non-preempting`；它比普通 Pod 更早被尝试，却没有受害者。
 - **只读命令：**
   ```powershell
   kubectl get priorityclass business-high-non-preempting -o custom-columns='VALUE:.value,POLICY:.preemptionPolicy,GLOBAL:.globalDefault'
-  kubectl get pod -n platform pay-recovery -o custom-columns='PRI:.spec.priority,PC:.spec.priorityClassName,NODE:.spec.nodeName,NOMINATED:.status.nominatedNodeName'
+  kubectl get pod -n platform player-recovery -o custom-columns='PRI:.spec.priority,PC:.spec.priorityClassName,NODE:.spec.nodeName,NOMINATED:.status.nominatedNodeName'
   ```
 - **示例证据（教学示意）：** `VALUE=100000 POLICY=Never`，Pod 仍未绑定且没有 nomination。
 - **能证明：** 该 Pod 的优先级与“不主动抢占”策略。
@@ -2574,40 +2503,12 @@ description: "高排队优先级，但不主动抢占其他 Pod"
 
 ## 14. 从单个 Pod 上升到业务平台：调度前、调度中、调度后分别由谁负责
 
-### 14.1 先套回真实交付链：Git、Argo、Deployment、Scheduler 不是一个控制器
-
-公司平台里的完整责任链更接近：
-
-```text
-Git/Kustomize overlay
-  -> Argo CD root Application
-  -> ApplicationSet
-  -> child Application
-  -> 目标 EKS API
-  -> Deployment / ReplicaSet
-  -> 尚未绑定的 Pod
-  -> kube-scheduler 选 Node 并 Bind
-  -> kubelet / CSI / CNI / runtime
-  -> startup/readiness/liveness 与业务流量
-```
-
-| 现场问题 | 第一责任域 | Scheduler 何时才进入主线 |
-|---|---|---|
-| Git 与 live image 不同 | 先确认环境的 image 所有权、Application ignoreDifferences 与本次 operation syncOptions | 错误同步确实创建了新 Pod，且该 Pod 还没有 `spec.nodeName` |
-| replicas 突然变化 | Git/Argo、HPA/人工扩缩容、Deployment controller | 新增 Pod 已被 API 接收但没有可行 Node |
-| rollout 卡住但 Pod 已有 Node | kubelet、镜像、卷、探针、应用启动与流量摘除 | 普通选点已经结束，不应先重启 scheduler |
-| UAT 一次出现多服务新 Pod | 全天自动同步与提交批次设计 | 每个 Pod 仍独立进入队列，但上游同时制造了调度洪峰 |
-
-Git push 只改变远端 revision，不等于 Kubernetes 已完成 Sync；root Application、ApplicationSet 和 child Application 还要分别 reconcile。三套环境不能共用一份所有权假设。dev 可以保留 live image 和临时 replicas；UAT 保留 image、由 Git 管 replicas；prod 走人工发布并逐服务审批。Scheduler 不理解这些组织规则，它只读取 API Server 中最终出现的 Pod。因此值班取证必须先保存 Git revision、Application revision/operation、Deployment generation，再进入 Pod UID、Event 与调度插件证据。
-
-真实分批同步事件也说明了这一点：操作级 Sync 参数没有继承完整的 `RespectIgnoreDifferences=true`，live image 被 bootstrap image 短暂覆盖。正确处置是停止后续批次、按快照恢复、核对 operation syncOptions，并先用无差异 Sync 证明 image、replicas、generation 和 Pod UID 不再变化；把这个事故归因于 Scheduler 会找错责任方。
-
-### 14.2 一张图看清三层控制
+### 14.1 一张图看清三层控制
 
 ```mermaid
 flowchart LR
     subgraph A["第一层：业务准入与排队"]
-        A1["GitOps / 发布平台"]
+        A1["Deployment / 发布系统"]
         A2["API Server Admission"]
         A3["ResourceQuota / LimitRange / Policy"]
         A4["Kueue 等工作负载准入"]
@@ -2639,22 +2540,23 @@ flowchart LR
 - **已经有 `spec.nodeName`，但容器没运行**：优先查 kubelet、镜像、卷、设备、runtime 和应用；
 - **容器运行但性能差**：优先查运行时用量、CPU throttling、NUMA、GPU 利用率、存储与网络，而不是直接怪 Score。
 
-#### 运维现场小案例：Deployment 要 4 个副本，API 中却只有 3 个 Pod
 
-- **背景：** 案例 A 的教学变体中，`platform/platform-aggregator` 期望 4 副本，ResourceQuota 让 ReplicaSet 创建第 4 个 Pod 失败；值班却先查 scheduler。
+#### 运维现场小案例：单副本 Deployment 已更新，API 中为什么一个新 Pod 都没有
+
+- **背景：** 案例 A 的隔离变体中，`platform/activity` 期望 1 个副本；ReplicaSet 创建新 Pod 时被 ResourceQuota 拒绝，API 中仍只有旧 Pod。此时不是 Node Filter 失败。
 - **只读命令：**
   ```powershell
-  kubectl get deploy,rs,pod -n platform -l app=platform-aggregator -o wide
+  kubectl get deploy,rs,pod -n platform -l app=activity -o wide
   kubectl get resourcequota -n platform
   kubectl get events -n platform --field-selector involvedObject.kind=ReplicaSet --sort-by='.metadata.creationTimestamp'
   ```
-- **示例证据（教学示意）：** Deployment desired=4，API 中只有 3 个 Pod；ReplicaSet Event 指向配额拒绝。
-- **能证明：** 缺失 Pod 从未进入 scheduler 责任域，问题在控制器/API 准入链。
-- **不能证明/时间边界：** Event 会聚合和过期；配额解除后，新建 Pod 仍可能再遇到节点 Filter。
-- **修复/安全边界：** 调整发布规模或经审批改配额；不要删除健康 Pod 来“腾 quota”。
-- **源码/组件映射：** Deployment/ReplicaSet controller 创建 Pod，ResourceQuota admission 决定是否接收；只有已创建未绑定 Pod 才进入 kube-scheduler。
+- **示例证据（教学示意）：** Deployment desired=1，新 ReplicaSet desired=1，但新 RS 的 Pod 数为 0；ReplicaSet Event 指向配额准入拒绝。
+- **能证明：** 缺失的新 Pod 从未进入 scheduler 责任域，问题先在控制器/API 准入链。
+- **不能证明/时间边界：** Event 会聚合和过期；配额解除后，新建 Pod 仍可能再遇到 Node Filter。
+- **修复/安全边界：** 经审批调整配额或发布合同；不要删除健康旧 Pod 来“腾 quota”。
+- **源码/组件映射：** Deployment/ReplicaSet controller 创建 Pod，ResourceQuota admission 决定是否接收；只有已创建且未绑定的 Pod 才进入 kube-scheduler。
 
-### 14.3 平台应把 Pod 规格变成“可治理的合同”
+### 14.2 平台应把 Pod 规格变成“可治理的合同”
 
 调度器不是意图识别器。业务只写 `replicas: 10`，平台必须进一步把意图翻译为明确合同：
 
@@ -2672,21 +2574,23 @@ flowchart LR
 
 `request` 是这里最关键的合同字段之一。它不是平均利用率，也不是“想用多少就填多少”的报价；它决定调度账本认为这个 Pod 至少占多少容量。
 
-#### 运维现场小案例：Helm 写 1200m，最终 Pod 为什么按 1400m 调度
 
-- **背景：** 案例 A 的业务容器 request 是 `1200m`，平台注入 mesh sidecar `200m`；研发只拿 values.yaml 解释 `Insufficient cpu`。
+#### 运维现场小案例：模板只写 limit，最终调度合同为什么仍要看 Pod
+
+- **背景：** 案例 A 的 nonprod 基线在应用容器显式配置 `limits=1 CPU/4Gi`，没有把讲义中的教学 sidecar 当作公司事实。
 - **只读命令：**
   ```powershell
-  kubectl get pod -n platform platform-aggregator-new-7f8d9 -o jsonpath='{range .spec.containers[*]}{.name}{" cpu="}{.resources.requests.cpu}{" mem="}{.resources.requests.memory}{"\n"}{end}'
+  kubectl get deploy -n platform activity -o jsonpath='{range .spec.template.spec.containers[*]}template/{.name}{" request="}{.resources.requests}{" limit="}{.resources.limits}{"\n"}{end}'
+  kubectl get pod -n platform -l app=activity -o jsonpath='{range .items[0].spec.containers[*]}pod/{.name}{" request="}{.resources.requests}{" limit="}{.resources.limits}{"\n"}{end}{"overhead="}{.items[0].spec.overhead}{"\n"}'
   kubectl get limitrange -n platform -o yaml
   ```
-- **示例证据（教学示意）：** API 最终对象显示 `platform-aggregator=1200m`、`mesh-proxy=200m`，常驻容器合计 1400m。
-- **能证明：** scheduler 消费 API 中最终 Pod 合同，而不是仓库模板截图。
-- **不能证明/时间边界：** 单看最终对象不一定能定位是谁注入 sidecar；精确责任还需 admission 配置和审计日志。
-- **修复/安全边界：** 让模板、准入和容量模型使用同一本合同；不要只为消 Pending 把 request 降到启动峰值以下。
-- **源码/组件映射：** `resource.PodRequests` 汇总最终 Pod；`NodeResourcesFit.PreFilter/Filter` 用结果与 `NodeInfo` 比较。
+- **示例证据（教学预期）：** 无其他 admission/default/overhead 时，最终 Pod request 按 `1 CPU/4Gi`；若最终对象出现其他容器或数值，则容量模型必须随之更新。
+- **能证明：** scheduler 实际消费的最终 Pod 合同，而不是仓库模板或平台页面截图。
+- **不能证明/时间边界：** 仅凭最终对象不能唯一定位修改来源；需要 admission 配置、审计日志与生成链继续追查。
+- **修复/安全边界：** 让模板、准入和容量模型使用同一本合同；不要只为消除 Pending 把 request 降到启动峰值以下。
+- **源码/组件映射：** `resource.PodRequests` 汇总最终 Pod；`NodeResourcesFit.PreFilter/Filter` 使用结果与 `NodeInfo` 比较。
 
-### 14.4 节点池不要只靠一个 label
+### 14.3 节点池不要只靠一个 label
 
 生产节点池通常需要成套设计：
 
@@ -2722,10 +2626,10 @@ spec:
 
 #### 运维现场小案例：容忍专池污点的 Pod 为什么落到普通池
 
-- **背景：** 案例 D 的教学变体 `ml/train-a100-canary` 只写了 GPU 池 toleration，没有 required affinity，结果落到一个同样上报 GPU scalar、但属于共享测试池的节点。
+- **背景：** 案例 D 的教学变体 `ml-lab/train-a100-canary` 只写了 GPU 池 toleration，没有 required affinity，结果落到一个同样可行的普通测试节点。
 - **只读命令：**
   ```powershell
-  kubectl get pod -n ml train-a100-canary -o yaml
+  kubectl get pod -n ml-lab train-a100-canary -o yaml
   kubectl get nodes -L platform.example.com/pool,accelerator -o wide
   ```
 - **示例证据（教学示意）：** Pod 容忍 special taint，但 `requiredDuringSchedulingIgnoredDuringExecution` 为空；普通节点也通过硬约束。
@@ -2734,48 +2638,51 @@ spec:
 - **修复/安全边界：** 专池通常组合稳定 label、required affinity、taint 和 toleration；改活跃节点元数据前先评估全部 Pod。
 - **源码/组件映射：** `TaintToleration.Filter` 查准入许可；`NodeAffinity.Filter` 才执行必须匹配的节点集合。
 
-### 14.5 发布系统要把“滚动升级”换算成瞬时容量
 
-假设平台聚合服务：
+### 14.4 发布系统要把 rollout 换算成瞬时 Pod shape
 
-```text
-replicas = 100
-单 Pod request.cpu = 1.4 核
-maxSurge = 25%
-```
-
-稳定态账面 CPU 是 `140` 核，滚动升级时最多额外产生 25 个新 Pod，瞬时调度需求可再增加 `35` 核。还没有算 DaemonSet、系统保留、故障域余量和其他业务同时发布。
-
-因此平台容量公式至少要包含：
+对公司 HK dev 的单副本基线，最小但最容易忽略的计算是：
 
 ```text
-需要的可调度容量
-= 稳定态 requests
-+ 发布 surge
-+ 节点故障余量
-+ 集群扩容生效前的缓冲
-+ 系统组件和 DaemonSet
-+ 业务突发/批任务受控额度
+replicas = 1
+maxSurge = 1
+maxUnavailable = 0
+单 Pod 教学 request = 1 CPU / 4Gi
+
+稳定态 = 1 个 Pod shape
+发布峰值 = 旧 1 + 新 1 = 2 个 Pod shape
+需要额外可行余量 = 至少 1 CPU / 4Gi，且必须落在同一台满足全部硬约束的 Node
 ```
 
-如果平台只按平均 CPU 使用率采购，发布时 Pending 并不是 scheduler 异常，而是合同容量根本不够。
+对案例 F 的 UAT 多服务发布，则要对每个真正发生 PodTemplate 变化的 Deployment 分别计算 surge，再按发布批次汇总。只改副本忽略策略或控制器元数据、没有改变 PodTemplate 时，不会凭空创建一批新 Pod。
 
-#### 运维现场小案例：稳定态够用，为什么只在发布时缺 1400m
+平台容量公式至少要考虑：
 
-- **背景：** 案例 A 为 4 个 Spring Boot 副本、每 Pod `1400m`、`maxSurge=1`；稳定态正常，第 5 个 surge Pod 遇到在线池只余 `800m`。
+```text
+稳定态 requests
++ 当前发布批次的 surge Pod shapes
++ 节点/故障域余量
++ 扩容生效前缓冲
++ 系统组件与 DaemonSet
++ 受控批任务额度
+```
+
+#### 运维现场小案例：稳定态 1 只够用，为什么发布时还缺 1 CPU/4Gi
+
+- **背景：** 案例 A 的 `activity` 为单副本、`maxSurge=1`；旧 Pod Running，新 Pod 需要 `1 CPU/4Gi`，唯一合规 Node 只余 `800m/3Gi`。
 - **只读命令：**
   ```powershell
-  kubectl get deploy -n platform platform-aggregator -o jsonpath='replicas={.spec.replicas}{" surge="}{.spec.strategy.rollingUpdate.maxSurge}{" unavailable="}{.spec.strategy.rollingUpdate.maxUnavailable}{"\n"}'
-  kubectl get rs,pod -n platform -l app=platform-aggregator -o wide
+  kubectl get deploy -n platform activity -o jsonpath='replicas={.spec.replicas}{" surge="}{.spec.strategy.rollingUpdate.maxSurge}{" unavailable="}{.spec.strategy.rollingUpdate.maxUnavailable}{"\n"}'
+  kubectl get rs,pod -n platform -l app=activity -o wide
   kubectl describe node worker-a
   ```
-- **示例证据（教学示意）：** 旧 RS 尚未缩，新 RS 已多建 1 Pod；`worker-a` request 余额 800m，小于新 Pod 的 1400m。
-- **能证明：** rollout surge 确实制造瞬时 request 峰值，并耗尽本例目标池余额。
-- **不能证明/时间边界：** API 快照不含短暂 Assume 账；总核数也不能代替逐节点 shape。
-- **修复/安全边界：** 在扩容、surge、unavailable 和发布批次间权衡；策略修改会改变发布速度与可用性。
-- **源码/组件映射：** Deployment controller 决定新旧 RS 数；scheduler `NodeResourcesFit` 只对每个新 Pod 做单节点检查。
+- **示例证据（教学示意）：** 旧 RS 的 1 个 Pod 尚未缩，新 RS 已创建 1 个 Pending Pod；Node 余额小于新 Pod shape。
+- **能证明：** rollout surge 制造了第二份瞬时 request 合同，且本例目标池没有可行装箱位置。
+- **不能证明/时间边界：** API 快照不含短暂 Assume 账；跨 Node 的总余量也不能替代单节点 shape。
+- **修复/安全边界：** 在预留容量、发布批次和 rollout 策略间权衡；`maxUnavailable` 变更会直接影响单副本可用性。
+- **源码/组件映射：** Deployment controller 决定新旧 RS 数；scheduler `NodeResourcesFit` 只判断每个新 Pod 能否进入某一 Node。
 
-### 14.6 软规则过多会制造“每条都满足一点、整体谁也看不懂”
+### 14.5 软规则过多会制造“每条都满足一点、整体谁也看不懂”
 
 Score 插件会把多个偏好归一化和加权后求和。业务平台应限制可选策略组合，否则容易出现：
 
@@ -2796,10 +2703,10 @@ Score 插件会把多个偏好归一化和加权后求和。业务平台应限�
 
 #### 运维现场小案例：偏好 online，Pod 为什么仍去了 batch
 
-- **背景：** 案例 A 的教学变体 `platform/platform-aggregator-canary` 只用 preferred affinity 给 `workload-tier=online` 加 20 分，最终却落到 `worker-b`。
+- **背景：** 案例 A 的教学变体 `platform/activity-canary` 只用 preferred affinity 给 `workload-tier=online` 加 20 分，最终却落到 `worker-b`。
 - **只读命令：**
   ```powershell
-  kubectl get pod -n platform platform-aggregator-canary -o jsonpath='{.spec.affinity.nodeAffinity.preferredDuringSchedulingIgnoredDuringExecution}{"\nnode="}{.spec.nodeName}{"\n"}'
+  kubectl get pod -n platform activity-canary -o jsonpath='{.spec.affinity.nodeAffinity.preferredDuringSchedulingIgnoredDuringExecution}{"\nnode="}{.spec.nodeName}{"\n"}'
   kubectl get nodes worker-a worker-b -L workload-tier,topology.kubernetes.io/zone
   ```
 - **示例证据（教学示意）：** online 是 preferred 而非 required；`worker-b` 也通过全部硬 Filter。
@@ -2808,7 +2715,7 @@ Score 插件会把多个偏好归一化和加权后求和。业务平台应限�
 - **修复/安全边界：** 真不可违反就改硬约束并先做容量仿真；不要随意拉高全局权重。
 - **源码/组件映射：** `NodeAffinity.Score/NormalizeScore` 只贡献一部分分；`frameworkImpl.RunScorePlugins` 加权汇总。
 
-### 14.7 四类配额不是同一本账
+### 14.6 四类配额不是同一本账
 
 | 账本 | 回答的问题 | 是否直接决定某个节点可放下 Pod |
 |---|---|---:|
@@ -2821,12 +2728,12 @@ Score 插件会把多个偏好归一化和加权后求和。业务平台应限�
 
 #### 运维现场小案例：Kueue 还有额度，为什么 Pod 仍 Pending
 
-- **背景：** 案例 E 中团队 `vision` 的 Workload 已从 `vision-lq` 获准 8 个 1-GPU Pod，但节点层只有 6 个 Pod 能找到位置。
+- **背景：** 案例 E 的 `batch-lab/train-8` Workload 已从 `batch-lq` 获准 8 个 1-GPU Pod，但节点层只有 6 个 Pod 能找到位置。
 - **只读命令（安装 Kueue 时）：**
   ```powershell
-  kubectl get localqueue -n vision vision-lq -o yaml
-  kubectl get workload -n vision -o yaml
-  kubectl get pods -n vision -o custom-columns='NAME:.metadata.name,NODE:.spec.nodeName,SCHEDULED:.status.conditions[?(@.type=="PodScheduled")].status'
+  kubectl get localqueue -n batch-lab batch-lq -o yaml
+  kubectl get workload -n batch-lab -o yaml
+  kubectl get pods -n batch-lab -o custom-columns='NAME:.metadata.name,NODE:.spec.nodeName,SCHEDULED:.status.conditions[?(@.type=="PodScheduled")].status'
   ```
 - **示例证据（教学示意）：** Workload `Admitted=True`，却只有 6 个 Pod 有 `nodeName`，其余仍为 Unschedulable。
 - **能证明：** 工作负载准入账与逐 Pod 单节点装箱账是不同状态。
@@ -2838,7 +2745,9 @@ Score 插件会把多个偏好归一化和加权后求和。业务平台应限�
 
 ## 15. GPU 调度完整链路：scheduler 只负责“哪台节点”，不负责“哪块卡”
 
-> 本节是在前述真实 EKS/GitOps 治理背景上的 GPU 教学扩展。现有平台巡检材料没有证明公司生产环境已经运行同样的 GPU 节点、Device Plugin、DRA、Kueue、Volcano 或自定义 GPU scheduler；以下对象名、卡型和数量都不能当作现网资产事实。
+> **适用边界：** 本节 D 场景全部是 `ml-lab` 隔离教学数据。现有公司材料没有证明 dev/UAT/prod EKS 已部署 GPU Node、NVIDIA Device Plugin、GPU Operator 或自定义 GPU scheduler；不能把这些命令当作公司现网操作记录。
+
+
 ### 15.1 先记住传统 Device Plugin 路径的一句话
 
 > scheduler 看见的是某节点还有几个名为 `nvidia.com/gpu` 的整数资源；真正挑 GPU UUID 并把设备交给容器的是目标节点上的 kubelet DeviceManager 与设备插件。
@@ -2870,7 +2779,7 @@ sequenceDiagram
 #### 运维现场小案例：Pod 已选中节点，但你仍不知道是哪张卡
 
 - **现象**：Pod 已在 `gpu-b` 运行，业务追问“它拿到的是哪个 GPU UUID？”
-- **变量**：`$Namespace='ml-prod'; $PodName='train-0'; $Node='gpu-b'`
+- **变量**：`$Namespace='ml-lab'; $PodName='train-0'; $Node='gpu-b'`
 - **只读命令 1**：`kubectl get pod -n $Namespace $PodName -o custom-columns='PHASE:.status.phase,NODE:.spec.nodeName'`
 - **只读命令 2**：`kubectl get node $Node -o custom-columns='NODE:.metadata.name,GPU-ALLOC:.status.allocatable.nvidia\.com/gpu'`
 - **预期/示例输出（教学化）**：`Running  gpu-b`，节点上报 `GPU-ALLOC=4`。
@@ -2917,7 +2826,7 @@ spec:
 #### 运维现场小案例：GPU 明明空闲，Pod 却报 Insufficient GPU
 
 - **现象**：监控显示 GPU 利用率接近 0，但请求 `nvidia.com/gpu: 1` 的 Pod 一直 Pending。
-- **变量**：`$Namespace='ml-prod'; $PodName='infer-7'; $Node='gpu-a'`
+- **变量**：`$Namespace='ml-lab'; $PodName='infer-7'; $Node='gpu-a'`
 - **只读命令 1**：`kubectl get pod -n $Namespace $PodName -o jsonpath='{.spec.containers[*].resources.requests.nvidia\.com/gpu}{" / "}{.spec.containers[*].resources.limits.nvidia\.com/gpu}{"\n"}'`
 - **只读命令 2**：`kubectl describe node $Node | Select-String 'Allocated resources:|nvidia.com/gpu' -Context 0,8`
 - **只读命令 3**：`kubectl get events -n $Namespace --field-selector involvedObject.kind=Pod,involvedObject.name=$PodName --sort-by='.metadata.creationTimestamp'`
@@ -3019,7 +2928,7 @@ spec:
 #### 运维现场小案例：四台 GPU 节点中为什么只有 gpu-b 能接单
 
 - **现象**：2-GPU Pod 最终落到 `gpu-b`，运维需要解释其他三台为何不可行。
-- **变量**：`$Namespace='ml-prod'; $PodName='train-2gpu'`
+- **变量**：`$Namespace='ml-lab'; $PodName='train-2gpu'`
 - **只读命令 1**：`kubectl get pod -n $Namespace $PodName -o wide`
 - **只读命令 2**：`kubectl get nodes -o custom-columns='NAME:.metadata.name,PRODUCT:.metadata.labels.platform\.example\.com/gpu-product,GPU-ALLOC:.status.allocatable.nvidia\.com/gpu,TAINTS:.spec.taints[*]'`
 - **只读命令 3**：`kubectl describe nodes | Select-String 'Name:|Allocated resources:|nvidia.com/gpu' -Context 0,8`
@@ -3077,7 +2986,7 @@ profiles:
 #### 运维现场小案例：配置了 GPU Pod，却没有按 GPU 余量装箱
 
 - **现象**：两个节点都能放下 Pod，最终落点不像运维预想的“优先塞进 GPU 更满的节点”。
-- **变量**：`$Namespace='ml-prod'; $PodName='infer-9'`
+- **变量**：`$Namespace='ml-lab'; $PodName='infer-9'`
 - **只读命令 1**：`kubectl get pod -n $Namespace $PodName -o custom-columns='SCHEDULER:.spec.schedulerName,NODE:.spec.nodeName'`
 - **只读命令 2**：`kubectl -n kube-system get pod -l component=kube-scheduler -o jsonpath='{range .items[*]}{.metadata.name}{"\t"}{.spec.containers[0].command}{" "}{.spec.containers[0].args}{"\n"}{end}'`
 - **只读命令 3**：若配置来自 ConfigMap，再执行 `kubectl -n kube-system get cm -o yaml | Select-String 'NodeResourcesFit|MostAllocated|LeastAllocated|nvidia.com/gpu' -Context 2,6`
@@ -3105,7 +3014,7 @@ Assume 先把 Pod-A 加入 scheduler cache，相当于在本地账本占住最�
 #### 运维现场小案例：Node API 看着还有一张卡，第二个 Pod 却被拒绝
 
 - **现象**：Pod-A 正在异步绑定，Pod-B 同期收到 `Insufficient nvidia.com/gpu`，但 Node 的 API 请求账暂时还没增加。
-- **变量**：`$Namespace='ml-prod'; $PodA='train-a'; $PodB='train-b'; $Node='gpu-a'`
+- **变量**：`$Namespace='ml-lab'; $PodA='train-a'; $PodB='train-b'; $Node='gpu-a'`
 - **只读命令 1**：`kubectl get pod -n $Namespace $PodA $PodB -o custom-columns='NAME:.metadata.name,NODE:.spec.nodeName,PHASE:.status.phase'`
 - **只读命令 2**：`kubectl describe node $Node | Select-String 'Allocated resources:|nvidia.com/gpu' -Context 0,8`
 - **只读命令 3**：`kubectl get events -n $Namespace --field-selector involvedObject.kind=Pod --sort-by='.metadata.creationTimestamp' | Select-String "$PodA|$PodB"`
@@ -3133,7 +3042,7 @@ Assume 先把 Pod-A 加入 scheduler cache，相当于在本地账本占住最�
 #### 运维现场小案例：为什么 kubectl 看不到显存和 NVLink
 
 - **现象**：平台想让默认 scheduler 按剩余显存和 NVLink 自动选择 GPU。
-- **变量**：`$Namespace='ml-prod'; $PodName='train-0'; $Node='gpu-a'`
+- **变量**：`$Namespace='ml-lab'; $PodName='train-0'; $Node='gpu-a'`
 - **只读命令 1**：`kubectl top pod -n $Namespace $PodName`
 - **只读命令 2**：`kubectl get node $Node -o json | ConvertFrom-Json | Select-Object -ExpandProperty status`
 - **只读命令 3**：经审批的节点只读通道执行 `nvidia-smi topo -m`
@@ -3146,6 +3055,9 @@ Assume 先把 Pod-A 加入 scheduler cache，相当于在本地账本占住最�
 ---
 
 ## 16. GPU 进阶：MIG、时间切片、DRA 与拓扑分别改变了什么
+
+> **适用边界：** MIG、time-slicing、DRA 与设备拓扑均为能力选型教学。使用前必须按目标 EKS/Kubernetes 版本、驱动和资源供给模型重新验证，公司现状未在本讲义中核实。
+
 
 ### 16.1 四种常见供给模型对 scheduler 的呈现
 
@@ -3161,7 +3073,7 @@ Assume 先把 Pod-A 加入 scheduler cache，相当于在本地账本占住最�
 #### 运维现场小案例：同一个“1 GPU”工单其实来自四种供给
 
 - **现象**：容量平台把整卡、MIG、time-slicing 和 DRA 都汇总为 `GPU=1`。
-- **变量**：`$Namespace='ml-prod'; $PodName='gpu-demo'`
+- **变量**：`$Namespace='ml-lab'; $PodName='gpu-demo'`
 - **只读命令 1**：`kubectl get nodes -o jsonpath='{range .items[*]}{.metadata.name}{"\t"}{.status.allocatable}{"\n"}{end}'`
 - **只读命令 2**：`kubectl get pod -n $Namespace $PodName -o yaml | Select-String 'nvidia.com/|resourceClaims:' -Context 1,6`
 - **只读命令 3**：`kubectl api-resources --api-group=resource.k8s.io`
@@ -3194,7 +3106,7 @@ MIG 可以把支持的 NVIDIA GPU 切成硬件隔离实例。设备插件可以�
 #### 运维现场小案例：小 MIG 实例很多，大 profile 仍然 Pending
 
 - **现象**：节点还有多个小 MIG 资源，但请求大 profile 的 Pod 报资源不足。
-- **变量**：`$Namespace='ml-prod'; $PodName='mig-train'; $Node='mig-a'`
+- **变量**：`$Namespace='ml-lab'; $PodName='mig-train'; $Node='mig-a'`
 - **只读命令 1**：`kubectl get node $Node -o json | ConvertFrom-Json | ForEach-Object { $_.status.allocatable.psobject.Properties | Where-Object Name -Match '^nvidia\.com/mig-' }`
 - **只读命令 2**：`kubectl get pod -n $Namespace $PodName -o yaml | Select-String 'nvidia.com/mig-'`
 - **只读命令 3**：`kubectl get events -n $Namespace --field-selector involvedObject.kind=Pod,involvedObject.name=$PodName --sort-by='.metadata.creationTimestamp'`
@@ -3279,7 +3191,7 @@ DRANodeAllocatableResources   -> Alpha，默认关闭
 #### 运维现场小案例：高优先级 DRA Pod 为什么没有抢走低优先级 Pod 的设备
 
 - **现象**：低优先级 Pod 的 Claim 已分配设备，高优先级 DRA Pod 仍 Pending，运维误以为 DRA 会按“最好 GPU”评分并自动抢占。
-- **变量**：`$Namespace='ml-prod'; $ClaimName='gpu-claim-low'; $PodName='train-high'`
+- **变量**：`$Namespace='ml-lab'; $ClaimName='gpu-claim-low'; $PodName='train-high'`
 - **只读命令 1**：`kubectl get resourceclaims.resource.k8s.io -n $Namespace $ClaimName -o yaml | Select-String 'exactly:|firstAvailable:|allocation:|driver:|pool:|device:' -Context 1,5`
 - **只读命令 2**：`kubectl get pod -n $Namespace $PodName -o custom-columns='PRIORITY:.spec.priority,NODE:.spec.nodeName,PHASE:.status.phase'`
 - **只读命令 3**：`kubectl get events -n $Namespace --field-selector involvedObject.kind=Pod,involvedObject.name=$PodName --sort-by='.metadata.creationTimestamp'`
@@ -3308,7 +3220,7 @@ Kubernetes 常用的 topology spread 约束，按 zone、hostname 等**节点标
 #### 运维现场小案例：Pod 跨可用区分散正确，但四卡通信仍很慢
 
 - **现象**：PodTopologySpread 满足了 zone 分散，单节点训练进程仍怀疑拿到了跨 PCIe root 的 GPU。
-- **变量**：`$Namespace='ml-prod'; $PodName='train-0'; $Node='gpu-a'`
+- **变量**：`$Namespace='ml-lab'; $PodName='train-0'; $Node='gpu-a'`
 - **只读命令 1**：`kubectl get pod -n $Namespace $PodName -o yaml | Select-String 'topologySpreadConstraints:|topologyKey:|nodeName:' -Context 0,12`
 - **只读命令 2**：`kubectl get node $Node --show-labels`
 - **只读命令 3**：经审批的节点只读通道执行 `nvidia-smi topo -m`
@@ -3356,7 +3268,9 @@ sequenceDiagram
 
 ## 17. Kueue、Volcano 与 kube-scheduler：都谈调度，但决定的不是同一件事
 
-> 本节继续使用教学扩展环境。它说明未来若引入批任务准入或 gang scheduling 应怎样划分责任，不表示当前公司的生产集群已经安装 Kueue 或 Volcano。
+> **适用边界：** 本节 E 场景位于 `batch-lab`，只解释工作负载准入与逐 Pod 放置的边界。现有材料没有证明公司集群安装 Kueue 或 Volcano。
+
+
 ### 17.1 Kueue 先决定“这批活现在能不能进场”
 
 面向训练、批处理、AI Job，单纯让每个 Pod 立即进入 kube-scheduler 队列会产生问题：
@@ -3406,7 +3320,7 @@ Kueue 的 Topology-Aware Scheduling（TAS）还能在**准入阶段**按 rack/bl
 #### 运维现场小案例：Workload 已 Admitted，Pod 为什么还在 Pending
 
 - **现象**：Kueue 页面显示训练 Workload 已准入，但某些 GPU Pod 仍没有 `nodeName`。
-- **变量**：`$Namespace='vision'; $Workload='vision-train-8'; $PodName='vision-train-worker-7'`
+- **变量**：`$Namespace='batch-lab'; $Workload='train-8'; $PodName='train-worker-7'`
 - **只读命令 1**：`kubectl get workloads.kueue.x-k8s.io -n $Namespace $Workload -o jsonpath='{range .status.conditions[*]}{.type}={.status}:{.reason}{"\n"}{end}'`
 - **只读命令 2**：`kubectl get pod -n $Namespace $PodName -o custom-columns='NODE:.spec.nodeName,PHASE:.status.phase,SCHEDULER:.spec.schedulerName'`
 - **只读命令 3**：`kubectl get events -n $Namespace --field-selector involvedObject.kind=Pod,involvedObject.name=$PodName --sort-by='.metadata.creationTimestamp'`
@@ -3461,7 +3375,7 @@ spec:
 #### 运维现场小案例：Pod 到底由 kube-scheduler 还是 Volcano 负责
 
 - **现象**：GPU Pod 没有绑定，值班人员只查 kube-scheduler 日志却找不到记录。
-- **变量（独立 Volcano 教学变体，不是同一轮 Kueue 任务）**：`$Namespace='vision'; $PodName='vc-train-worker-0'; $PodGroup='vc-train'`
+- **变量**：`$Namespace='batch-lab'; $PodName='vc-train-8-worker-0'; $PodGroup='vc-train-8'`
 - **只读命令 1**：`kubectl get pod -n $Namespace $PodName -o custom-columns='SCHEDULER:.spec.schedulerName,NODE:.spec.nodeName,PHASE:.status.phase'`
 - **只读命令 2**：`kubectl get podgroups.scheduling.volcano.sh -n $Namespace $PodGroup -o yaml | Select-String 'minMember:|phase:|conditions:|reason:|message:' -Context 1,5`
 - **只读命令 3**：`kubectl get events -n $Namespace --field-selector involvedObject.name=$PodName --sort-by='.metadata.creationTimestamp'`
@@ -3495,10 +3409,10 @@ spec:
 #### 运维现场小案例：把 8-Pod 训练任务定位到正确阶段
 
 - **现象**：平台统一显示“排队中”，实际可能是 Kueue 等待、Pod 调度失败或绑定后的设备错误。
-- **变量**：`$Namespace='vision'; $Workload='vision-train-8'; $JobLabel='job-name=vision-train-8'`
+- **变量**：`$Namespace='batch-lab'; $Workload='train-8'; $JobLabel='job-name=train-8'`
 - **只读命令 1**：`kubectl get workloads.kueue.x-k8s.io -n $Namespace $Workload -o yaml | Select-String 'QuotaReserved|Admitted|admissionChecks|message:' -Context 1,4`
 - **只读命令 2**：`kubectl get pods -n $Namespace -l $JobLabel -o custom-columns='POD:.metadata.name,SCHEDULER:.spec.schedulerName,NODE:.spec.nodeName,PHASE:.status.phase'`
-- **只读命令 3**：`kubectl get events -n $Namespace --sort-by='.metadata.creationTimestamp' | Select-String 'vision-train-8|FailedScheduling|UnexpectedAdmissionError'`
+- **只读命令 3**：`kubectl get events -n $Namespace --sort-by='.metadata.creationTimestamp' | Select-String 'train-8|FailedScheduling|UnexpectedAdmissionError'`
 - **预期/示例输出（教学化）**：未准入时 Pod 可能未放行；已准入后可能 `6 Running + 2 Pending`；已绑定失败则具有 Node 且进入 Failed/容器错误层。
 - **能证明**：当前对象停在准入、节点调度还是 kubelet/runtime 之后的哪一层。
 - **不能证明**：Phase 和一条 Event 不能单独给出根因；gang 的最小成员还取决于实际实现与配置。
@@ -3509,7 +3423,9 @@ spec:
 
 ## 18. 多 Profile、多 scheduler、Framework 插件和 Extender 怎么选
 
-> 本节是平台演进与隔离实验的选型方法。当前基线材料没有证明公司 EKS 生产环境已启用多 profile、独立 GPU scheduler、Framework 自定义插件或 Extender；托管 EKS 的默认控制面配置也不能靠读取 `kube-system` Pod 来假设。
+> **适用边界：** 本节的 `gpu-binpack-scheduler`、自定义 Framework 插件与 Extender 都是隔离方案演练，不代表公司托管 EKS 当前配置。公司调度案例 A、B、F 默认从 `default-scheduler` 责任域排查。
+
+
 ### 18.1 `schedulerName` 是责任路由，不是普通标签
 
 Pod 默认使用 `default-scheduler`。也可以写：
@@ -3525,18 +3441,18 @@ spec:
 
 ```powershell
 $Namespace = 'platform'
-$PodName = 'platform-aggregator-typo'
+$PodName = 'activity-typo'
 kubectl get pod -n $Namespace $PodName -o jsonpath='{.spec.schedulerName}{"\n"}'
 ```
 
 #### 运维现场小案例：拼错 `schedulerName`，连 FailedScheduling 都没有
 
-- **背景：** 案例 A 的教学变体 `platform/platform-aggregator-typo` 写成 `defaut-scheduler`，数分钟 `NODE=<none>`，也没有常见 Filter 失败 Event。
+- **背景：** 案例 A 的教学变体 `platform/activity-typo` 写成 `defaut-scheduler`，数分钟 `NODE=<none>`，也没有常见 Filter 失败 Event。
 - **只读命令：**
   ```powershell
-  kubectl get pod -n platform platform-aggregator-typo -o custom-columns='SCHEDULER:.spec.schedulerName,NODE:.spec.nodeName,GATES:.spec.schedulingGates[*].name'
+  kubectl get pod -n platform activity-typo -o custom-columns='SCHEDULER:.spec.schedulerName,NODE:.spec.nodeName,GATES:.spec.schedulingGates[*].name'
   kubectl get deploy,pod -A | Select-String 'scheduler'
-  kubectl get events -n platform --field-selector involvedObject.name=platform-aggregator-typo --sort-by='.metadata.creationTimestamp'
+  kubectl get events -n platform --field-selector involvedObject.name=activity-typo --sort-by='.metadata.creationTimestamp'
   ```
 - **示例证据（教学示意）：** Pod 路由名拼错；可见配置只声明 `default-scheduler` 和 `gpu-binpack-scheduler`。
 - **能证明：** 当调度器清单和配置证据完整时，可闭合“没有组件负责该路由名”。
@@ -3571,10 +3487,10 @@ flowchart TB
 
 #### 运维现场小案例：Pod 没写 affinity，却被 profile 的隐藏条件拒绝
 
-- **背景：** 案例 D 的 `ml/train-a100` 使用 `gpu-binpack-scheduler`；Pod YAML 没写 nodeAffinity，Event 却显示 NodeAffinity 不匹配。
+- **背景：** 案例 D 的 `ml-lab/train-a100` 使用 `gpu-binpack-scheduler`；Pod YAML 没写 nodeAffinity，Event 却显示 NodeAffinity 不匹配。
 - **只读命令（配置载体按发行版调整）：**
   ```powershell
-  kubectl get pod -n ml train-a100 -o yaml
+  kubectl get pod -n ml-lab train-a100 -o yaml
   kubectl -n kube-system get configmap kube-scheduler-config -o yaml
   kubectl -n kube-system get pod -l component=kube-scheduler -o yaml
   ```
@@ -3629,7 +3545,7 @@ Framework 插件通常也不是把一个 `.so` 扔进目录就运行时热加载
 
 #### 运维现场小案例：Extender 超时拖慢整个 Filter 路径
 
-- **背景：** 案例 F 的教学变体中，内置插件延迟正常，但 `gpu-binpack-scheduler` attempt p99 暴涨；日志出现 Extender 超时。
+- **背景：** 隔离 profile 实验中，内置插件延迟正常，但 `gpu-binpack-scheduler` attempt p99 暴涨；日志出现 Extender 超时。
 - **只读命令：**
   ```powershell
   kubectl -n platform get service,endpointslice -l app=gpu-extender -o wide
@@ -3661,7 +3577,7 @@ Scheduler 不是典型无状态 Web 服务。一次配置变化会改变未来�
 
 #### 运维现场小案例：进程健康，但新 Score 把 GPU Pod 分布打歪
 
-- **背景：** 案例 F 的 canary profile 全部绑定成功，健康检查全绿，但 90% 测试 Pod 落在一个机架；旧 profile 只有约 45%。
+- **背景：** 隔离 canary profile 的测试 Pod 全部绑定成功，健康检查全绿，但 90% 落在一个机架；旧 profile 只有约 45%。
 - **只读命令：**
   ```powershell
   kubectl get pod -n scheduler-canary -o custom-columns='NAME:.metadata.name,SCHEDULER:.spec.schedulerName,NODE:.spec.nodeName'
@@ -3710,11 +3626,11 @@ flowchart TD
 
 #### 运维现场小案例：Pod 仍是 Pending，但已不是 scheduler 第一责任域
 
-- **背景：** 案例 C2 的 Pod `finance/ledger-close-0` 页面显示 Pending；调整 C1 的供给/约束并完成绑定后，实际已有 `spec.nodeName=worker-a`，后续观察是卷挂载失败。
+- **背景：** 案例 C 的 `scheduler-lab/storage-wffc-0` 页面显示 Pending；实际已有 `spec.nodeName=worker-a`，后续观察是卷挂载失败。
 - **只读命令：**
   ```powershell
-  kubectl get pod -n finance ledger-close-0 -o custom-columns='NODE:.spec.nodeName,SCHEDULED:.status.conditions[?(@.type=="PodScheduled")].status,PHASE:.status.phase'
-  kubectl get events -n finance --field-selector involvedObject.name=ledger-close-0 --sort-by='.metadata.creationTimestamp'
+  kubectl get pod -n scheduler-lab storage-wffc-0 -o custom-columns='NODE:.spec.nodeName,SCHEDULED:.status.conditions[?(@.type=="PodScheduled")].status,PHASE:.status.phase'
+  kubectl get events -n scheduler-lab --field-selector involvedObject.name=storage-wffc-0 --sort-by='.metadata.creationTimestamp'
   ```
 - **示例证据（教学示意）：** `NODE=worker-a`、`PodScheduled=True`，后续为 `FailedMount` 类观察。
 - **能证明：** Node Binding 已持久化，当前第一责任域转到 kubelet/CSI。
@@ -3728,7 +3644,7 @@ flowchart TD
 
 ```powershell
 $Namespace = 'platform'
-$PodName = 'platform-aggregator-new-7f8d9'
+$PodName = 'activity-new-7f8d9'
 $CollectedAt = Get-Date -Format 'yyyyMMdd-HHmmss'
 $PodUid = kubectl get pod -n $Namespace $PodName -o jsonpath='{.metadata.uid}'
 $EvidenceDir = Join-Path (Get-Location) "scheduler-evidence-$CollectedAt-$PodUid"
@@ -3766,8 +3682,8 @@ kubectl get events -n $Namespace --field-selector "involvedObject.uid=$PodUid" -
 - **背景：** 案例 A 的 Deployment 重建 Pod，工单只记名字；值班把旧 UID 的 CPU 不足与新 UID 的卷错误拼成一条链。
 - **只读命令（API 只读，但会写本地文件）：**
   ```powershell
-  $PodUid = kubectl get pod -n platform platform-aggregator-new-7f8d9 -o jsonpath='{.metadata.uid}'
-  kubectl get pod -n platform platform-aggregator-new-7f8d9 -o yaml | Set-Content ".\pod-$PodUid.yaml" -Encoding utf8
+  $PodUid = kubectl get pod -n platform activity-new-7f8d9 -o jsonpath='{.metadata.uid}'
+  kubectl get pod -n platform activity-new-7f8d9 -o yaml | Set-Content ".\pod-$PodUid.yaml" -Encoding utf8
   kubectl get events -n platform --field-selector "involvedObject.uid=$PodUid" -o yaml | Set-Content ".\events-$PodUid.yaml" -Encoding utf8
   ```
 - **示例证据（教学示意）：** 当前 UID 与旧截图 UID 不同，两批 Event 属于两个对象。
@@ -3803,10 +3719,10 @@ N4 = N3 中 CPU/memory/GPU request 余额足够的节点
 
 #### 运维现场小案例：`1+1+1` 不代表三组节点互不重叠
 
-- **背景：** 案例 A 的 `platform-aggregator-new-7f8d9` 同时收到 CPU、标签和污点聚合原因；有人把数字相加后画成三组互斥 Node。
+- **背景：** 案例 A 的 `activity-new-7f8d9` 同时收到 CPU、标签和污点聚合原因；有人把数字相加后画成三组互斥 Node。
 - **只读命令：**
   ```powershell
-  kubectl get pod -n platform platform-aggregator-new-7f8d9 -o yaml
+  kubectl get pod -n platform activity-new-7f8d9 -o yaml
   kubectl get nodes worker-a worker-b worker-c -o custom-columns='NAME:.metadata.name,TIER:.metadata.labels.workload-tier,CPU:.status.allocatable.cpu,TAINTS:.spec.taints'
   ```
 - **示例证据（教学示意）：** `worker-c` 可同时不满足某个标签条件并带未容忍 taint；节点失败原因可以重叠。
@@ -3831,11 +3747,11 @@ N4 = N3 中 CPU/memory/GPU request 余额足够的节点
 
 #### 运维现场小案例：CPU 有余量，WFFC 卷拓扑仍清空可行集合
 
-- **背景：** 案例 C1 的 Pod `finance/ledger-close-0` request 很小，Pod 只允许 zone-a，但可供卷容量主要在 zone-b。
+- **背景：** 案例 C 的 `scheduler-lab/storage-wffc-0` request 很小，Pod 只允许 zone-a，但可供卷容量主要在 zone-b。
 - **只读命令：**
   ```powershell
-  kubectl get pod -n finance ledger-close-0 -o yaml
-  kubectl get pvc -n finance -o wide
+  kubectl get pod -n scheduler-lab storage-wffc-0 -o yaml
+  kubectl get pvc -n scheduler-lab -o wide
   kubectl get pv,storageclass -o yaml
   kubectl get csistoragecapacity -A -o yaml
   ```
@@ -3884,14 +3800,14 @@ kubectl get pods -A --field-selector "spec.nodeName=$NodeName" -o json |
 
 #### 运维现场小案例：节点实时 CPU 15%，调度账却只余 800m
 
-- **背景：** 案例 A 中 `worker-a` usage 只有约 15%，Allocatable 为 4000m、已请求 3200m，新 Pod 要 1400m。
+- **背景：** 案例 A 中 `worker-a` usage 只有约 15%，Allocatable 为 4000m、已请求 3200m，新 Pod 要 1000m。
 - **只读命令：**
   ```powershell
   kubectl top node worker-a
   kubectl describe node worker-a
   kubectl get pods -A --field-selector spec.nodeName=worker-a -o custom-columns='NS:.metadata.namespace,POD:.metadata.name,CPU:.spec.containers[*].resources.requests.cpu,MEM:.spec.containers[*].resources.requests.memory'
   ```
-- **示例证据（教学示意）：** usage 约 15%，CPU requests=3200m；1400m 大于 `4000-3200=800m`。
+- **示例证据（教学示意）：** usage 约 15%，CPU requests=3200m；1000m 大于 `4000-3200=800m`。
 - **能证明：** usage 与 request 是两本账，低 usage 不等于可承诺余额足够。
 - **不能证明/时间边界：** `describe` 不含刚 Assume 的瞬时账；简化列表也未完整复算 init、overhead 和 Pod-level resources。
 - **修复/安全边界：** 用长期负载、SLO 和压测右调 request；贸然下调可能变成争用、抖动或 OOM。
@@ -3946,7 +3862,7 @@ kubectl get pods -A -o json |
 #### 运维现场小案例：Node 没有 GPU scalar，不等于一定是 Device Plugin 坏了
 
 - **现象**：`gpu-b` 的 `.status.allocatable.nvidia.com/gpu` 为空，但请求同名资源的 Pod 可能走 DRA extended-resource 桥接。
-- **变量**：`$Namespace='ml-prod'; $PodName='gpu-pending'`
+- **变量**：`$Namespace='ml-lab'; $PodName='gpu-pending'`
 - **只读命令 1**：`kubectl get nodes -o custom-columns='NAME:.metadata.name,GPU:.status.allocatable.nvidia\.com/gpu'`
 - **只读命令 2**：`kubectl get deviceclasses.resource.k8s.io -o custom-columns='CLASS:.metadata.name,EXTENDED:.spec.extendedResourceName'`
 - **只读命令 3**：`kubectl get pod -n $Namespace $PodName -o yaml | Select-String 'nvidia.com/gpu|resourceClaims:' -Context 1,6`
@@ -3970,7 +3886,7 @@ kubectl get pods -A -o json |
 #### 运维现场小案例：Allocate 失败后的原 Pod 为什么不会换节点复活
 
 - **现象**：Pod 已有 `spec.nodeName=gpu-a`，随后 kubelet admission 因设备分配失败将它置为 Failed。
-- **变量**：`$Namespace='ml-prod'; $PodName='train-failed'`
+- **变量**：`$Namespace='ml-lab'; $PodName='train-failed'`
 - **只读命令 1**：`kubectl get pod -n $Namespace $PodName -o custom-columns='PHASE:.status.phase,REASON:.status.reason,NODE:.spec.nodeName,OWNER:.metadata.ownerReferences[0].kind'`
 - **只读命令 2**：`kubectl get events -n $Namespace --field-selector involvedObject.kind=Pod,involvedObject.name=$PodName --sort-by='.metadata.creationTimestamp'`
 - **只读命令 3**：`kubectl get pod -n $Namespace $PodName -o jsonpath='{.metadata.uid}{"\t"}{.status.message}{"\n"}'`
@@ -3980,42 +3896,35 @@ kubectl get pods -A -o json |
 - **时间/风险边界**：插件恢复不会复活同一个 Failed Pod；删除独立训练 Pod 前必须确认 checkpoint 和数据一致性。
 - **责任域/源码映射**：`pkg/kubelet/cm/admission/errors.go` 定义原因；`kubelet.go` 的 `(*Kubelet).rejectPod` 写入 Failed；scheduler 不重写已绑定 Pod 的 Node。
 
-### 19.8 日志该怎样开，才不会把控制面打爆
 
-公司使用托管 EKS：默认路径不是去 `kube-system` 找 kube-scheduler Pod，而是先用 Kubernetes 对象和指标定界；若已启用 EKS 控制面 scheduler 日志，再通过 CloudWatch 或获批的日志平台按 namespace/name、时间窗查询。后文的 `kubectl logs -l component=kube-scheduler` 只适用于自管控制面或隔离实验。
+### 19.8 托管 EKS 的 scheduler 日志要从 CloudWatch 边界开始判断
 
-建议从低成本证据逐级升级：
+公司使用托管 EKS，不能默认控制面以 `kube-system/kube-scheduler-*` Pod 暴露给租户。值班应从低成本证据逐级升级：
 
 ```text
-Pod YAML/Condition/Event
-  -> Node/PVC/Claim 等对象
-  -> scheduler 稳定 metrics
-  -> 当前常规日志按 Pod namespace/name 搜索，API/Event 再用 UID 定身份
-  -> 临时、受控提高 verbosity
-  -> 必要时 profile 影子/测试环境复现
+最终 Pod / Condition / Event
+  -> Node、Deployment、PVC 等 API 对象
+  -> scheduler 与 API Server 可观测指标
+  -> 若 EKS 控制面 scheduler 日志已启用：到 CloudWatch 按集群、时间窗、namespace/name 查询
+  -> 仍不足时，再按变更流程临时提高或补充控制面日志
 ```
 
-高 verbosity 会显著增加 CPU、磁盘与日志平台压力，还可能输出大量对象元数据。若必须提高：限定时间窗、单副本/测试 scheduler、明确回退时间，遵守集群日志隐私规范。不要为了找一个 Pod，把所有控制面长期开到最高日志级别。
+只有自管控制面或隔离实验，才直接执行 `kubectl logs -n kube-system -l component=kube-scheduler`。高 verbosity 会增加控制面与日志平台压力，也可能输出对象元数据；提级必须限时、可回退并遵守日志权限与隐私要求。
 
-#### 运维现场小案例：只追一个 Pod 名与 UID，不把全控制面开到 `-v=10`
+#### 运维现场小案例：EKS 中查不到 kube-scheduler Pod，不等于 scheduler 不存在
 
-- **背景：** 案例 F 中单个 `platform/platform-aggregator-new-7f8d9` 偶发 SchedulerError；团队准备永久提高全部 scheduler 副本日志级别。
+- **背景：** 案例 A 的一只 Pod 偶发 `SchedulerError`；值班执行 `kubectl get pod -n kube-system -l component=kube-scheduler` 返回空列表。
 - **只读命令：**
   ```powershell
-  $PodKey = 'platform/platform-aggregator-new-7f8d9'
-  $PodUid = kubectl get pod -n platform platform-aggregator-new-7f8d9 -o jsonpath='{.metadata.uid}'
-  # 托管 EKS：在已启用的 CloudWatch 控制面 scheduler 日志中按 $PodKey 与时间窗查询。
-  # 下面两条仅用于自管控制面或隔离实验：
-  kubectl -n kube-system logs -l component=kube-scheduler --since=10m --tail=-1 --prefix |
-    Select-String -SimpleMatch $PodKey
+  $PodUid = kubectl get pod -n platform activity-new-7f8d9 -o jsonpath='{.metadata.uid}'
+  kubectl get pod -n platform activity-new-7f8d9 -o yaml
   kubectl get events -n platform --field-selector "involvedObject.uid=$PodUid" --sort-by='.metadata.creationTimestamp'
-  kubectl -n kube-system get pod -l component=kube-scheduler -o jsonpath='{range .items[*]}{.metadata.name}{" args="}{.spec.containers[0].args}{"\n"}{end}'
   ```
-- **示例证据（教学示意）：** CloudWatch（托管 EKS）或 scheduler 常规日志（自管/实验）在该 `namespace/name` 上显示 Binding API 超时；UID Event 属于当前 Pod；自管实验中的启动参数为 `-v=2`。
-- **能证明：** 限定窗口内某个带实例前缀的 scheduler 日志记录过相关错误，Event 对象身份和当前启动参数也可核对。
-- **不能证明/时间边界：** 固定源码常规日志通常不会打印 UID；轮转、leader 切换和聚合也可能漏行，一次超时不能直接归因 etcd。
-- **修复/安全边界：** 先用对象、metrics 和常规日志；提级必须限实例、限时、有回退并评估隐私/磁盘/CPU。
-- **源码/组件映射：** `ScheduleOne` / `scheduleOnePod` 与 `runBindingCycle` / `bindingCycle` 产生日志，`handleSchedulingFailure` 收束失败；verbosity 不是稳定业务接口。
+  若 EKS 已启用控制面 scheduler 日志，再在 CloudWatch Logs Insights 中按对应集群日志组、窄时间窗和 `platform/activity-new-7f8d9` 查询；未启用时先走平台变更流程，不能临时假设已有历史日志。
+- **能证明：** API 中当前 Pod 身份、Condition/Event 与可访问指标；CloudWatch 结果只能覆盖实际已启用并保留的日志窗口。
+- **不能证明/时间边界：** 看不到控制面 Pod 不代表 scheduler 不存在；Event 聚合/过期和日志未启用也可能造成证据缺口。
+- **修复/安全边界：** 先按对象与指标缩小范围，再申请控制面日志；不要为一个 Pod 长期开最高详细度。
+- **源码/组件映射：** `ScheduleOne`、`runBindingCycle` 与 `handleSchedulingFailure` 产生日志和状态；EKS 负责控制面日志交付边界。
 
 ---
 
@@ -4046,50 +3955,51 @@ Pod YAML/Condition/Event
 
 #### 运维现场小案例：平均值正常，Filter p99 已拖到 3 秒
 
-- **背景：** 案例 F 的面板只画 attempt 平均值 80ms，用户却周期性等待数秒；怀疑自定义插件长尾。
+- **背景：** 隔离 profile 性能实验的面板只画 attempt 平均值 80ms，测试 Pod 却周期性等待数秒；怀疑自定义插件长尾。
 - **只读命令（PromQL；下面两条逐条执行，不能整块粘贴）：**
   ```promql
   histogram_quantile(0.99, sum by (le,extension_point,profile) (rate(scheduler_framework_extension_point_duration_seconds_bucket[5m])))
   histogram_quantile(0.99, sum by (le,result,profile) (rate(scheduler_scheduling_attempt_duration_seconds_bucket[5m])))
   ```
-- **示例证据（教学示意）：** `Score/gpu-binpack-scheduler` p99=2.9s，attempt p99=3.1s。
+- **示例证据（教学示意）：** `extension_point=Filter` p99=2.9s，attempt p99=3.1s。
 - **能证明：** 慢点集中在该 profile 的 Filter 扩展点，并与总 attempt 长尾同窗相关。
 - **不能证明/时间边界：** 扩展点汇总不能直接锁定单插件；ALPHA 单插件指标还要核对版本和开销。
 - **修复/安全边界：** 关联发布和流量，灰度回滚慢插件；不要通过拉长窗口隐藏长尾。
 - **源码/组件映射：** `metrics.go` 定义指标；`frameworkImpl.RunFilterPlugins` 记录扩展点与插件耗时。
 
+
 ### 20.2 四种队列高分别说明什么
 
 ```text
 active 高且持续增长
-  -> scheduler 吞吐可能跟不上、leader/插件/API 变慢，或突然发布洪峰
+  -> 新 Pod 到达率可能高于调度吞吐，或 leader、插件、API 路径变慢
 
 backoff 高
-  -> 大量 Pod 经历失败并在退避；要结合 result=error/unschedulable 区分
+  -> 大量 Pod 经历失败并在退避；结合 result=error/unschedulable 分流
 
 unschedulable 高
-  -> 已尝试且硬条件不满足；看 scheduler_unschedulable_pods 的 plugin 分解
+  -> 已尝试且硬条件不满足；按 rejector plugin 和 Pod shape 查交集
 
 gated 高
-  -> Pod 被 scheduling gate/PreEnqueue 类机制挡住，可能是预期的准入等待
+  -> scheduling gate/PreEnqueue 在等待上层准入，可能是预期状态
 ```
 
-单看总 Pending 会把四种完全不同的处置方式混在一起。
+单看 Kubernetes Pod phase=Pending，会把这些完全不同的内部状态混在一起。
 
-#### 运维现场小案例：activeQ 1200，不等于 1200 个硬约束失败
+#### 运维现场小案例：UAT 同批出现 6 个新 Pod，队列曲线怎样读
 
-- **背景：** 案例 F 在周一 10:00 多团队同时发布，Pending 暴涨；active 高，unschedulable 并不高。
-- **只读命令（PromQL；下面三条逐条执行，不能整块粘贴）：**
+- **背景：** 案例 F 选取 UAT 的 `activity`、`announce`、`content-security`、`content-security-mng`、`policy`、`launcher-aggregator`。只有当 6 个 Deployment 的 PodTemplate 都变化时，单副本加 `maxSurge=1` 才可能在第一波新增 6 个 Pod。
+- **只读命令（PromQL；逐条执行）：**
   ```promql
   sum by (queue) (scheduler_pending_pods)
   sum by (result,profile) (rate(scheduler_schedule_attempts_total[5m]))
   sum by (event,queue) (rate(scheduler_queue_incoming_pods_total[5m]))
   ```
-- **示例证据（教学示意）：** active=1200、backoff=5、unschedulable=20；PodAdd 入队速率高于成功吞吐。
-- **能证明：** 主要是等待被尝试的队列积压，更像发布洪峰或吞吐不足。
-- **不能证明/时间边界：** 队列形状不能单独区分 API、插件、leader 抖动或到达率过高。
-- **修复/安全边界：** 继续看 attempt、extension point、API 延迟与发布速率；不要自动删除 activeQ Pod。
-- **源码/组件映射：** `PriorityQueue.Add/Pop/AddUnschedulableIfNotPresent` 维护状态；`pending_pods{queue}` 暴露分类快照。
+- **示例证据（教学示意）：** 发布开始时 PodAdd 使 active 上升；若教学可行余量只有 `4 CPU/16Gi`，4 只成功后至少 2 只转入 unschedulable。六服务最终 Pod request 均按 `1 CPU/4Gi` 推演。
+- **能证明：** 队列分类与入队/尝试速率能区分“尚未轮到”与“已尝试但无可行 Node”。
+- **不能证明/时间边界：** 聚合指标不能映射到具体 Pod，也不能证明 UAT 当时真的只有该余量；必须回到 UID、Condition、Event 与 Node 账。
+- **修复/安全边界：** 控制同批 PodTemplate 变更数量、预留 surge 容量，或等待安全扩容；不要自动删除队列中的 Pod。
+- **源码/组件映射：** `PriorityQueue.Add/Pop/AddUnschedulableIfNotPresent` 与 `NodeResourcesFit.Filter`。
 
 ### 20.3 一组起点 PromQL
 
@@ -4126,7 +4036,7 @@ histogram_quantile(
 
 #### 运维现场小案例：PromQL 少了 `le`，p99 就算错了
 
-- **背景：** 案例 F 的旧面板把 histogram bucket 直接求和后得到 `p99=0`，但用户明显感到慢。
+- **背景：** UAT 调度面板把 histogram bucket 直接求和后得到 `p99=0`，但用户明显感到慢。
 - **只读命令（PromQL）：**
   ```promql
   histogram_quantile(
@@ -4178,7 +4088,7 @@ histogram_quantile(
 
 #### 运维现场小案例：成功者 p99 很快，用户仍有 260 个 Pod 等待
 
-- **背景：** 案例 F 的团队用成功调度直方图宣布 SLO 全绿，但 unschedulable 队列持续积压。
+- **背景：** 独立容量压测只看成功调度直方图并宣布 SLO 全绿，但 unschedulable 队列仍持续积压。
 - **只读命令（PromQL；下面三条逐条执行，不能整块粘贴）：**
   ```promql
   histogram_quantile(0.99, sum by (le) (rate(scheduler_pod_scheduling_sli_duration_seconds_bucket[30m])))
@@ -4210,7 +4120,7 @@ GPU 池：A100-80GB
 
 #### 运维现场小案例：把 `Pending>0` 升级成可处置告警
 
-- **背景：** 案例 F 的旧告警只写 `PendingPods=87`，值班不知道 profile、插件、节点池，也不敢处置。
+- **背景：** 案例 D 的 GPU 隔离实验告警只写 `PendingPods=87`，值班不知道 profile、插件、节点池，也无法区分碎片与供给异常。
 - **只读命令：**
   ```promql
   topk(10, sum by (plugin,profile) (scheduler_unschedulable_pods))
@@ -4219,7 +4129,7 @@ GPU 池：A100-80GB
   kubectl get events -A --field-selector reason=FailedScheduling --sort-by='.metadata.creationTimestamp'
   kubectl get nodes -L platform.example.com/pool,accelerator
   ```
-- **示例证据（教学示意）：** `profile="gpu-binpack-scheduler", plugin="NodeResourcesFit"` 的不可调度计数持续增长，Event 侧集中于案例 D 的 A100 训练 Pod。
+- **示例证据（教学示意）：** `gpu-binpack/NodeResourcesFit` 持续增长，Event 侧集中于案例 D 的 A100 训练 Pod。
 - **能证明：** 告警可先收窄到 profile、失败方向和节点池，再由对象证据定位工作负载。
 - **不能证明/时间边界：** scheduler 指标通常没有 Pod/namespace；Event 会过期，两者关联是平台时间窗推断。
 - **修复/安全边界：** 告警携带查询、时间窗、runbook 和禁止自动动作；不能因资源不足就自动删训练 Pod。
@@ -4242,7 +4152,7 @@ GPU 池：A100-80GB
 #### 运维现场小案例：GPU 池总余量 4，4-GPU Pod 仍放不下
 
 - **现象**：四台节点各剩一张卡，容量大盘显示池余量 4，但单 Pod 请求 4 张卡。
-- **变量**：`$PoolSelector='platform.example.com/gpu-product=A100-80GB'; $Namespace='ml-prod'; $PodName='train-4gpu'`
+- **变量**：`$PoolSelector='platform.example.com/gpu-product=A100-80GB'; $Namespace='ml-lab'; $PodName='train-4gpu'`
 - **只读命令 1**：`kubectl describe nodes -l $PoolSelector | Select-String 'Name:|Allocated resources:|nvidia.com/gpu' -Context 0,8`
 - **只读命令 2**：`kubectl get events -n $Namespace --field-selector involvedObject.kind=Pod,involvedObject.name=$PodName --sort-by='.metadata.creationTimestamp'`
 - **预期/示例输出（教学化）**：四台均为 `allocatable=8、API request=7`；事件为 `0/4 nodes ... Insufficient nvidia.com/gpu`。
@@ -4277,7 +4187,7 @@ GPU 还有“交叉碎片”：
 #### 运维现场小案例：GPU 和内存分别都够，组合起来却无节点可用
 
 - **现象**：`gpu-a` 剩两张 GPU 但内存不足，`gpu-b` 内存充足但 GPU 已满。
-- **变量**：`$Namespace='ml-prod'; $PodName='infer-large'; $PoolSelector='platform.example.com/gpu-pool=a100'`
+- **变量**：`$Namespace='ml-lab'; $PodName='infer-large'; $PoolSelector='platform.example.com/gpu-pool=a100'`
 - **只读命令 1**：`kubectl describe nodes -l $PoolSelector | Select-String 'Name:|Allocated resources:|cpu|memory|nvidia.com/gpu|pods' -Context 0,10`
 - **只读命令 2**：`kubectl get events -n $Namespace --field-selector involvedObject.kind=Pod,involvedObject.name=$PodName --sort-by='.metadata.creationTimestamp'`
 - **预期/示例输出（教学化）**：事件可能同时汇总 `Insufficient memory` 和 `Insufficient nvidia.com/gpu`，但发生在不同节点。
@@ -4346,7 +4256,7 @@ GPU 节点通常比普通 CPU 节点准备时间更长。若业务 SLO 小于冷
 #### 运维现场小案例：新 GPU 节点 Ready 了，Pod 仍报 GPU 不足
 
 - **现象**：云实例已经加入集群并显示 Ready，但 Device Plugin 尚未上报 GPU allocatable。
-- **变量**：`$Node='gpu-new-01'; $Namespace='ml-prod'; $PodName='train-waiting'`
+- **变量**：`$Node='gpu-new-01'; $Namespace='ml-lab'; $PodName='train-waiting'`
 - **只读命令 1**：`kubectl get node $Node --watch -o custom-columns='NODE:.metadata.name,READY:.status.conditions[?(@.type=="Ready")].status,GPU:.status.allocatable.nvidia\.com/gpu'`
 - **只读命令 2**：`kubectl get ds -A -o wide | Select-String 'nvidia|device-plugin|cni|csi'`
 - **只读命令 3**：`kubectl get events -n $Namespace --field-selector involvedObject.kind=Pod,involvedObject.name=$PodName --sort-by='.metadata.creationTimestamp'`
@@ -4660,43 +4570,41 @@ resources:
 
 ---
 
-## 23. 九类生产型故障演练与复盘模板：表象相似，根因横跨不同组件
+## 23. 八类生产事故复盘：表象相似，根因横跨不同组件
 
-公司现场统一先确认目标 kube-context、AWS region 与环境，再核对 Git/Argo revision、Application operation、Deployment/ReplicaSet，最后才进入 Pod UID、Node、PVC 和 Scheduler 证据。配置修复继续走经过审批的 GitOps 路径；只读取证不等于授权现场 patch live 漂移。
 
-### 23.1 发布时老 Pod 正常，新 Pod 全 Pending
+### 23.1 单副本发布时旧 Pod 正常，新 Pod Pending
 
-**表象：** 稳定运行时没问题，一滚动升级就出现 `Insufficient cpu`。
+**表象：** `activity` 稳定运行时没有问题，PodTemplate 一更新，新 surge Pod 报 `Insufficient cpu/memory`，旧 Pod仍正常。
 
 **因果链：**
 
 ```text
-旧副本 requests 已占大部分节点池
-  -> Deployment 按 maxSurge 创建额外新 Pod
-  -> scheduler 把新 Pod 的 request 与剩余账比较
-  -> 没有节点余额达到单 Pod shape
-  -> 新 Pod Pending；旧 Pod 因可用性策略暂不缩减
+稳定态只有 1 个旧 Pod
+  -> Deployment 按 maxSurge=1 创建 1 个新 Pod
+  -> maxUnavailable=0 要求旧 Pod 在新 Pod可用前继续保留
+  -> scheduler 用新 Pod 的最终 request 检查每台 Node
+  -> 唯一满足池标签/污点的 Node 余额小于 1 CPU/4Gi
+  -> 新 Pod Pending，rollout 停在 1 旧 + 1 新
 ```
 
-**证据：** Deployment strategy、replicas、旧新 ReplicaSet 数量、Pod requests、目标池 allocatable/requested、FailedScheduling 时间线。
+`preStop sleep 15` 包含在 90 秒 termination grace 内，且只在旧 Pod 开始删除后发生；它不会解释新 Pod 的第一次 FailedScheduling。
 
-**修复方向：** 评估并调整 surge/容量/requests/发布批次，而不是先改 scheduler 权重。Score 不能让硬余额不足的节点通过 Filter。
+#### 运维现场小案例：HK dev 单副本为什么只在 rollout 窗口缺容量
 
-#### 运维现场小案例：稳定半年，为什么只在滚动发布时 Pending
-
-- **背景：** 案例 A 的旧 `platform-aggregator` 副本都 Running；新 surge Pod `platform-aggregator-new-7f8d9` 一创建就报 CPU 不足。
+- **背景：** 案例 A 的旧 `activity` Pod Running；新 `activity-new-7f8d9` 一创建就 Pending。
 - **只读命令：**
   ```powershell
-  kubectl get deploy -n platform platform-aggregator -o yaml
-  kubectl get rs,pod -n platform -l app=platform-aggregator -o wide
+  kubectl get deploy -n platform activity -o yaml
+  kubectl get rs,pod -n platform -l app=activity -o wide
   kubectl get events -n platform --field-selector reason=FailedScheduling --sort-by='.metadata.creationTimestamp'
   kubectl describe node worker-a
   ```
-- **示例证据（教学示意）：** `replicas=4,maxSurge=1`；旧 RS 尚未缩，新 Pod 要 1400m，而目标节点只余 800m。
-- **能证明：** 发布时间线、surge 对象数和单节点 request 余额共同支持瞬时容量不足。
-- **不能证明/时间边界：** 总 request 不代表每个 Pod shape 可装箱；`describe` 也缺短暂 Assume 账。
-- **修复/安全边界：** 在扩容、surge、unavailable、分批发布和 request 右调间选择；策略会影响可用性。
-- **源码/组件映射：** Deployment controller 决定 RS 数；`NodeResourcesFit.Filter` 判断每个新 Pod。
+- **示例证据（教学示意）：** `replicas=1,maxSurge=1,maxUnavailable=0`；旧 RS 尚未缩，新 Pod 要 `1 CPU/4Gi`，合规 Node 只余 `800m/3Gi`。
+- **能证明：** 发布时间线、第二只 Pod 和逐 Node request 余额共同支持瞬时容量不足。
+- **不能证明/时间边界：** Node 总 request 不能替代逐 shape 装箱，`describe` 也缺短暂 Assume 账；教学余额不是事故实录。
+- **修复/安全边界：** 在容量、发布批次和 rollout 策略间选择；单副本下放宽 unavailable 会改变可用性。
+- **源码/组件映射：** Deployment controller 制造 surge；`NodeResourcesFit.Filter` 判断新 Pod。
 
 ### 23.2 扩了 GPU 节点，Pod 还是看不到 GPU
 
@@ -4719,7 +4627,7 @@ resources:
 
 #### 运维现场小案例：新 GPU Node Ready，但资源名仍为空
 
-- **背景：** 案例 D 扩出 `gpu-new`，Node `Ready=True`，`ml/train-a100` 仍不把它当候选。
+- **背景：** 案例 D 扩出 `gpu-new`，Node `Ready=True`，`ml-lab/train-a100` 仍不把它当候选。
 - **只读命令：**
   ```powershell
   kubectl get node gpu-new -o custom-columns='READY:.status.conditions[?(@.type=="Ready")].status,CAP:.status.capacity.nvidia\.com/gpu,ALLOC:.status.allocatable.nvidia\.com/gpu'
@@ -4744,10 +4652,10 @@ resources:
 
 #### 运维现场小案例：整池空 6 张，4-GPU Pod 仍无落点
 
-- **背景：** 案例 D 的新增教学变体 `ml/train-a100-4gpu` 请求 4 卡，三台节点 API 账面分别只余 3、2、1。
+- **背景：** 案例 D 的新增教学变体 `ml-lab/train-a100-4gpu` 请求 4 卡，三台节点 API 账面分别只余 3、2、1。
 - **只读命令：**
   ```powershell
-  kubectl get pod -n ml train-a100-4gpu -o jsonpath='{range .spec.containers[*]}{.resources.requests.nvidia\.com/gpu}{"\n"}{end}'
+  kubectl get pod -n ml-lab train-a100-4gpu -o jsonpath='{range .spec.containers[*]}{.resources.requests.nvidia\.com/gpu}{"\n"}{end}'
   kubectl get nodes -l accelerator=a100-80gb -o custom-columns='NAME:.metadata.name,ALLOC:.status.allocatable.nvidia\.com/gpu'
   kubectl describe nodes -l accelerator=a100-80gb | Select-String 'Name:|Allocated resources:|nvidia.com/gpu'
   ```
@@ -4767,14 +4675,14 @@ resources:
 
 #### 运维现场小案例：`top` 只有 15%，Event 仍说 CPU 不足
 
-- **背景：** 案例 A 的 `worker-a` usage 约 15%，已承诺 request 为 3200m；新 Spring Boot Pod 要 1400m。
+- **背景：** 案例 A 的 `worker-a` usage 约 15%，已承诺 request 为 3200m；新的 `activity` Pod 要 1000m。
 - **只读命令：**
   ```powershell
   kubectl top node worker-a
   kubectl describe node worker-a
-  kubectl get pod -n platform platform-aggregator-new-7f8d9 -o jsonpath='{range .spec.containers[*]}{.name}{"="}{.resources.requests.cpu}{"\n"}{end}'
+  kubectl get pod -n platform activity-new-7f8d9 -o jsonpath='{range .spec.containers[*]}{.name}{"="}{.resources.requests.cpu}{"\n"}{end}'
   ```
-- **示例证据（教学示意）：** usage≈15%，request 余额=800m；新 Pod 合计 1400m。
+- **示例证据（教学示意）：** usage≈15%，request 余额=800m；新 Pod 合计 1000m。
 - **能证明：** 调度依据是承诺账，不是瞬时采样，两者不矛盾。
 - **不能证明/时间边界：** 低 usage 不能证明 request 过大；还需启动峰值、JIT/GC、SLO 和长期分位数。
 - **修复/安全边界：** 用压测/VPA 推荐作右调输入并灰度；大幅降 request 会制造争用和尾延迟。
@@ -4795,11 +4703,11 @@ resources:
 
 #### 运维现场小案例：容忍一条污点，却漏了同节点第二条
 
-- **背景：** 案例 A 的教学变体允许 `platform-aggregator` 进入 `worker-c`；Pod 容忍 `dedicated=gpu:NoSchedule`，却漏了维护污点。
+- **背景：** 案例 A 的教学变体允许 `activity` 进入 `worker-c`；Pod 容忍 `dedicated=gpu:NoSchedule`，却漏了维护污点。
 - **只读命令：**
   ```powershell
   kubectl get node worker-c -o jsonpath='{range .spec.taints[*]}{.key}{"="}{.value}{":"}{.effect}{"\n"}{end}'
-  kubectl get pod -n platform platform-aggregator-new-7f8d9 -o jsonpath='{range .spec.tolerations[*]}{.key}{" op="}{.operator}{" value="}{.value}{" effect="}{.effect}{"\n"}{end}'
+  kubectl get pod -n platform activity-new-7f8d9 -o jsonpath='{range .spec.tolerations[*]}{.key}{" op="}{.operator}{" value="}{.value}{" effect="}{.effect}{"\n"}{end}'
   ```
 - **示例证据（教学示意）：** Node 还有 `maintenance=pending:NoSchedule`；Pod 只容忍 dedicated。
 - **能证明：** 最终 Pod tolerations 未覆盖候选 Node 的全部不可容忍 NoSchedule taint。
@@ -4807,28 +4715,27 @@ resources:
 - **修复/安全边界：** 先确认维护 taint 的平台意图；不要为单 Pod 从节点删 taint，只按授权精确添加 toleration。
 - **源码/组件映射：** `TaintToleration.Filter` 找不可容忍 taint；`NodeAffinity.Filter` 决定候选池。
 
+
 ### 23.6 Pod 被提名到节点，却迟迟没绑定
 
-**可能原因：** 受害者优雅退出、PDB/抢占方案变化、目标节点新变化、卷/动态资源等待、Permit、API 更新或 Pod 已被替换。
+**可能原因：** 抢占受害者仍在优雅退出、PDB/候选方案变化、目标节点出现新事实、卷或动态资源等待、Permit、API 更新失败，或原 Pod 已被替换。
 
-**证据：** `status.nominatedNodeName`、`spec.nodeName`、受害者 deletionTimestamp、PriorityClass、PDB、Permit metrics、scheduler Event/log 时间线、Pod UID。
+案例 B 的生命周期教学设定复用公司 90 秒终止基线：受害者的 `preStop sleep 15` 在这 90 秒内执行，不应相加成 105 秒；只有受害者真正退出、request 释放后，被提名 Pod 才有条件在未来一轮重新通过全部 Filter。
 
-**不要做的事：** 看到 nomination 就把目标节点标成故障；也不要认为 nomination 是容量预留的强保证。
+#### 运维现场小案例：提名已出现，90 秒退出窗口内为什么仍无 nodeName
 
-#### 运维现场小案例：提名已出现，受害者还在优雅退出
-
-- **背景：** 案例 B 的 `platform/pay-recovery` 提名 `worker-a` 后仍无 Node；受害者 grace=30 秒。
+- **背景：** 案例 B 的 `platform/player-recovery` 提名 `worker-a` 后仍无 Node；教学受害者已进入 90 秒 grace。
 - **只读命令：**
   ```powershell
-  kubectl get pod -n platform pay-recovery -o custom-columns='UID:.metadata.uid,NODE:.spec.nodeName,NOMINATED:.status.nominatedNodeName'
+  kubectl get pod -n platform player-recovery -o custom-columns='UID:.metadata.uid,NODE:.spec.nodeName,NOMINATED:.status.nominatedNodeName'
   kubectl get pods -A --field-selector spec.nodeName=worker-a -o custom-columns='NS:.metadata.namespace,NAME:.metadata.name,PRI:.spec.priority,DELETING:.metadata.deletionTimestamp,GRACE:.spec.terminationGracePeriodSeconds'
   kubectl get pdb -A
   ```
-- **示例证据（教学示意）：** `NOMINATED=worker-a,NODE=<none>`；victim 已 deleting，grace=30s。
-- **能证明：** 清理尚未兑现成可用 request，等待可能是预期时序。
-- **不能证明/时间边界：** nomination 不保证最终绑定；Permit、卷、API 和节点新变化仍需时间线。
-- **修复/安全边界：** 等正常退出并核对终止；不要强删受害者或把 nomination 当硬预留。
-- **源码/组件映射：** `Evaluator.Preempt`/executor 推进删除和 nomination；未来 cycle 才重新验证并 Bind。
+- **示例证据（教学示意）：** `NOMINATED=worker-a,NODE=<none>`；victim 已 deleting、`GRACE=90`，资源尚未从请求账消失。
+- **能证明：** nomination 只是潜在落点，删除与资源释放仍在推进。
+- **不能证明/时间边界：** nomination 不保证最终绑定；Permit、卷、API 和节点新变化仍需放进同一时间线。
+- **修复/安全边界：** 等正常退出并核对终止链；不要强删受害者或把 nomination 当成硬预留。
+- **源码/组件映射：** `Evaluator.Preempt`/executor 推进删除与 nomination；未来 scheduling cycle 才重新 Filter 并 Bind。
 
 ### 23.7 Kueue 已 Admitted，Pod 仍然 Pending
 
@@ -4844,12 +4751,12 @@ resources:
 
 #### 运维现场小案例：Kueue 已准入，两个成员仍未选到 Node
 
-- **背景：** 案例 E 的 `vision` Workload 已从 `vision-lq` 准入，8 个 1-GPU Pod 中只有 6 个有 Node。
+- **背景：** 案例 E 的 `batch-lab/train-8` Workload 已从 `batch-lq` 准入，8 个 1-GPU Pod 中只有 6 个有 Node。
 - **只读命令（按已安装 Kueue API 调整）：**
   ```powershell
-  kubectl get workload -n vision -o yaml
-  kubectl get pod -n vision -o custom-columns='NAME:.metadata.name,NODE:.spec.nodeName,SCHEDULED:.status.conditions[?(@.type=="PodScheduled")].status'
-  kubectl get events -n vision --field-selector reason=FailedScheduling --sort-by='.metadata.creationTimestamp'
+  kubectl get workload -n batch-lab -o yaml
+  kubectl get pod -n batch-lab -o custom-columns='NAME:.metadata.name,NODE:.spec.nodeName,SCHEDULED:.status.conditions[?(@.type=="PodScheduled")].status'
+  kubectl get events -n batch-lab --field-selector reason=FailedScheduling --sort-by='.metadata.creationTimestamp'
   ```
 - **示例证据（教学示意）：** Workload `Admitted=True`；6 个 Pod 已绑定，2 个仍由 NodeResourcesFit/affinity 拒绝。
 - **能证明：** Workload admission 已完成，但逐 Pod Node placement 尚未完成。
@@ -4857,70 +4764,35 @@ resources:
 - **修复/安全边界：** 分别处理 quota/flavor 与节点碎片/健康；不要改 Condition 或手工绑定绕过控制器。
 - **源码/组件映射：** Kueue 管 admission/gates；放行后 Pod 进入 kube-scheduler `RunFilterPlugins`/Bind。
 
-### 23.8 scheduler 进程正常，却大面积调度变慢
 
-可能不是“算法算不动”这么简单：
+### 23.8 UAT 六服务同批发布，四只运行、两只 Pending
 
-```text
-activeQ 发布洪峰
-API Server / etcd 写入慢导致 Bind 变慢
-自定义 Filter/Score 插件延迟
-Extender 网络超时
-大量抢占模拟
-复杂 affinity/topology 匹配
-Node/Pod 规模增长与扫描比例
-事件风暴导致反复入队
-Permit 等待或异步 API 调用堆积
-```
+**表象：** scheduler leader 正常、进程无重启，但一批发布后只有部分新 Pod 绑定，剩余 Pod 持续 `FailedScheduling`。
 
-证据顺序：队列长度 -> attempt latency -> result -> extension point -> plugin/extender -> API Server 指标 -> 规模和变更时间线。不要只抓一个 goroutine profile 就跳过上游事实。
+**公司事实与推演边界：**
 
-#### 运维现场小案例：leader 正常，慢点其实在自定义扩展点
+- 实际 UAT 审计对象中选取 `activity`、`announce`、`content-security`、`content-security-mng`、`policy`、`launcher-aggregator` 六个服务；
+- 只有 PodTemplate 真正变化的 Deployment 才会 rollout；
+- 按 nonprod 单副本、`maxSurge=1`，并假设最终 Pod request 均为 `1 CPU/4Gi`，第一波最多新增 6 个 surge Pod，即 `6 CPU/24Gi`；
+- “当前可行余量只有 `4 CPU/16Gi`”是教学快照，不是 UAT 事故实测。
 
-- **背景：** 案例 F 的 Lease 正常续约、Pod 无重启，但多团队发布后从创建到绑定越来越慢。
-- **只读命令（PromQL；下面三条逐条执行，不能整块粘贴）：**
-  ```promql
-  sum by (queue) (scheduler_pending_pods)
-  histogram_quantile(0.99, sum by (le,result,profile) (rate(scheduler_scheduling_attempt_duration_seconds_bucket[5m])))
-  histogram_quantile(0.99, sum by (le,extension_point,profile) (rate(scheduler_framework_extension_point_duration_seconds_bucket[5m])))
+#### 运维现场小案例：第一波最多 6 只，为什么至少 2 只会等容量
+
+- **只读命令：**
+  ```powershell
+  $Apps = 'activity','announce','content-security','content-security-mng','policy','launcher-aggregator'
+  foreach ($App in $Apps) {
+    kubectl get deploy -n platform $App -o custom-columns='NAME:.metadata.name,GEN:.metadata.generation,OBSERVED:.status.observedGeneration,REPLICAS:.spec.replicas,UPDATED:.status.updatedReplicas,AVAILABLE:.status.availableReplicas'
+  }
+  kubectl get pod -n platform -o custom-columns='NAME:.metadata.name,NODE:.spec.nodeName,SCHEDULED:.status.conditions[?(@.type=="PodScheduled")].status'
+  kubectl get events -n platform --field-selector reason=FailedScheduling --sort-by='.metadata.creationTimestamp'
   ```
-- **示例证据（教学示意）：** activeQ 增长；attempt p99=4s；`Score/gpu-binpack-scheduler` p99=3.6s；leader 正常。
-- **能证明：** 本窗口吞吐瓶颈集中在该 profile 的 Filter 扩展点；进程 Running 不等于 SLO 健康。
-- **不能证明/时间边界：** 扩展点指标不能唯一归因单插件或下游；还要查 plugin/Extender/API。
-- **修复/安全边界：** 灰度回滚最近插件/Extender 变更或限发布洪峰；不要先重启全部 scheduler 或长期开最高日志。
-- **源码/组件映射：** `PriorityQueue` 体现积压，`RunFilterPlugins` 记录耗时；HTTP 路径落到 `HTTPExtender.Filter/send`。
-
-### 23.9 手动 Argo Sync 改错 image，新 Pod 异常不等于 Scheduler 是根因
-
-**真实背景（已脱敏）：** dev 分批同步时，在当时使用的 Argo CD CLI v3.2.5 组合中，命令同时加入 `--server-side` 与 `--apply-out-of-sync-only`，生成了新的 operation syncOptions；该次 operation 没有带上 Application 原有的 `RespectIgnoreDifferences=true`。某服务的 live image 因而被 Git 中的 bootstrap image 短暂覆盖，并触发了非预期 rollout。这个结论针对当时已验证的版本与命令，不应外推成所有 Argo CD 版本的普遍行为。
-
-**因果链：**
-
-```text
-环境本来约定 live image 由发布流程保留
-  -> 手动 Sync operation 没有继承完整 ignore/sync 选项
-  -> Argo 把 Git bootstrap image 当成本次 apply 目标
-  -> Deployment Pod template 改变，ReplicaSet 创建新 Pod
-  -> Scheduler 只负责给这些新 Pod 选 Node
-  -> 即使新 Pod 成功绑定，运行的仍可能是错误版本
-```
-
-**第一组证据：** Application 的 `spec.syncPolicy.syncOptions`、`ignoreDifferences`、最近一次 `status.operationState.operation.sync.syncOptions` 与 revision；Deployment 的 image、generation、ReplicaSet、Pod UID；同步前快照。
-
-```powershell
-$Application = '<application-name>'
-$Service = '<service-name>'
-kubectl get application -n argocd $Application -o yaml
-kubectl get deployment -n platform $Service `
-  -o jsonpath='generation={.metadata.generation}{" observed="}{.status.observedGeneration}{" image="}{.spec.template.spec.containers[0].image}{" replicas="}{.spec.replicas}{"\n"}'
-kubectl get rs,pod -n platform -l "app=$Service" -o wide
-```
-
-**能证明：** desired/live 所有权是否在本次 operation 中失效，以及错误 image 是否先于新 ReplicaSet/Pod 出现。只有新 Pod 另外出现 `PodScheduled=False` 时，才再按案例 A 查 request、affinity、taint、卷和 topology。
-
-**处置顺序：** 立即停止后续批次；从受控的同步前快照恢复应该保留的 live 字段；等待纠正 rollout；验证不再使用会覆盖完整 Application syncOptions 的操作级参数；执行一次无差异 Sync，确认 image、replicas、generation、活动 Pod UID 都不变化，再继续小批次。
-
-**不要误判：** `Pod Pending`、`ImagePullBackOff` 或 readiness 失败可能只是错误 rollout 的下游表现。Scheduler 不选择镜像版本，也不决定 Argo 应该管理哪些字段；重启 scheduler 不会修复字段所有权。
+  指标侧再逐条看 `sum by (queue) (scheduler_pending_pods)` 与 `sum by (result,profile) (rate(scheduler_schedule_attempts_total[5m]))`。
+- **示例证据（教学示意）：** 六个 Deployment 均产生 1 个新 surge Pod；可行池只能再装 4 个 `1 CPU/4Gi` shape，因而最多 4 只先绑定，至少 2 只进入不可调度等待。
+- **能证明：** Deployment 新旧 Pod 数、最终 request、逐 Node 可行余额与 Event 可以复算“发布批次超过瞬时可调度容量”。
+- **不能证明/时间边界：** 六个应用数不等于六只 Pod，除非六个 PodTemplate 都变化；聚合指标也不能替代逐 UID 证据，教学余量不是实际 UAT 数据。
+- **修复/安全边界：** 把服务拆批、预留 surge 容量或等待受控扩容；不要靠重启 scheduler 或删除健康旧 Pod“清队列”。
+- **源码/组件映射：** Deployment controller 决定 Pod 到达率；`PriorityQueue` 维护等待状态，`NodeResourcesFit` 判断每只 Pod 的 Node 可行性。
 
 ---
 
@@ -5115,18 +4987,16 @@ DRA 是另一条更丰富的设备声明/Claim/分配路径，不要把两条证
 9. scheduler 选 Node 不等于 GPU 已分配、CUDA 已成功；
 10. 进程存活不等于业务可调度容量健康。
 
-### 25.5 事故现场九问
+### 25.5 事故现场七问
 
 ```text
-1. 当前 kube-context/region 是什么，这是 dev、UAT 还是 prod；该环境的 image/replicas 字段由谁管理？
-2. Git revision、Application revision/operation、Deployment generation 是否指向同一批变更？
-3. 这是哪个 Pod UID，何时创建？
-4. spec.nodeName 是否已经有值？
-5. spec.schedulerName 谁负责？是否有 gate/上层准入？
-6. PodScheduled Condition 与 Event 的时间线是什么？
-7. 失败插件对应哪些硬约束集合？
-8. request/allocatable/requested 与实际 usage 各是多少，是否混账？
-9. 哪个事实变化才能让结果改变，QueueingHint 是否应当唤醒？
+1. 这是哪个 Pod UID，何时创建？
+2. spec.nodeName 是否已经有值？
+3. spec.schedulerName 谁负责？是否有 gate/上层准入？
+4. PodScheduled Condition 与 Event 的时间线是什么？
+5. 失败插件对应哪些硬约束集合？
+6. request/allocatable/requested 与实际 usage 各是多少，是否混账？
+7. 哪个事实变化才能让结果改变，QueueingHint 是否应当唤醒？
 ```
 
 ---
@@ -5183,19 +5053,19 @@ DRA 是另一条更丰富的设备声明/Claim/分配路径，不要把两条证
 
 ## 27. 官方资料、固定源码入口与继续学习顺序
 
-### 27.1 Kubernetes、Argo CD 与 EKS 官方概念和运维边界
+### 27.1 Kubernetes 官方概念与配置
 
 - [Scheduling Framework](https://kubernetes.io/docs/concepts/scheduling-eviction/scheduling-framework/)
 - [Scheduler Configuration](https://kubernetes.io/docs/reference/scheduling/config/)
 - [Assigning Pods to Nodes](https://kubernetes.io/docs/concepts/scheduling-eviction/assign-pod-node/)
 - [Pod Priority and Preemption](https://kubernetes.io/docs/concepts/scheduling-eviction/pod-priority-preemption/)
 - [Pod Topology Spread Constraints](https://kubernetes.io/docs/concepts/scheduling-eviction/topology-spread-constraints/)
+- [Resource Management for Pods and Containers](https://kubernetes.io/docs/concepts/configuration/manage-resources-containers/)
+- [Deployments](https://kubernetes.io/docs/concepts/workloads/controllers/deployment/)
+- [Amazon EKS control plane logs](https://docs.aws.amazon.com/eks/latest/userguide/control-plane-logs.html)
 - [Device Plugins](https://kubernetes.io/docs/concepts/extend-kubernetes/compute-storage-net/device-plugins/)
 - [Dynamic Resource Allocation](https://kubernetes.io/docs/concepts/scheduling-eviction/dynamic-resource-allocation/)
 - [Storage Classes / WaitForFirstConsumer](https://kubernetes.io/docs/concepts/storage/storage-classes/)
-- [Resource Management for Pods and Containers](https://kubernetes.io/docs/concepts/configuration/manage-resources-containers/)
-- [Argo CD Sync Options / RespectIgnoreDifferences](https://argo-cd.readthedocs.io/en/latest/user-guide/sync-options/)
-- [Amazon EKS Control Plane Logs](https://docs.aws.amazon.com/eks/latest/userguide/control-plane-logs.html)
 
 ### 27.2 队列与 GPU 官方资料
 
