@@ -36,11 +36,12 @@
 
 以下专题用于把多个正式课程一次性串成完整生产因果链，不新增第 22 课，不改变 07～21 的冻结顺序，也不自动推进个人学习进度。
 
-- [Kubernetes Scheduler 全景：从生产实战到业务平台、GPU 与源码](专题/01_Kubernetes_Scheduler从生产实战到业务平台_GPU与源码全景_新手独立讲义.md)
-  - 生产问题：从一个 `Pending` Pod 出发，贯通 Filter/Score、Assume/Bind、失败重排、抢占、平台治理、GPU 设备供给、Kueue/Volcano 与生产排障。
-  - 必要前置：认识 Pod、Node、Deployment、resources request、label/affinity 和 taint/toleration；不要求先掌握 Go。
-  - 插入理由：作为面向新手的独立全景复盘，横向串联第 08～10 课 scheduler 主线和第 15～21 课 GPU 平台主线，适合值班前查阅或学完分章后回看。
-  - 验证边界：固定 Kubernetes commit `301946d15e67a4a2e8a5fb8292eb836acd366d78`；静态源码与教学审校已完成，Go 单测受本机工具链版本阻塞，真实集群/GPU 实验未执行。
+- [Kubernetes Scheduler：从新手值班到独立分析与平台设计](专题/01_Kubernetes_Scheduler从生产实战到业务平台_GPU与源码全景_新手独立讲义.md)
+  - 生产问题：从一个 Pending Pod 出发，先学责任边界、请求计算与约束交集，再学习发布、跨域、抢占、缓存和源码。
+  - 必要前置：会选择目标集群查看对象、认识 YAML 基本缩进；对象与调度术语在主篇就地解释，不要求先掌握 Go。
+  - 专题路径：主教材 → [生产设计](专题/01_Scheduler配套/02_生产设计与疑难排障.md) → [GPU 与源码](专题/01_Scheduler配套/03_GPU与源码进阶.md)，配合[实验手册](专题/01_Scheduler配套/04_实验手册.md)与阶段验收。
+  - 插入理由：作为新手独立专题串联第 08–10 与 15–21 课，不改变冻结顺序；原文完整归档，第二轮补足算例、反例与源码带读。
+  - 验证边界：关键源码核对固定 commit `301946d15e67a4a2e8a5fb8292eb836acd366d78`；第二轮 19 项内存离线测试通过，另 3 项文件系统测试未重跑；真实集群/GPU 与上游 Go 测试未执行。见[审校记录](专题/01_Scheduler配套/审校记录.md)。
 
 ## 唯一大纲与冻结规则
 
