@@ -1,6 +1,6 @@
 # Kubernetes Scheduler：Pod 为什么放不下，怎样用数字和源码查清楚
 
-> 2026-10-01 优化版。你已有 K8s 运维经验，本文从你熟悉的 Java 应用发布讲起；Go 和调度器内部流程在用到时解释。
+> 2026-10-02 优化版。你已有 K8s 运维经验，本文从你熟悉的 Java 应用发布讲起；Go 和调度器内部流程在用到时解释。
 >
 > 读完要能回答三件事：Pod 卡在哪一步？哪个条件没满足？改这个条件以后，会影响什么？先自己算，再看实验，最后用一小段源码核对。
 >
@@ -21,13 +21,15 @@
 | 对照实际结果 | [第 16 章](#verification) | 区分实测、教学算例和仍未运行的部分 |
 | 遇到专业词 | [第 17 章：术语速查](#terms) | 用一句大白话复述它做什么，再回到原例子 |
 
-下文 `activity` 是 Java/Spring Boot 教学服务，数字用于推演，没有连接公司生产集群。标为“云端实测”的段落来自独立实验集群，版本与结果直接写在本文第 16 章。原文 327,726 字节的历史归档仍保留；它不作为当前结论和实验步骤的依据。
+**想先学会一个完整例子：**读 1.2 判断卡在哪一步，再读 3.1—3.2 算 CPU 余额；完成 15.1 的准备后，做[第 15.2 节 CPU 实验](#cpu-lab)。看到同一只 Pod 从等待变为 Ready，再读[第 14.1 节源码跟读](#cpu-source-walk)。后两部分使用同一组数字，不要求先学完 GPU 和所有内部机制。
+
+下文 `activity` 是 Java/Spring Boot 教学服务，数字用于推演，没有连接公司生产集群。标为“云端实测”的段落来自独立实验集群，版本与结果直接写在本文第 16 章。
 
 ### 0.1 版本与命令约定
 
 日常原理以 Kubernetes 官方文档为依据；源码进阶沿用并核验原文固定提交 `301946d15e67a4a2e8a5fb8292eb836acd366d78`。固定提交就是固定到这一份代码快照，后续源码变化不会悄悄改变本文依据。
 
-feature gate 是功能开关，决定某项能力是否启用；函数签名说明“接收什么参数、返回什么结果”；插件是实现某类检查或评分的代码，同一插件可以参与多个处理阶段。开发提交中的这些设置不代表你的生产版本。现场先保存 `kubectl version -o yaml`、发行版、schedulerName、可见配置和采集时间。`schedulerName` 是这只 Pod 交给谁调度的名字，第 12.6 节再讲多个调度器。[S1][S2]
+开发提交的功能与默认设置不代表你的生产版本。现场先保存 `kubectl version -o yaml`、发行版、schedulerName、可见配置和采集时间。`schedulerName` 是这只 Pod 交给谁调度的名字，第 12.6 节再讲多个调度器。[S1][S2]
 
 正文命令以 Bash 为主，关键只读取证同时给 PowerShell。第 15 章在 Linux/WSL 的 Bash 中运行，用 Python 3.9+ 标准库生成实验对象，实际操作由 kubectl 完成；不需要下载配套脚本。实验使用自己创建的 kind 集群与专用 kubeconfig。
 
@@ -41,19 +43,17 @@ Bash 和 PowerShell 是执行命令的工具；WSL 是在 Windows 里运行 Linu
 
 ### 1.1 用一次 Java 发布串起组件
 
-你修改 `activity` 的镜像后，Deployment 控制器推进滚动更新，ReplicaSet 控制器创建新 Pod。控制器就是反复检查“现在有几只、目标要几只”，并据此推进创建或删除的程序。Deployment 管发布和版本替换，ReplicaSet 管某一版的副本数量。
+`activity` 发布卡住时，先分清三件事：**新 Pod 有没有创建？有没有选到节点？节点有没有把应用启动好？**
 
-scheduler 给已经创建的 Pod 选节点；目标节点的 kubelet 再拉镜像、挂卷、启动 JVM。kubelet 是每台节点上负责把容器真正运行起来、报告状态的程序；JVM 是运行 Java 程序的环境。readiness 是就绪检查，询问应用是否已准备好接请求。Pod 的必要就绪条件满足后才报告 Ready，但 Ready 仍不能代替接口和性能验收。[S3][S4]
+你修改镜像后，Deployment 管这次版本替换，ReplicaSet 管这一版的副本数量、创建新 Pod。它们都是控制器：反复检查目标和现状，再推进需要的创建或删除。
 
-这些组件通过 API Server 读写对象。API Server 是集群接收查询和修改请求的统一入口；这里的对象就是保存起来的 Pod、Node、Deployment 等记录。它们各做一段工作，所以“发布没完成”还不能直接推出“scheduler 有问题”。
+scheduler 为已经创建的 Pod 选节点。目标节点的 kubelet 再准备卷、拉镜像和启动容器。kubelet 就是每台节点上负责执行这些工作、报告结果的程序。[S3][S4]
 
-读 YAML 时，先看 `spec` 中实际要求了什么，再看 `status` 中组件报告做到哪一步。`metadata.uid` 是这次对象创建的唯一标识，名字相同但删后重建也会换 UID。Deployment 模板只是准备创建的配置；准入是保存对象前的检查和补充处理，可能加 sidecar（与业务容器一起工作的辅助容器）或默认 request（资源申请量）。scheduler 收到的是处理后的最终 Pod。
+容器里的 JVM 是运行 Java 程序的环境。它启动后，应用还可能加载缓存、做预热；readiness 是就绪检查，用来判断能否接请求。Pod 的必要就绪条件满足后才报告 Ready，接口和性能仍要单独验收。
 
-后面有两种标签要分清：Node 标签用来找节点池、可用区；Pod 标签用来找同一应用的副本。`selector` 就是按标签筛选的规则。Namespace 本身不表示独占一批节点。
+这些组件通过 API Server 读写对象。API Server 是集群接收查询和修改请求的统一入口，对象就是其中保存的 Pod、Node 等记录。因此“发布没完成”还不能直接推出“scheduler 有问题”。
 
-对普通单 Pod 调度路径，kube-scheduler 的核心工作是：
-
-硬条件是“任何一条不满足就不能选”；软偏好是“在已经能选的节点中更喜欢谁”。Binding 是把选定节点正式写进 Pod 的 `spec.nodeName`，后面的组件才知道由哪台节点接手。
+选节点时，硬条件是“任何一条不满足就不能选”；软偏好是“在已经能选的节点中更喜欢谁”。Binding 是把选定节点正式写进 Pod 的 `spec.nodeName`，后面的组件才知道由哪台节点接手。从上往下看它负责的这一段：
 
 ```text
 已经存在、尚未分配节点的 Pod
@@ -62,7 +62,11 @@ scheduler 给已经创建的 Pod 选节点；目标节点的 kubelet 再拉镜�
   → 把选定节点通过 Binding 写入 API
 ```
 
-容器创建、镜像拉取、挂卷和应用启动，是后续链路。GPU 是图形处理器，本文主要关注用它做训练、推理等并行计算。传统 Device Plugin 是向 kubelet 报告设备数量、健康状态并协助准备设备的节点插件；具体设备分配也在节点侧。DRA 则让应用提交设备申请，调度过程参与设备选择与分配，第 13 章再展开。[S1][S3][S12][S13]
+读后面的现场时，用 `spec` 看对象的要求，用 `status` 看组件报告的结果。`metadata.uid` 标识这一次创建的对象；删掉再建，即使名字相同，UID 也会换。第 15.2 节就用它证明“还是原来那只 Pod 在重试”。
+
+Deployment 模板是创建 Pod 的输入。保存前的检查和补充叫准入，它可能改变最终 Pod；request 就是其中的资源申请量。具体怎样补默认值，到第 3.3 节再算。[S4]
+
+后面有两种标签要分清：Node 标签用来找节点池、可用区；Pod 标签用来找同一应用的副本。`selector` 就是按标签筛选的规则。Namespace 本身不表示独占一批节点。设备相关的新增步骤留到第 13 章，在这条主线清楚以后再接着学。
 
 ### 1.2 工作负载没起来，先分四站
 
@@ -237,12 +241,14 @@ GC 是 JVM 清理不再使用的对象、回收内存的工作；JIT 是把常�
 ```text
 余额 = 5000 - 100 - 4700 = 200m
 新 Pod 请求 201m：201 > 200，调度失败
-删除它，再请求 200m：200 没有超过余额，绑定并 Ready
+删除 holding，原来的 201m Pod 不变：余额回到 4900m，同 UID 绑定并 Ready
+删除已运行的 201m Pod，再恢复 holding：余额回到 200m
+新建请求 200m 的 Pod：200 没有超过余额，绑定并 Ready
 ```
 
 先前一次云端对照读取 kubelet stats 时，节点 CPU 采样约为 `13.2m`，holding 为 `0m`。这是当时的采样，不是全过程峰值。机器很闲和请求账只剩 200m，可以同时成立。
 
-第 15.2 节有两组 CPU 对照：一组测试“单只请求超过节点 CPU Allocatable”，另一组测试“请求小于 Allocatable，但超过剩余请求额度”，两者对应不同原因。复跑时命令根据你的节点和已有 Pod 重新计算，CPU 采样值每次也可能不同。
+[第 15.2 节](#cpu-lab)分别验证超过节点 CPU Allocatable、超过当前余额，以及释放占用后同一只 Pod 重新成功。201m 与 200m 的比较会先恢复相同占用，不把空节点上的成功当边界证据。复跑时命令根据你的节点和已有 Pod 重新计算，CPU 采样值每次也可能不同。
 
 **先预测再运行：**把新请求从 201m 改为 200m，只改变了哪一项？CPU 通过以后，能否直接说 Java 服务已恢复？不能，还要验证启动、探针和业务请求。
 
@@ -316,7 +322,7 @@ fitsRequest 返回不足记录
 
 Pod 创建时，缺少的同资源 request 会按 limit 补齐；明确填写的 request 不会被这条默认规则覆盖。LimitRange、注入容器、RuntimeClass overhead 等还可能影响最后的输入。因此容量计算以 API 中最终 Pod 为起点。[S4]
 
-对于最简单的普通容器场景：
+sidecar 是与业务容器配合工作的辅助容器，例如收集日志的容器。对于最简单的普通容器场景：
 
 ```text
 业务容器：1000m / 4Gi
@@ -1285,7 +1291,7 @@ CPU 余额、硬条件、发布空间和失败重试仍适用。现在新增的�
 
 先回答一个问题：Pod 已绑定，为什么仍可能无法使用 GPU？先分清“数量满足”与“节点把设备准备好”，后面的证据才知道该找谁。
 
-传统 Device Plugin 路径，scheduler 先看资源名和申请数量，节点侧再准备实际设备。从上到下读下面的步骤；箭头表示工作先后，不表示组件间同步调用：
+GPU 是擅长并行计算的处理器。传统 Device Plugin 是节点上的设备插件，向 kubelet 报告设备数量、健康状态，并协助准备设备。scheduler 先看资源名和申请数量，节点侧再准备实际设备。从上到下读下面的步骤；箭头表示工作先后，不表示组件间同步调用：
 
 ```text
 驱动/设备插件发现设备
@@ -1470,7 +1476,7 @@ DRA 不只把设备数写在 Node 上，而是让驱动发布可用设备，再�
 
 #### 13.4.1 版本卡比一张“GA/Beta表”更可靠
 
-GA 表示功能进入上游稳定阶段，Beta 表示还处在测试发布阶段；这些是功能成熟度标签。它们没有替你检查云厂商是否开放、开关是否启用、驱动是否安装，所以仍要核对下面的实际环境信息。
+GA 表示功能进入上游稳定阶段，Beta 表示还处在测试发布阶段；这些是功能成熟度标签。feature gate 是功能开关。它们没有替你检查云厂商是否开放、开关是否启用、驱动是否安装，所以仍要核对下面的实际环境信息。
 
 为目标环境填写：Kubernetes版本与发行版、DRA driver版本、API discovery结果、feature gates、scheduler插件配置、ResourceSlice内容、Claim请求类型、分配结果及节点准备状态。不要把开发分支的默认开关当成云厂商当前开放能力。
 
@@ -1479,6 +1485,103 @@ GA 表示功能进入上游稳定阶段，Beta 表示还处在测试发布阶段
 scalar 在这里就是“一个资源名对应一个数量”的数值账，比如 GPU=8；桥接是让原先按数量表达的申请接到 DRA 分配路径，具体是否支持、怎样处理以目标版本为准。
 
 DRA 下的抢占、优先请求、可消耗容量和设备绑定条件，都要按版本核对。不能仅凭某个开发快照断言以后始终不支持，也不能承诺提高 Pod priority 就能拿到别人 Claim 的设备。结论要有目标版本源码、驱动规则和实验支持。[G2]
+
+#### 13.4.2 跟一个具体现场：要两份设备，为什么申请一直没分配
+
+**这是按 v1.34 API 编写的教学模拟，不是 GPU 实测输出。**假设一个推理 Pod `infer-demo` 位于 `ml-lab`，已限定到 worker-a；CPU、内存及其他普通硬条件通过。它引用同 namespace 的 `infer-gpu` Claim，要求两个不同的设备。管理员已核对：这个案例中只有一个匹配供给池，清单完整，其中只有一个空闲设备；没有共享分配或其他候选池。
+
+先预测：Pod 会先绑定、到节点才发现少设备，还是在选点时就可能被挡住？这一题用来区分“申请没分配”与“已经分配，但节点准备失败”。
+
+下面四块是**用于阅读的字段摘录，省略了无关字段，不是可直接 apply 的完整清单**。名字都是虚构教学名字。字段结构对照 v1.34 的 API 类型，尤其要注意 requests 下的 `exactly` 层级。[N13]
+
+```yaml
+# Pod：把 gpu-input 这个本地引用名接到 infer-gpu Claim。
+metadata:
+  name: infer-demo
+  namespace: ml-lab
+spec:
+  nodeSelector:
+    kubernetes.io/hostname: worker-a
+  resourceClaims:
+  - name: gpu-input
+    resourceClaimName: infer-gpu
+  containers:
+  - name: inference
+    resources:
+      claims:
+      - name: gpu-input
+```
+
+```yaml
+# ResourceClaim，apiVersion 为 resource.k8s.io/v1。
+metadata:
+  name: infer-gpu
+  namespace: ml-lab
+spec:
+  devices:
+    requests:
+    - name: cards
+      exactly:
+        deviceClassName: gpu-lab
+        allocationMode: ExactCount
+        count: 2
+status: {}  # 本题假定查询时还没有 allocation。
+```
+
+ExactCount 的意思是“要满足指定数量”，count=2 就是两个不同设备，不能因为只剩一个就默默少给一份。这里的 `cards` 是 Claim 中这条请求的名字；`gpu-input` 是 Pod 中的引用名，两者职责不同。
+
+```yaml
+# DeviceClass：只选择这个驱动公布的设备。
+metadata:
+  name: gpu-lab
+spec:
+  selectors:
+  - cel:
+      expression: 'device.driver == "gpu.example.com"'
+```
+
+CEL 是写筛选表达式的一种语言；这里整句就是“设备来自 gpu.example.com 驱动”。这个名字只是教学标识，不意味着节点已装有真实驱动。
+
+```yaml
+# ResourceSlice：worker-a 可使用的完整池，本题只有一个设备。
+spec:
+  driver: gpu.example.com
+  pool:
+    name: worker-a
+    generation: 1
+    resourceSliceCount: 1
+  nodeName: worker-a
+  devices:
+  - name: gpu-0
+```
+
+pool 是驱动组织的一组设备供给。`resourceSliceCount: 1` 表示这一代完整池应有一份清单；不能只看见某一份 Slice 上有一台设备，就断言整个集群只有一台。`gpu-0` 是驱动清单里的设备名，也不能直接当成 NVIDIA 的硬件 UUID。
+
+在自己的真实现场，先把 context、namespace 和对象名换成实际值，再做这些只读查询。没有这些教学对象的环境返回 NotFound，并不是验证失败：
+
+```bash
+kubectl --context "$CTX" get pod infer-demo -n ml-lab -o yaml
+kubectl --context "$CTX" get resourceclaim infer-gpu -n ml-lab -o yaml
+kubectl --context "$CTX" get deviceclass gpu-lab -o yaml
+kubectl --context "$CTX" get resourceslices -o yaml
+kubectl --context "$CTX" describe pod infer-demo -n ml-lab
+```
+
+按下面顺序读查询结果，每一行都先核对实际字段，再下结论：
+
+| 看到什么 | 本题怎样解释 | 还不能据此说什么 |
+|---|---|---|
+| Pod 的引用指向同 namespace 的 infer-gpu | 找到了本次具体申请 | 不能只查一个同名但不同 namespace 的 Claim |
+| Claim 要 gpu-lab，ExactCount=2 | 请求是两份，不能按一份计算 | 不能假定 count=2 一定等于两张物理整卡，资源含义仍由驱动声明 |
+| Class 匹配该驱动，完整供给池只有 gpu-0 | 在本题限定条件下，1 < 2，数量不足 | 单个 Slice 的局部输出不等于完整库存 |
+| Claim 没有 allocation，Pod 没有 nodeName | 还没形成设备分配与节点绑定 | 缺 allocation 本身不足以证明数量不足，还可能是 Class、选择器等问题 |
+| Pod 失败原因与设备分配对应 | 才把请求、供给与调度结果串起来 | 不凭一个 Pending 就去重启节点驱动 |
+
+v1.34 的 DynamicResources.Filter 在分配器没有为全部 Claim 找到结果时，会返回包含 `cannot allocate all claims` 的拒绝结果；它是目标版本可能出现的消息片段，不是所有版本统一的完整 Event。[N14] 本题的判断先来自完整的“要 2、只有 1”，再用实际失败原因核对。
+
+**只改一个输入再预测：**若创建一份同条件但 count=1 的新 Claim，并让测试 Pod 引用它，数量这一项可以满足；Class、节点条件、其他占用仍要检查。Claim 的 spec 不能就地随便改，所以不能写成“patch 原 Claim 的 count 就好了”。这只是下一步教学推演，没有在本轮执行设备分配或容器 GPU 验证。
+
+如果实际看到的是 **Claim 已有 allocation、Pod 已有 nodeName、容器仍未启动**，问题已经换到另一段：对照分配结果中的 driver/pool/device，再查节点驱动准备与容器运行时。不要把这两种现场都写成“GPU 不够”。
 
 ### 13.5. Kueue、Volcano 与 kube-scheduler 不是三个同义词
 
@@ -1531,21 +1634,214 @@ Volcano gang 需要核对 schedulerName、PodGroup 与插件配置。业务需�
 
 第一遍的关键判断已经在 3.2.2、3.3.2、8.3.1 就地解释。这里才继续追入口、缓存、返回结果与失败补偿；它们对应第 10 章的具体例子。
 
-### 14.1 先定位，再追一条完整路径
+<a id="cpu-source-walk"></a>
+
+### 14.1 跟同一只 201m 的 Pod：第一次失败，后来为什么成功
 
 本篇固定教学提交为 `301946d15e67a4a2e8a5fb8292eb836acd366d78`。本次在 `/workspace/kubernetes` 单独检出，`git describe --always` 为 `301946d1`，工作区干净。实验服务器另为 v1.34.0，发布提交是 `f28b4c9efbca5c5c0af716d9f2d5702667ee8a45`。这两个版本分开核对；生产排障则应使用目标集群版本。
+
+先用[第 15.2 节](#cpu-lab)的 CPU 对照理解这一条链。这里的 Pod 叫 `one-over`，只有一个 sleep 容器，申请 201m；它用节点标签限定到同一 worker。内存等其他条件通过，没有调度 gate，也没有低优先级占位者可供它抢占。
+
+数字沿用本次 5000m 节点；你复跑时，节点容量与占位请求按自己的实际值代入。按时间从上到下读：
+
+| 时刻 | 目标节点已请求 CPU | 余额 | one-over 的结果 |
+|---|---:|---:|---|
+| holding 已 Ready | 系统 100m + holding 4700m = 4800m | 200m | 201 > 200，不能放 |
+| holding 删除已被 scheduler 处理 | 系统 100m | 4900m | 下一次尝试时，201 ≤ 4900 |
+| one-over 被记入请求账 | 系统 100m + one-over 201m = 301m | 4699m | 继续绑定；启动后才可能 Ready |
+
+这次没有修改 `one-over` 的 request，也没有把它删掉重建。**变化的是别的 Pod 释放了请求，原 Pod 获得一次新的尝试。**sleep 不验证 Java 吞吐，但能把 Java 发布前“资源账不够”的判断单独拿出来观察。
+
+下面追的是普通单 Pod、默认资源插件和默认绑定插件。源码快照与实验版的函数拆分不同，结尾有对照；不能把实验的成功结果当作每一条内部函数都已被逐行跟踪。
+
+#### 14.1.1 201m 从哪里来：先算 Pod 请求，再逐台比较
+
+进入一次尝试后，调度器准备两份输入：这只 Pod 的最终配置，以及这一轮使用的节点资料。NodeInfo 是某台节点及其已计入 Pod、资源等资料的汇总；CycleState 是本轮插件之间暂存数据的地方。
+
+**这段只回答：怎样把 Pod 请求保存下来，供后面重复使用？**下面是 `pkg/scheduler/framework/plugins/noderesources/fit.go / Fit.PreFilter` 的完整函数，只加中文注释。[N8] 本组所有 Go 摘录都依赖上游类型，不能独立编译。
+
+参数 `pod` 是当前 Pod；`cycleState` 是本轮暂存区；`f` 是资源插件自身。`ctx` 传递本轮处理的上下文，如取消信号；`nodes` 是候选节点资料列表，本函数体没有读取它。
+
+```go
+func (f *Fit) PreFilter(ctx context.Context, cycleState fwk.CycleState, pod *v1.Pod, nodes []fwk.NodeInfo) (*fwk.PreFilterResult, *fwk.Status) {
+    // 按最终 Pod 和功能配置计算请求；本例只有一个容器，CPU 得到 201m。
+    result := computePodResourceRequest(pod, ResourceRequestsOptions{EnablePodLevelResources: f.enablePodLevelResources})
+    // 保存计算结果，后面检查每台节点时从同一处取。
+    cycleState.Write(preFilterStateKey, result)
+    // 不额外缩小候选节点集合；本次前置处理成功。
+    return nil, nil
+}
+```
+
+**大白话总结：**输入是最终 Pod；内部通过 `resource.PodRequests` 汇总请求；动作是把结果写进本轮暂存区。它没有扣节点资源，也没有调用绑定 API。[N8]
+
+**顺手学 Go：**`(f *Fit)` 表示这个方法属于一个 Fit 插件实例，`f` 可暂时类比 Java 的 `this`，但 Go 不是 Java 的类继承模型。`*T` 是指向 T 类型值的指针；`[]T` 是一组 T 类型记录。两个返回位置各有用途：第一个 nil 表示不返回节点范围限制，第二个 nil Status 表示成功，不能合读成“两次失败”。`fwk` 在这一段是导入的框架包名。
+
+#### 14.1.2 为什么失败：把现场数字送进同一个判断
+
+继续到 `Fit.Filter`：它先用 `getPreFilterState` 取回刚才的请求，再调用第 3.2.2 节已经逐行读过的 `fitsRequest`。把那段代码里的变量填上：
+
+| 源码中的值 | 本例数字 | 从哪里来 |
+|---|---:|---|
+| `podRequest.MilliCPU` | 201 | 最终 Pod 请求，经上一步汇总 |
+| `nodeInfo.GetAllocatable().GetMilliCPU()` | 5000 | scheduler 所见的节点可分配量 |
+| `nodeInfo.GetRequested().GetMilliCPU()` | 4800 | 此节点已计入的系统 Pod 与 holding |
+| 可用余额 | 5000−4800=200 | 两项相减；不是实时 usage |
+
+于是 `201 > 200` 成立，产生 `Insufficient cpu` 记录。`201 > 5000` 不成立，Unresolvable 为 false：删除其他请求有可能解决。这里记录的是一次条件不满足，程序并没有崩溃。
+
+沿返回值追到外层，下面是文字路线，箭头表示结果交给谁，并非每一行都是相邻函数调用：[N8][N9][S17]
+
+```text
+fitsRequest：返回 CPU 不足记录
+  → Fit.Filter：返回 Unschedulable Status，带 Insufficient cpu
+  → RunFilterPlugins：标记失败插件，停止这台节点后续 Filter
+  → schedulePod：本例其他节点也被硬条件挡住，没有可行节点，返回 FitError
+  → schedulingAlgorithm：还可能跑 PostFilter，例如尝试寻找抢占方案
+  → 本例没有可用方案，返回携带 FitError 的 Unschedulable Status
+  → schedulingCycle 原样把这个失败结果向外交回
+```
+
+FitError 是“本轮没有合适节点”的诊断结果。它包含各节点的失败原因，可以用 Go error 传递，但不等于 scheduler 内部故障。对于读取前置状态失败等异常，`Fit.Filter` 会返回 Error；Framework 也会把不符合过滤阶段约定的返回状态包装成 Error。[N8][N9]
+
+**第二遍再读一个容易想错的分支：**固定提交中，PostFilter 自己返回 Error 时，`schedulingAlgorithm` 会记录异常，但这个 FitError 分支最终仍返回携带原 FitError 的 Unschedulable。不能只看到内层出现 Error，就断言最外层一定报告 SchedulerError。没有节点、普通找不到位置、非 FitError 的执行异常，也要分别读。[S17]
+
+#### 14.1.3 谁让它继续等，谁把原因写给 kubectl 看
+
+回到 `pkg/scheduler/schedule_one.go / scheduleOnePod`。下面是函数末尾的连续摘录，省略了前面的取配置、跳过不需调度的 Pod、创建本轮状态等步骤；不是完整函数。[S17]
+
+`sched` 是调度器实例；`podInfo` 包含正在处理的 Pod；`state` 是本轮暂存区。`fwk` **在这一段是前文选出的调度配置实例变量**，不是上一段的导入包名。其他参数携带本轮的时间、上下文和待激活 Pod 记录。
+
+```go
+// 完成选点以及成功后的临时占账准备，得到结果与处理状态。
+scheduleResult, assumedPodInfo, status := sched.schedulingCycle(schedulingCycleCtx, state, fwk, podInfo, start, podsToActivate)
+if !status.IsSuccess() {
+    // 本例在这里处理“放不下”：记原因、更新状态并安排后续尝试。
+    sched.FailureHandler(schedulingCycleCtx, fwk, assumedPodInfo, status, scheduleResult.nominatingInfo, start)
+    return // 这一次不会进入下面的绑定流程。
+}
+// 只有上面的准备成功，才另行推进绑定。
+go sched.runBindingCycle(ctx, state, fwk, scheduleResult, assumedPodInfo, start, podsToActivate)
+```
+
+**大白话总结：**输入是本轮尝试；检查 status 是否成功；失败交给 FailureHandler 后结束本次调用，成功才启动绑定流程。本例第一次没有走到 `go` 那一行；变量名叫 `assumedPodInfo`，也不代表失败时已经完成 Assume。
+
+**顺手学 Go：**多返回值按位置接到三个变量；`!` 是取反。`return` 结束当前函数，不是退出 scheduler 进程。`go` 启动另一段可并发推进的工作，原调用不用等 API 绑定完成才继续。
+
+默认的 FailureHandler 指向 `handleSchedulingFailure`，它要处理几份不同的记录：[S17]
+
+| 它处理的记录 | 本例的动作 | 为什么不能省 |
+|---|---|---|
+| 失败插件资料 | 从 FitError 保存失败插件 | 后续变化到来时，要判断哪些等待者值得再试 |
+| 队列里的 Pod | 确认对象仍存在、尚未绑定、UID 未换，再调用 `AddUnschedulableIfNotPresent` | 已绑定、删除或重建的对象不能按旧资料重新排队 |
+| 对外状态与报告 | 记录 FailedScheduling Event，尝试把 PodScheduled 写为 False、reason=Unschedulable | 让现场查询能看见这次判断；写 API 失败还会另记错误 |
+
+队列函数还会结合本轮发生过的变化、退避时间等选择等待位置，名字里有 Unschedulable 不表示所有路径都只塞进同一个容器。若插入队列等处理出错，这个 handler 记录错误；它没有把 error 返回给 `scheduleOnePod`，也不承诺插入一定成功。Done 负责结束本轮队列跟踪，不是释放已经运行的 Pod 资源。
+
+#### 14.1.4 删除 holding 后，哪两份东西要更新
+
+只向 API 发出删除请求还不够。holding 要退出，相关对象变化还要传到 scheduler。它处理已绑定 Pod 的删除时，先改资源账，再通知队列检查等待者。[N10]
+
+下面是 `pkg/scheduler/eventhandlers.go / deleteAssignedPodFromCache` 的连续摘录。`pod` 是收到删除通知的 holding；`sched` 是调度器；`logger` 已在前文从 sched 取得。省略的是耗时统计和入口日志。
+
+```go
+// 从 scheduler 的缓存移除 holding，正常处理后会扣掉它的资源请求。
+if err := sched.Cache.RemovePod(logger, pod); err != nil {
+    // 移除失败会记错误；注意这里没有 return，后面的队列通知仍会发生。
+    utilruntime.HandleErrorWithLogger(logger, err, "Scheduler cache RemovePod failed", "pod", klog.KObj(pod))
+}
+// 告诉队列：有一只已绑定 Pod 被删除了，可以检查哪些等待者值得再试。
+sched.SchedulingQueue.MoveAllToActiveOrBackoffQueue(logger, framework.EventAssignedPodDelete, pod, nil, nil)
+```
+
+**大白话总结：**输入是 holding 的删除通知；动作一是撤掉它在缓存里的请求，动作二是让队列检查等待者。正常情况下余额从 200m 变为 4900m；如果移除失败，不能仅凭发了通知就宣布余额已经正确。
+
+**顺手学 Go：**`if err := 调用(); err != nil` 是先调用并接住错误，再判断是否出错；err 在这个 if 及对应分支内使用。末尾两个 nil 分别表示没有新对象、没有额外的预检查函数，不是两个错误返回值。
+
+这里的 AssignedPodDelete 是程序内部的对象变化通知。FailedScheduling 才是前面给 `kubectl get events` 查看的一条报告。队列不会因为你删除了某条 FailedScheduling Event 就认定 CPU 已释放。
+
+#### 14.1.5 值得重试，为什么还不能承诺一定成功
+
+资源插件通过 `EventsToRegister` 关注已绑定 Pod 的删除，并提供 `isSchedulableAfterAssignedPodDelete` 判断是否值得重新尝试。[N8]
+
+下面是该判断函数的连续摘录。前文已把通知中的旧对象解析成 `deletedPod`；解析失败时返回 `Queue, err`，不在下面冒充解析成功。`pod` 是等待的 one-over，`deletedPod` 是删除的 holding，`logger` 来自参数。
+
+```go
+// 没绑定、也没被提名的旧 Pod，不提供这里要找的释放线索。
+if deletedPod.Spec.NodeName == "" && deletedPod.Status.NominatedNodeName == "" {
+    logger.V(5).Info("the deleted pod was unscheduled and it wouldn't make the unscheduled pod schedulable", "pod", klog.KObj(pod), "deletedPod", klog.KObj(deletedPod))
+    return fwk.QueueSkip, nil // 本插件认为这次删除不用触发重试。
+}
+// 有绑定或提名信息，先认为值得再看一遍，并未计算是否足够。
+logger.V(5).Info("another scheduled pod was deleted, and it may make the unscheduled pod schedulable", "pod", klog.KObj(pod), "deletedPod", klog.KObj(deletedPod))
+return fwk.Queue, nil // 建议重试；没有解析错误。
+```
+
+**大白话总结：**holding 已绑定，所以得到 Queue。这个函数没有算 `4700 ≥ 1`，也没有验证其他硬条件；它只给出“值得再试”的建议。队列还要结合退避和其他失败插件决定何时可取出。[N11]
+
+**顺手学 Go：**两个返回位置分别是“排队建议”和“错误”。`Queue, nil` 是建议重试且本函数没有错误；`QueueSkip, nil` 是不因这次变化重试且本函数没有错误。日志的 `V(5)` 表示详细程度，不是优先级数值。
+
+**反事实：**如果只删除另一台不符合节点标签的 Node 上的 Pod，这个提示仍可能建议重试；但目标 worker 余额还是 200m，下一轮仍失败。不要把提示函数读成第二个完整 Filter。
+
+#### 14.1.6 再次选中以后，哪一步才让 API 出现 nodeName
+
+one-over 再次被取出时，会重新更新本轮节点视图、计算请求、检查硬条件。正常删除已传播后，CPU 判断变为 `201 > 4900`，结果是假，所以不会新增 CPU 不足记录。只有这一台可行时无需比较多个候选分数。[S17]
+
+按时间从上到下看后半段；这里的先后是处理路线，API 与缓存通知仍可能短暂不同步：
+
+| 步骤 | 改了什么 | 此时能宣布什么 |
+|---|---|---|
+| `assumeAndReserve` 中的 `assume` | 给 Pod 的内存副本设置候选 nodeName，先把 201m 记入本 scheduler 的 cache | 本调度器余额变为 4699m；还不能据此说 API 已绑定 |
+| Reserve、Permit | 执行配置的临时预留、准许或等待逻辑 | 失败需要撤销，等待还没有结束绑定 |
+| `runBindingCycle` → `bindingCycle` | 等待 Permit、执行 PreBind，再调用绑定路径 | 仍需检查返回状态 |
+| 默认绑定插件 | 把 Pod 的 namespace、name、UID 与目标 Node 组成 Binding 请求 | API 成功保存后才能查到这次落点 |
+| kubelet 后续处理 | 准备并启动容器，报告状态 | Ready 是后来的节点与容器结果 |
+
+**这段只回答：默认绑定怎样把结果交给 API？**下面是 `pkg/scheduler/framework/plugins/defaultbinder/default_binder.go / DefaultBinder.Bind` 的连续摘录。[N12] `binding` 已由当前 Pod 身份和目标 nodeName 构造，`b` 是绑定插件，`ctx` 是本轮上下文。固定提交还包含 APICacher 分支；下面只展示未使用该分支时的直接调用，不能当成完整函数。
+
+```go
+// 给 API 发送这只 Pod 到目标 Node 的 Binding 请求。
+err := b.handle.ClientSet().CoreV1().Pods(binding.Namespace).Bind(ctx, binding, metav1.CreateOptions{})
+if err != nil {
+    return fwk.AsStatus(err) // 请求出错，转成插件处理状态交回上层。
+}
+return nil // 本插件绑定处理成功；不表示容器已经 Ready。
+```
+
+**大白话总结：**输入是 Pod 身份与目标节点；动作是请求 API 绑定；失败转换成 Status，成功返回 nil。APICacher 是帮调度器管理部分 API 写入的内部设施，另一分支会提交绑定并等待它的完成结果，仍要处理错误。[N12]
+
+**顺手学 Go：**连着写的 `.方法()` 是逐步取得 API 客户端并发起调用；`metav1.CreateOptions{}` 构造空的创建选项。这里的 `AsStatus(err)` 是转换错误表示，不会把错误变成成功。
+
+若 Reserve、Permit 或绑定失败，不能一直占着这 201m。固定路径按失败位置执行 Unreserve、ForgetPod 等清理；绑定失败处理还会通知队列资源可能释放，让其他受影响 Pod 有机会再试。清理自身出错也会记录错误，不能把“调用过清理”写成“必然清理成功”。Done 则按相应路径结束本轮跟踪，不必等到所有绑定步骤结束才执行，见第 10.3 节。[S17]
+
+**合上源码，检查你能否回答：**第一次失败为何没有执行 Assume？删除 holding 为什么要同时更新账和队列？第二次返回 nil 为什么还不能宣布 Java 接口恢复？答案分别是：资源阶段已经返回失败；重试既要看到新的余额，也要获得尝试机会；nil 只说明对应处理成功，节点启动与应用验收还在后面。
+
+#### 14.1.7 实验版本怎么对应，现场又能证明到哪一步
+
+| 位置 | 教学提交 | v1.34.0 发布源码 |
+|---|---|---|
+| 单 Pod 的主要流程 | `ScheduleOne` 转到 `scheduleOnePod` | 主要逻辑直接在 `ScheduleOne` |
+| 选点失败、PostFilter | 拆在 `schedulingAlgorithm` 等函数 | 相应逻辑主要在 `schedulingCycle` |
+| 资源删除提示 | `isSchedulableAfterAssignedPodDelete` | `isSchedulableAfterPodEvent` 处理包括删除在内的变化 |
+| 删除后重新尝试的结论 | 更新缓存，向队列传递变化，再检查条件 | 对本例的结论相同；函数名与参数不能照搬 |
+
+表中差异已对照 v1.34.0 的 [schedule_one.go](https://github.com/kubernetes/kubernetes/blob/f28b4c9efbca5c5c0af716d9f2d5702667ee8a45/pkg/scheduler/schedule_one.go)、[eventhandlers.go](https://github.com/kubernetes/kubernetes/blob/f28b4c9efbca5c5c0af716d9f2d5702667ee8a45/pkg/scheduler/eventhandlers.go) 和 [fit.go](https://github.com/kubernetes/kubernetes/blob/f28b4c9efbca5c5c0af716d9f2d5702667ee8a45/pkg/scheduler/framework/plugins/noderesources/fit.go)。
+
+第 15.2 节保存删除前后的 UID、request、PodScheduled、nodeName 和 Ready。它能证明原对象从 CPU 不足变为绑定并启动；**单凭这些 API 快照，不能分辨某次重试究竟由删除通知、退避到期还是其他队列路径触发。**内部因果说明来自上述源码核对，本轮没有用断点逐次追踪 scheduler。
+
+需要继续找入口时，再用下面的表，不把整张表当第一遍必背内容：
 
 | 阅读顺序 | 位置 | 本轮只回答的问题 |
 |---|---|---|
 | 1 | scheduler.go / Run | 谁启动循环，谁负责leader后的工作 |
-| 2 | schedule_one.go / ScheduleOne | Pod从哪里取，什么时候Done |
-| 3 | schedulingCycle / schedulePod | snapshot、Filter与Score怎样衔接 |
+| 2 | schedule_one.go / ScheduleOne、scheduleOnePod | Pod从哪里取，什么时候Done |
+| 3 | schedulingCycle / schedulingAlgorithm / schedulePod | snapshot、Filter与Score怎样衔接 |
 | 4 | framework/runtime/framework.go | 插件按何顺序调用，何时短路 |
 | 5 | assumeAndReserve | 通用cache与插件状态分别改了什么 |
 | 6 | bindingCycle | Permit等待、PreBind、Bind和PostBind责任 |
 | 7 | cache实现 | Add/Assume/Forget与NodeInfo账怎样维护 |
 
-上面的定位表用来找入口，不要求按函数清单从头背。第一次先看第 3.2.2 节的 CPU 判断；能把数字代入之后，再回来追 Pod 从哪里取、请求账何时变化、绑定失败怎样撤销。[G5]
+上面的定位表对应固定教学提交。遇到别的版本，先查实际入口，再沿相同问题找代码。[G5]
 
 ### 14.2 用一页状态表读代码
 
@@ -1654,7 +1950,9 @@ print(int(Decimal(s[:-1]) if s.endswith("m") else Decimal(s)*1000))')
 test "$ALLOC_M" -ge 1000
 ```
 
-下面是一个**实验对象生成器**，不是 Kubernetes 源码。它避免每组重复几十行 YAML：普通 Pod 都选同一 worker，默认请求 50m/64Mi，容器只 sleep。`study_pod` 创建单只 Pod，`study_deploy` 创建 Deployment；第三/第四个参数中的 JSON 只补本组要比较的字段。CPU 参数 `-` 表示不填写 CPU request，专门用于默认值实验。
+下面的小工具负责命名、等待、保存现场，以及为后续实验生成重复对象。先复制一次即可；**第 15.2 节的第一组实验会完整展示 Pod YAML，不使用对象生成器创建 Pod。**
+
+其中的**实验对象生成器**不是 Kubernetes 源码。它为后续各组省去重复 YAML：普通 Pod 都选同一 worker，默认请求 50m/64Mi，容器只 sleep。`study_pod` 创建单只 Pod，`study_deploy` 创建 Deployment；第三/第四个参数中的 JSON 只补本组要比较的字段。CPU 参数 `-` 表示不填写 CPU request，专门用于默认值实验。
 
 <details>
 <summary>展开并复制一次小工具，后面各组复用</summary>
@@ -1730,15 +2028,78 @@ save_case() {
 
 `wait_rejected` 不只等一个 False：它还核对未绑定、Unschedulable 和本组的失败方向。超时或断言失败就停止，不能记作通过。`save_case` 保存现场；各对象读取不保证是同一瞬间的原子快照。
 
-### 15.2 CPU：超过单节点容量，和超过余额，是两件事
+<a id="cpu-lab"></a>
 
-先预测两种输入。单只请求为 Allocatable+1000m，删其他 Pod 也放不下；只超余额 1m，可能通过释放其他请求解决。
+### 15.2 从完整 YAML 做一次 CPU 对照，再看原 Pod 怎样重试
+
+本节按顺序执行，复用 15.1 的隔离集群和变量。先写三个预测：单只请求超过节点可分配 CPU 会怎样？余额 200m 时申请 201m 会怎样？不改这只 Pod，只删除占位者，它有没有机会成功？
+
+所有容器只 sleep，CPU 大 request 用于占请求账，不能把结果当 Java 性能测试。命令中的 `lab` 已固定实验 kubeconfig；`new_case` 创建本组 namespace；等待函数检查状态；`save_case` 保存对象。真正提交什么 Pod，下面每次都写出来。
+
+#### 15.2.1 先认清 YAML：请求超过节点可分配 CPU
+
+本次节点可分配 5000m，所以下面计算出的请求是 6000m；别的环境会按其 Allocatable 加 1000m。它连可分配量都超过了，删掉其他 Pod 也不够；这里比较的是 Allocatable，不是第 3.1 节的总容量 Capacity。
 
 ```bash
 new_case cpu
-study_pod oversized "$((ALLOC_M + 1000))m"
+OVERSIZED_M=$((ALLOC_M + 1000))
+lab apply -f - <<YAML
+apiVersion: v1
+kind: Pod
+metadata:
+  name: oversized
+  namespace: $LAB_NS
+spec:
+  nodeSelector:
+    kubernetes.io/hostname: $LAB_NODE
+  restartPolicy: Never
+  terminationGracePeriodSeconds: 5
+  automountServiceAccountToken: false
+  containers:
+  - name: sleeper
+    image: $LAB_IMAGE
+    imagePullPolicy: IfNotPresent
+    command: ["sh", "-c", "sleep 3600"]
+    resources:
+      requests:
+        cpu: ${OVERSIZED_M}m
+        memory: 64Mi
+      limits:
+        memory: 128Mi
+YAML
 wait_rejected oversized 'Insufficient cpu'
+lab get pod oversized -n "$LAB_NS" \
+  -o custom-columns='NAME:.metadata.name,CPU:.spec.containers[0].resources.requests.cpu,NODE:.spec.nodeName,SCHEDULED:.status.conditions[?(@.type=="PodScheduled")].status'
 save_case oversized
+```
+
+`<<YAML` 到单独一行 `YAML` 之间是交给 kubectl 的内容；Bash 会先把 `$LAB_NS`、`$LAB_NODE` 等变量换成实际值。这里没有写 `nodeName`，只是用 nodeSelector 限定目标节点，所以仍由 scheduler 检查能否放下。
+
+| 这一项 | 为什么写它 |
+|---|---|
+| `nodeSelector` | 固定候选 worker，避免 Pod 跑到另一台空节点 |
+| `requests.cpu` | 本题真正比较的数；不是要求 sleep 实际烧满这些 CPU |
+| `requests.memory: 64Mi` | 仍声明内存要求；本组要确认它没有先成为瓶颈 |
+| 没有 CPU limit | 保持只讨论 CPU 请求账；不引入 CPU 限速对照 |
+| `restartPolicy: Never` | 这是独立实验 Pod，结束后不由 kubelet 重启容器 |
+
+5000m 节点上的预期关键值如下。CPU 数量输出可能规范化成 `6`，它等于 6000m；节点列应为空，PodScheduled 应为 False：
+
+```text
+NAME        CPU   NODE     SCHEDULED
+oversized   6     <none>   False
+```
+
+这四列只说明输入和当前状态。还要看上面等待函数打印的 `Unschedulable` 与 `Insufficient cpu`，才能对应 CPU 原因。其余节点可能同时报告标签、污点等原因，不要求整条 message 与某次样例逐字相同。
+
+#### 15.2.2 留出 200m：先把节点已有请求算清楚
+
+清理 oversized 后，按当前实际请求计算 holding 要占多少。本次是 `5000−100−200=4700m`。这里的 100m 是目标 worker 原有系统 Pod 的最终请求合计，不是写死的 Kubernetes 默认值。
+
+<details>
+<summary>展开并执行余额计算；第一遍只需理解上面的减法</summary>
+
+```bash
 lab delete pod oversized -n "$LAB_NS" --wait=true
 lab get node "$LAB_NODE" -o json > "$LAB_ROOT/node.json"
 lab get pods -A --field-selector "spec.nodeName=$LAB_NODE" -o json > "$LAB_ROOT/bound-pods.json"
@@ -1772,20 +2133,149 @@ assert holding>0, "没有足够余额做这个对照"
 print(holding)
 PY
 )
-study_pod holding "${HOLDING_M}m"
+printf '目标节点=%s，占位请求=%sm，预留余额=200m\n' "$LAB_NODE" "$HOLDING_M"
+```
+
+</details>
+
+计算器只适用于这个干净集群中的简单 Pod，遇到 init、overhead、Pod-level resources、终态或未稳定 resize 会停止。正在退出的 Pod 仍在输入中时，不擅自扣除它。先把余额算出来再继续，不要把自己机器上的 holding 也硬填为 4700m。
+
+把占位 Pod 的完整 YAML 保存到实验临时目录，后面做 200m 边界对照时还要恢复它。这是本次运行产生的文件，不需要放进学习仓库。
+
+```bash
+cat > "$LAB_ROOT/holding.yaml" <<YAML
+apiVersion: v1
+kind: Pod
+metadata:
+  name: holding
+  namespace: $LAB_NS
+spec:
+  nodeSelector:
+    kubernetes.io/hostname: $LAB_NODE
+  restartPolicy: Never
+  terminationGracePeriodSeconds: 5
+  automountServiceAccountToken: false
+  containers:
+  - name: sleeper
+    image: $LAB_IMAGE
+    imagePullPolicy: IfNotPresent
+    command: ["sh", "-c", "sleep 3600"]
+    resources:
+      requests:
+        cpu: ${HOLDING_M}m
+        memory: 64Mi
+      limits:
+        memory: 128Mi
+YAML
+lab apply -f "$LAB_ROOT/holding.yaml"
 wait_ready holding
-study_pod one-over 201m
+```
+
+先等 holding Ready，证明它已经占到位置，再创建竞争者。否则两个 Pod 一起提交，先后顺序改变，就可能做成另一道题。
+
+#### 15.2.3 只差 1m，也先不能放
+
+下面的 one-over 申请 201m，目标节点余额是 200m。内存等其他条件通过时，预期仍是未绑定、CPU 不足。
+
+```bash
+lab apply -f - <<YAML
+apiVersion: v1
+kind: Pod
+metadata:
+  name: one-over
+  namespace: $LAB_NS
+spec:
+  nodeSelector:
+    kubernetes.io/hostname: $LAB_NODE
+  restartPolicy: Never
+  terminationGracePeriodSeconds: 5
+  automountServiceAccountToken: false
+  containers:
+  - name: sleeper
+    image: $LAB_IMAGE
+    imagePullPolicy: IfNotPresent
+    command: ["sh", "-c", "sleep 3600"]
+    resources:
+      requests:
+        cpu: 201m
+        memory: 64Mi
+      limits:
+        memory: 128Mi
+YAML
 wait_rejected one-over 'Insufficient cpu'
+CPU_WAIT_UID=$(lab get pod one-over -n "$LAB_NS" -o jsonpath='{.metadata.uid}')
+lab get pods holding one-over -n "$LAB_NS" \
+  -o custom-columns='NAME:.metadata.name,CPU:.spec.containers[0].resources.requests.cpu,NODE:.spec.nodeName,READY:.status.conditions[?(@.type=="Ready")].status'
 save_case cpu-201
 lab get --raw "/api/v1/nodes/$LAB_NODE/proxy/stats/summary" > "$LAB_ROOT/cpu-stats.json"
+```
+
+预期 holding 已在目标 worker 上并 Ready，one-over 没有 nodeName。节点统计里的 usageNanoCores 除以 1000000 得到 m，时间在 cpu.time 中；它只是一次采样，不是全过程峰值。即使 CPU 很闲，也没有改变请求账只剩 200m 的事实。
+
+#### 15.2.4 不改 one-over：删除占位者后检查同一个 UID
+
+这一步只删除我们创建的 holding。它正常退出、删除变化被 scheduler 处理后，本次节点余额由 200m 回到 4900m，原来的 201m 就有机会通过。不能拿同样的动作直接删除生产中的健康业务 Pod。
+
+```bash
+lab delete pod holding -n "$LAB_NS" --wait=true
+wait_ready one-over
+test "$CPU_WAIT_UID" = "$(lab get pod one-over -n "$LAB_NS" -o jsonpath='{.metadata.uid}')"
+test "201m" = "$(lab get pod one-over -n "$LAB_NS" -o jsonpath='{.spec.containers[0].resources.requests.cpu}')"
+lab get pod one-over -n "$LAB_NS" \
+  -o custom-columns='NAME:.metadata.name,UID:.metadata.uid,CPU:.spec.containers[0].resources.requests.cpu,NODE:.spec.nodeName,READY:.status.conditions[?(@.type=="Ready")].status'
+save_case cpu-same-uid-ready
+```
+
+两个 `test` 分别检查“还是原对象”和“请求没被改”。预期对照如下，U 表示你实际记录的同一个 UID，节点名用“目标 worker”代称，并非命令原样输出：
+
+| 观察时刻 | UID | CPU request | nodeName | Ready |
+|---|---|---:|---|---|
+| holding 仍占位 | U | 201m | 空 | 未就绪 |
+| holding 删除后，等待成功 | U | 201m | 目标 worker | True |
+
+**你刚证明的是：**原 Pod 没变，外部资源条件变好后，它重新获得位置并启动。为什么删除会影响队列、哪一步写入绑定，回到[第 14.1 节](#cpu-source-walk)逐步看。
+
+如果没有成功，先保留现场：holding 是否真的消失？系统请求是否增加？失败原因是否仍是 CPU？同 UID 只能证明对象没换，不能代替这些检查，也不能单凭这份快照确定内部是哪次通知触发了重试。
+
+#### 15.2.5 恢复相同占用，再验证刚好 200m
+
+最后回到原来的 200m 余额。先删除已经运行的 one-over，恢复 holding 并等它 Ready，再创建申请 200m 的 exact-fit。**如果不恢复占位者，拿空节点跑成功就没有验证边界。**这一小组的对象名和 UID 会变化，只用来比较相同占用下的请求大小，不作为上一小组“同对象重试”的证据。
+
+```bash
 lab delete pod one-over -n "$LAB_NS" --wait=true
-study_pod exact-fit 200m
+lab apply -f "$LAB_ROOT/holding.yaml"
+wait_ready holding
+lab apply -f - <<YAML
+apiVersion: v1
+kind: Pod
+metadata:
+  name: exact-fit
+  namespace: $LAB_NS
+spec:
+  nodeSelector:
+    kubernetes.io/hostname: $LAB_NODE
+  restartPolicy: Never
+  terminationGracePeriodSeconds: 5
+  automountServiceAccountToken: false
+  containers:
+  - name: sleeper
+    image: $LAB_IMAGE
+    imagePullPolicy: IfNotPresent
+    command: ["sh", "-c", "sleep 3600"]
+    resources:
+      requests:
+        cpu: 200m
+        memory: 64Mi
+      limits:
+        memory: 128Mi
+YAML
 wait_ready exact-fit
+lab get pods -n "$LAB_NS" -o wide
 save_case cpu-200
 lab delete namespace "$LAB_NS" --wait=true
 ```
 
-计算器只适用于这个干净集群中的简单 Pod，遇到 init、overhead、Pod-level resources、终态或未稳定 resize 会停止。正在退出的 Pod 仍在输入中时不擅自扣除它。节点统计缺失或读取失败时，也不能写成“测得 CPU 很闲”。采样中的 usageNanoCores 除以 1000000 得到 m，时间在 JSON 的 cpu.time 中；它不等于峰值。
+**合上命令复述：**超过节点可分配量，删占位者仍不够；只超过当前余额，释放请求可能有用；同一余额下 201m 失败、200m 通过，来自严格的大于判断；绑定之后还要等容器 Ready。能分别说明这四个结果，再继续下一组。
 
 ### 15.3 配额：查 ReplicaSet，而不是等待不存在的第二只 Pod
 
@@ -2057,7 +2547,7 @@ kind delete cluster --name "$LAB_NAME" --kubeconfig "$LAB_KUBECONFIG"
 
 2026-10-01 在云端独立 kind 集群验证。环境为 kind v0.30.0、kubectl/server v1.34.0，server commit `f28b4c9efbca5c5c0af716d9f2d5702667ee8a45`。1 个控制面、2 个 worker，目标 worker Allocatable 为 5000m、原系统请求 100m。使用本地 sh/sleep 镜像，镜像 ID 为 `sha256:77529943b1c8f1d968af94870125a6ba4ffe88fbe97f089a8f7fcadb0f9901e1`。
 
-本次复用了已创建的这套独立 kind 集群，直接从本文提取第 15.2—15.9 节的八组实验命令，全部正常退出，覆盖下表的 11 项对照。保存了 27 份 namespace 对象快照，另有节点、跨 namespace 请求账和 CPU 采样 JSON；再核对 Ready、nodeName、最终请求、失败原因、新旧 UID 和 Event 对应关系。本轮没有重复执行创建、删除集群的命令。
+2026-10-01 这一轮复用了已创建的这套独立 kind 集群，直接从当时版本提取第 15.2—15.9 节的八组实验命令，全部正常退出，覆盖下表的 11 项对照。保存了 27 份 namespace 对象快照，另有节点、跨 namespace 请求账和 CPU 采样 JSON；再核对 Ready、nodeName、最终请求、失败原因、新旧 UID 和 Event 对应关系。该轮没有重复执行创建、删除集群的命令。
 
 每项结果都按自己的输入解释，不把这一份节点容量和 UID 当作你的环境必然相同。先前验证的 112 条现场快照属于上一轮，采集格式不同，不与这次的 27 份合并计数。
 
@@ -2078,6 +2568,24 @@ kind delete cluster --name "$LAB_NAME" --kubeconfig "$LAB_KUBECONFIG"
 CPU usage 是不同采样时刻的测量，不是全过程峰值。配额的 FailedCreate Event 已按 ReplicaSet UID 对应；端口实验没有监听 Java 服务。发布没有 HTTP 探测，表里的零可用副本不代表已经测出中断时长。
 
 源码核对使用 `/workspace/kubernetes` 的固定教学提交 `301946d15e67a4a2e8a5fb8292eb836acd366d78`，describe 为 `301946d1`，工作区干净；关键 CPU、默认请求、端口、拓扑与失败路径另对照实验版本。Go 摘录保留真实语句，只补教学注释。没有运行上游 Go 测试、真实 GPU/CUDA、DRA driver、CSI、Java 压测、PromQL 查询或真实 AZ 故障；相关内容按教学推演和目标版本核对。
+
+### 16.1 2026-10-02 补跑：完整 YAML 与同 UID 重试
+
+这次使用北京时间记录日期，复用上面同一套 v1.34.0 隔离集群与 sleep 镜像。从本版第 15.2 节直接提取六段 Bash，按正文顺序执行，正常退出；没有使用 `study_pod` 生成本组 Pod，也没有重新创建、删除整套集群。
+
+新增保存四份 namespace 快照，每份另存节点与目标节点已绑定 Pod；分别对应 oversized、201m 失败、同 UID 的 201m 成功、恢复占用后的 200m 成功。数字与结果如下：
+
+| 检查 | 实际结果 |
+|---|---|
+| 单只超过可分配量 | Allocatable=5000m，请求 6000m；nodeName 为空，PodScheduled=False，原因包含 Insufficient cpu |
+| 仅超过余额 | 系统请求 100m，holding=4700m；one-over=201m 未绑定 |
+| 删除 holding 后 | one-over 的 UID 和 201m 请求均保持不变，绑定到原目标 worker 并 Ready |
+| 恢复后比较边界 | 先删除 one-over、恢复 holding=4700m，再创建 exact-fit=200m；它绑定并 Ready |
+| 清理 | 本组 namespace 已删除，保留取证 JSON，整套学习集群未删除 |
+
+这轮验证的是对象、请求和状态变化；没有用断点确认每次内部队列唤醒的来源，也没有测 Java 接口或 GPU 性能。第 14.1 节的内部路径来自固定源码核对，五段新增 Go 摘录均与相应源码的连续语句对应。
+
+第 13.4.2 节的四段 DRA 摘录补齐 apiVersion、kind、Pod 镜像等必要字段后，也交给同一 v1.34.0 API 执行了 `kubectl create --dry-run=server --validate=strict`，四类对象全部通过。server dry-run 是让服务器检查请求、但不保存对象；它只验证这些字段可被 API 接受，没有创建真实设备、运行分配器或验证节点驱动。
 
 <a id="terms"></a>
 
@@ -2261,6 +2769,8 @@ CPU usage 是不同采样时刻的测量，不是全过程峰值。配额的 Fai
 | DeviceClass / Class | 定义选择哪类设备、使用什么匹配规则。 |
 | ResourceClaim / Claim / allocation | Claim 是具体设备申请；allocation 是分配结果，节点准备和应用使用还要继续验证。 |
 | ResourceClaimTemplate | 为每只 Pod 生成独立设备申请的模板；与多只 Pod 引用同一 Claim 的含义不同。 |
+| `exactly` / ExactCount / count | 本例 exactly 写这条设备请求的要求；ExactCount 要求指定数量，count=2 表示两份，不能只给一份就算满足。 |
+| CEL / pool / resourceSliceCount | CEL 写设备筛选表达式；pool 是驱动组织的供给池；resourceSliceCount 帮助判断同一代池清单是否已收齐。 |
 | API discovery / GA / Beta / feature gate | 分别是查询提供哪些资源接口、功能稳定阶段、测试发布阶段、功能开关；这些信息都不代替实际设备验收。 |
 | checkpoint / 训练 / 推理 | 保存应用进度和必要状态、用数据调整模型、用已有模型处理新输入；删 Pod 前先确认是否能恢复。 |
 | worker | 在 kind 中是工作节点，在训练中是任务成员；训练成员通常由 Pod 承载，不能直接换算成 Node 数。 |
@@ -2292,7 +2802,9 @@ CPU usage 是不同采样时刻的测量，不是全过程峰值。配额的 Fai
 | SLI / 成功者偏差 | SLI 是衡量体验的实际指标；只统计成功者会把还在等待的人漏掉，结果看起来比实际好。 |
 | 函数 / 参数 / 返回值 / helper | 一段被调用的处理、传入的数据、处理后交回的结果；helper 是辅助函数。 |
 | 函数签名 / 作用域 | 函数参数与返回结果的形式和类型；以及某个变量在哪段代码中能使用。 |
-| 导入包名 / `v1` / `fwk` | 给别处代码起一个本地使用的名字；本文 v1 指 API 包，fwk 指框架包。点后可以是包提供的常量、类型或函数，不都是对象方法。 |
+| receiver / `*T` / context | receiver 是方法所属实例，本例为 f、sched 等；*T 是指向 T 的指针；context 传递取消等本轮处理信息，不是 kubeconfig 的 context。 |
+| FitError / Queue / QueueSkip / APICacher | FitError 记录本轮没有合适节点；Queue、QueueSkip 是是否值得因某次变化重试的建议；APICacher 管理部分调度器 API 写入，不是 Pod 已绑定的证明。 |
+| 导入包名 / `v1` / `fwk` | 导入包提供可使用的常量、类型和函数；本文 v1 指 API 包，PreFilter 等摘录中的 fwk 指框架包。第 14.1.3 节的同名变量 fwk 则是调度配置实例，要按当前作用域判断，不能把点后内容一律读成包名或对象方法。 |
 | `v1.ResourceCPU` / `v1.ContainerPort` / `fwk.HostPortInfo` | 分别是包提供的 CPU 资源名常量、端口记录类型、端口账类型，不是本函数临时创建的变量。 |
 | struct / 结构体 / 字段 | 把几项相关资料装成一条记录；字段就是其中某一项，例如 Requested。 |
 | slice / `[]T` / append | 可按序访问的一组 T 类型记录；append 加入新记录并返回更新后的切片，调用者需要保存返回值。 |
@@ -2321,6 +2833,7 @@ CPU usage 是不同采样时刻的测量，不是全过程峰值。配额的 Fai
 | 断言 / 静态阅读 / 单测 / 回归 | 必须成立的检查、只看源码不执行、验证局部函数的给定输入、改动后比较原有行为是否受影响。 |
 | 固定输入重放 / 负向验证 | 用同一批输入比较改动效果，以及故意保留一个不满足的条件，检查是否按预期拒绝。 |
 | 集群实验 / 硬件实验 | 前者看 API、控制器、调度和节点的配合；后者才验证实际 GPU、驱动与应用能力，不能相互替代。 |
+| server dry-run | 把请求交给 API 服务器检查，但不保存对象；不代表调度、设备准备或容器运行成功。 |
 
 **查完一个词，再回到原例子问三句：谁用了它？它读或改了什么？哪个现场字段能证明结果？**能回答这三句，比记住英文全称有用。
 
@@ -2406,3 +2919,10 @@ CPU usage 是不同采样时刻的测量，不是全过程峰值。配额的 Fai
 [N5]: https://github.com/kubernetes/kubernetes/blob/301946d15e67a4a2e8a5fb8292eb836acd366d78/pkg/scheduler/framework/plugins/nodeports/node_ports.go#L170-L178
 [N6]: https://github.com/kubernetes/kubernetes/blob/301946d15e67a4a2e8a5fb8292eb836acd366d78/staging/src/k8s.io/kube-scheduler/framework/types.go
 [N7]: https://github.com/kubernetes/kubernetes/blob/f28b4c9efbca5c5c0af716d9f2d5702667ee8a45/pkg/scheduler/framework/plugins/nodeports/node_ports.go
+[N8]: https://github.com/kubernetes/kubernetes/blob/301946d15e67a4a2e8a5fb8292eb836acd366d78/pkg/scheduler/framework/plugins/noderesources/fit.go
+[N9]: https://github.com/kubernetes/kubernetes/blob/301946d15e67a4a2e8a5fb8292eb836acd366d78/pkg/scheduler/framework/runtime/framework.go
+[N10]: https://github.com/kubernetes/kubernetes/blob/301946d15e67a4a2e8a5fb8292eb836acd366d78/pkg/scheduler/eventhandlers.go
+[N11]: https://github.com/kubernetes/kubernetes/blob/301946d15e67a4a2e8a5fb8292eb836acd366d78/pkg/scheduler/backend/queue/scheduling_queue.go
+[N12]: https://github.com/kubernetes/kubernetes/blob/301946d15e67a4a2e8a5fb8292eb836acd366d78/pkg/scheduler/framework/plugins/defaultbinder/default_binder.go
+[N13]: https://github.com/kubernetes/kubernetes/blob/f28b4c9efbca5c5c0af716d9f2d5702667ee8a45/staging/src/k8s.io/api/resource/v1/types.go
+[N14]: https://github.com/kubernetes/kubernetes/blob/f28b4c9efbca5c5c0af716d9f2d5702667ee8a45/pkg/scheduler/framework/plugins/dynamicresources/dynamicresources.go
